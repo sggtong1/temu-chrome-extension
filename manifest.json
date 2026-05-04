@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Temu 数据采集",
+  "version": "1.0.0",
+  "description": "每日一键采集 Temu 卖家数据并同步到 Supabase",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "https://*.temu.com/*",
+    "https://agentseller-us.temu.com/*",
+    "https://agentseller-eu.temu.com/*",
+    "https://agentseller.temu.com/*",
+    "https://*.supabase.co/*"
+  ],
+  "background": {
+    "service_worker": "background/service_worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://agentseller-us.temu.com/*",
+        "https://agentseller-eu.temu.com/*",
+        "https://agentseller.temu.com/*"
+      ],
+      "js": ["content/fetch_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://agentseller-us.temu.com/*",
+        "https://agentseller-eu.temu.com/*",
+        "https://agentseller.temu.com/*"
+      ],
+      "js": ["content/content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Temu 数据采集",
+    "default_icon": { "48": "icons/icon-48.png" }
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "icons": { "48": "icons/icon-48.png" }
+}
