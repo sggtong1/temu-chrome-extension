@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Temu 采集插件 — 设置</title>
+<style>
+  body { font-family: system-ui; max-width: 520px; margin: 40px auto; padding: 0 16px; color: #1e293b; }
+  h1 { font-size: 18px; margin-bottom: 24px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #64748b; margin-bottom: 4px; margin-top: 16px; }
+  input { width: 100%; padding: 8px 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 13px; box-sizing: border-box; }
+  .row { display: flex; gap: 8px; margin-top: 24px; }
+  button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  #save { background: #1e40af; color: white; }
+  #test { background: #f1f5f9; color: #1e293b; }
+  #status { margin-top: 12px; font-size: 12px; min-height: 18px; }
+  #status.ok { color: #16a34a; }
+  #status.err { color: #dc2626; }
+</style>
+</head>
+<body>
+<h1>🛒 Temu 数据采集 — 设置</h1>
+<label>Supabase URL</label>
+<input id="url" type="url" placeholder="https://xxxx.supabase.co">
+<label>Supabase Anon Key</label>
+<input id="key" type="password" placeholder="eyJ...">
+<div class="row">
+  <button id="save">保存</button>
+  <button id="test">测试连接</button>
+</div>
+<div id="status"></div>
+<script src="options.js"></script>
+</body>
+</html>
