@@ -17,7 +17,11 @@ function moduleUrl(module, mallId, siteType, region) {
     return `${base}/main/${path}?init=true&mallId=${mallId}`;
   }
   if (module === 'sales') {
-    return `${base}/main/data-center/goods-data?mallId=${mallId}`;
+    if (siteType === 'semi_us') {
+      return `${US_BASE}/main/data-center/goods-data?mallId=${mallId}`;
+    }
+    // full_managed: agentseller.temu.com regardless of region
+    return `${DEF_BASE}/stock/fully-mgt/sale-manage/main?mallId=${mallId}`;
   }
   if (module === 'orders') {
     return `${US_BASE}/mmsos/orders.html?mallId=${mallId}`;
@@ -40,6 +44,8 @@ let _state = {
   shopName: '',
   siteType: 'semi_us',
   captured: {},
+  // full_managed SALES requires two API captures before processing
+  salesPartials: { meta: null, qty: null },
   supabaseUrl: null,
   supabaseAnonKey: null,
 };
@@ -52,6 +58,7 @@ function resetState() {
   _state.active = false;
   _state.modules = [];
   _state.captured = {};
+  _state.salesPartials = { meta: null, qty: null };
 }
 
 // ── Message router ──────────────────────────────────────────────────────────
@@ -118,6 +125,15 @@ async function handleApiData(msg) {
   const expected = _state.modules[0];
   if (msg.module !== expected) return;
 
+  // full_managed SALES needs two API captures (listOverall + querySkuSalesNumber)
+  if (msg.module === 'sales' && _state.siteType === 'full_managed' && msg.subType) {
+    _state.salesPartials[msg.subType] = msg.data;
+    if (!_state.salesPartials.meta || !_state.salesPartials.qty) return;
+    // Both captured — merge and fall through to processModule
+    msg = { ...msg, subType: null, data: { meta: _state.salesPartials.meta, qty: _state.salesPartials.qty } };
+    _state.salesPartials = { meta: null, qty: null };
+  }
+
   _state.captured[msg.module] = msg.data;
   if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
 
@@ -160,6 +176,7 @@ function navigateToNextModule() {
         type: 'ACTIVATE_CAPTURE',
         module: mod,
         targetDate: _state.date,
+        siteType: _state.siteType,
       });
 
       _captureTimer = setTimeout(async () => {
@@ -184,7 +201,7 @@ async function processModule(module, rawData) {
   }
 
   if (module === 'sales') {
-    const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData);
+    const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData, ctx);
     // Cost lookup uses 货号 (extCode) directly — matches sku_cost.sku_id column
     const extCodes = [...new Set(Object.values(skuPrices).map(p => p.extCode).filter(Boolean))];
     const skuCostMap = await getSkuCost(supabaseUrl, supabaseAnonKey, extCodes, _state.date, _state.siteType);

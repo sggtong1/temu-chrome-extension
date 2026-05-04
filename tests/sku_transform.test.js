@@ -1,26 +1,88 @@
 import { describe, it, expect } from '@jest/globals';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from '../background/transform/sku_transform.js';
 
-describe('parseSalesResponse', () => {
-  it('extracts sku sales and prices', () => {
+describe('parseSalesResponse — semi_us', () => {
+  const ctx = { siteType: 'semi_us', date: '2026-05-03' };
+
+  it('extracts sku sales and extCode from saleAnalysisDetailDTOList', () => {
     const raw = {
       result: {
-        skuList: [
-          { skuId: 111, salesNumber: 10, activityPrice: 2500, dailyPrice: 3000, extCode: 'ABC-01', properties: { color: 'red' } },
+        saleAnalysisDetailDTOList: [
+          {
+            productSkuId: 111,
+            productId: 999,
+            skuExtCode: 'ABC-01',
+            skuSaleDTOList: [
+              { date: '2026-05-02', saleNum: 3 },
+              { date: '2026-05-03', saleNum: 10 },
+            ],
+          },
         ],
       },
     };
-    const { skuSales, skuPrices } = parseSalesResponse(raw);
+    const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(raw, ctx);
     expect(skuSales['111']).toBe(10);
-    expect(skuPrices['111'].activityPrice).toBeCloseTo(25.0);
-    expect(skuPrices['111'].dailyPrice).toBeCloseTo(30.0);
+    expect(skuPrices['111'].activityPrice).toBeNull();   // not in this API
+    expect(skuPrices['111'].dailyPrice).toBeNull();
     expect(skuPrices['111'].extCode).toBe('ABC-01');
+    expect(skuSpuMap['111']).toBe('999');
+  });
+
+  it('uses 0 when target date is absent from skuSaleDTOList', () => {
+    const raw = {
+      result: {
+        saleAnalysisDetailDTOList: [
+          { productSkuId: 111, skuExtCode: 'X', skuSaleDTOList: [{ date: '2026-05-01', saleNum: 5 }] },
+        ],
+      },
+    };
+    const { skuSales } = parseSalesResponse(raw, ctx);
+    expect(skuSales['111']).toBe(0);
   });
 
   it('returns empty maps for missing result', () => {
-    const { skuSales, skuPrices } = parseSalesResponse({});
+    const { skuSales, skuPrices } = parseSalesResponse({}, ctx);
     expect(Object.keys(skuSales)).toHaveLength(0);
     expect(Object.keys(skuPrices)).toHaveLength(0);
+  });
+});
+
+describe('parseSalesResponse — full_managed', () => {
+  const ctx = { siteType: 'full_managed', date: '2026-05-03' };
+
+  it('merges listOverall (meta) and querySkuSalesNumber (qty)', () => {
+    const raw = {
+      meta: {
+        result: [
+          {
+            goodsId: 999,
+            skuQuantityDetailList: [
+              { productSkuId: 111, skuExtCode: 'ABC-01', className: 'red/M', supplierPrice: 1500 },
+            ],
+          },
+        ],
+      },
+      qty: {
+        result: [
+          { date: '2026-05-03', prodSkuId: 111, salesNumber: 7 },
+          { date: '2026-05-02', prodSkuId: 111, salesNumber: 3 },  // different date — should be ignored
+        ],
+      },
+    };
+    const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(raw, ctx);
+    expect(skuSales['111']).toBe(7);
+    expect(skuPrices['111'].extCode).toBe('ABC-01');
+    expect(skuPrices['111'].activityPrice).toBeNull();
+    expect(skuSpuMap['111']).toBe('999');
+  });
+
+  it('returns 0 sales for skus absent from qty response', () => {
+    const raw = {
+      meta: { result: [{ goodsId: 1, skuQuantityDetailList: [{ productSkuId: 222, skuExtCode: 'Y' }] }] },
+      qty: { result: [] },
+    };
+    const { skuSales } = parseSalesResponse(raw, ctx);
+    expect(skuSales['222']).toBe(0);
   });
 });
 

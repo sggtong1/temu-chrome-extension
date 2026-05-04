@@ -3,13 +3,13 @@
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'ACTIVATE_CAPTURE') {
     window.dispatchEvent(new CustomEvent('temu:setConfig', {
-      detail: { activeModule: msg.module, targetDate: msg.targetDate },
+      detail: { activeModule: msg.module, targetDate: msg.targetDate, siteType: msg.siteType },
     }));
     sendResponse({ ok: true });
   }
   if (msg.type === 'DEACTIVATE_CAPTURE') {
     window.dispatchEvent(new CustomEvent('temu:setConfig', {
-      detail: { activeModule: null, targetDate: null },
+      detail: { activeModule: null, targetDate: null, siteType: null },
     }));
     sendResponse({ ok: true });
   }
@@ -24,6 +24,7 @@ window.addEventListener('temu:apiCapture', (e) => {
   chrome.runtime.sendMessage({
     type: 'API_DATA',
     module: e.detail.module,
+    subType: e.detail.subType ?? null,
     url: e.detail.url,
     data: e.detail.data,
   });

@@ -1,26 +1,91 @@
 /**
  * Transforms SALES API response into per-SKU records.
- * Expected shape: { result: { skuList: [{ skuId, salesNumber, activityPrice, dailyPrice, extCode, properties }] } }
- * activityPrice and dailyPrice are in CENTS (divide by 100).
+ *
+ * semi_us shape:
+ *   { result: { saleAnalysisDetailDTOList: [{ productSkuId, productId, skuExtCode, skuSaleDTOList: [{date, saleNum}] }] } }
+ *
+ * full_managed shape (merged from two APIs):
+ *   {
+ *     meta: listOverall response — result is array of products with skuQuantityDetailList
+ *     qty:  querySkuSalesNumber response — result is array of { date, prodSkuId, salesNumber }
+ *   }
+ *
+ * @param {object} rawSales
+ * @param {{ siteType: string, date: string }} ctx
  */
-export function parseSalesResponse(rawSales) {
-  const skuList = rawSales?.result?.skuList ?? rawSales?.result?.list ?? [];
+export function parseSalesResponse(rawSales, ctx) {
+  const siteType = ctx?.siteType ?? 'semi_us';
+  const targetDate = ctx?.date ?? '';
+
+  if (siteType === 'full_managed') {
+    return _parseFullManaged(rawSales, targetDate);
+  }
+  return _parseSemiUs(rawSales, targetDate);
+}
+
+function _parseSemiUs(rawSales, targetDate) {
+  const items = rawSales?.result?.saleAnalysisDetailDTOList ?? [];
   const skuSales = {};
   const skuPrices = {};
   const skuSpuMap = {};
 
-  for (const item of skuList) {
-    const id = String(item.skuId ?? '');
+  for (const item of items) {
+    const id = String(item.productSkuId ?? '');
     if (!id) continue;
-    skuSales[id] = Number(item.salesNumber ?? item.saleNum ?? 0);
+
+    // Find sales qty for target date from the daily breakdown list
+    const dayEntry = (item.skuSaleDTOList ?? []).find(d => d.date === targetDate);
+    skuSales[id] = dayEntry?.saleNum ?? 0;
+
     skuPrices[id] = {
-      activityPrice: item.activityPrice != null ? item.activityPrice / 100 : null,
-      dailyPrice: item.dailyPrice != null ? item.dailyPrice / 100 : null,
-      extCode: item.extCode ?? item.goodsCode ?? '',
-      properties: item.properties ?? {},
+      activityPrice: null,  // not available from sale/analysis/detail; comes from kiana/gamblers
+      dailyPrice: null,
+      extCode: item.skuExtCode ?? '',
+      properties: {},
     };
-    if (item.spuId) skuSpuMap[id] = String(item.spuId);
+
+    const spuId = item.productId ?? item.productSkcId ?? '';
+    if (spuId) skuSpuMap[id] = String(spuId);
   }
+
+  return { skuSales, skuPrices, skuSpuMap };
+}
+
+function _parseFullManaged(rawSales, targetDate) {
+  // rawSales = { meta: listOverall response, qty: querySkuSalesNumber response }
+  const products = rawSales?.meta?.result ?? [];
+  const qtyItems = rawSales?.qty?.result ?? [];
+
+  // Build sales-number map from querySkuSalesNumber response
+  // Response items: { date, prodSkuId, salesNumber }
+  const salesMap = {};
+  for (const item of qtyItems) {
+    if (item.date === targetDate) {
+      salesMap[String(item.prodSkuId ?? '')] = item.salesNumber ?? 0;
+    }
+  }
+
+  const skuSales = {};
+  const skuPrices = {};
+  const skuSpuMap = {};
+
+  for (const product of products) {
+    const spuId = String(product.goodsId ?? product.productSkcId ?? '');
+    for (const sku of (product.skuQuantityDetailList ?? [])) {
+      const id = String(sku.productSkuId ?? '');
+      if (!id) continue;
+
+      skuSales[id] = salesMap[id] ?? 0;
+      skuPrices[id] = {
+        activityPrice: null,  // requires kiana/gamblers API
+        dailyPrice: null,
+        extCode: sku.skuExtCode ?? '',
+        properties: sku.className ? { className: sku.className } : {},
+      };
+      if (spuId) skuSpuMap[id] = spuId;
+    }
+  }
+
   return { skuSales, skuPrices, skuSpuMap };
 }
 
