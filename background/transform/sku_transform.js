@@ -49,19 +49,18 @@ function _parseSemiUs(rawSales, targetDate) {
 }
 
 function _parseFullManaged(rawSales, targetDate) {
-  // rawSales is the listOverall response. Real shape varies — log keys for diagnosis.
+  // listOverall returns a dashboard summary; the product list lives in subOrderList.
   const result = rawSales?.result;
-  console.log('[temu] _parseFullManaged result keys:',
-    result && typeof result === 'object' ? Object.keys(result) : typeof result,
-    'sample:', JSON.stringify(result).slice(0, 500));
 
-  // Try common list shapes: result is array | result.list | result.dataList |
-  // result.items | result.records | result.goodsList
   const products = Array.isArray(result) ? result
-    : result?.list ?? result?.dataList ?? result?.items
-      ?? result?.records ?? result?.goodsList ?? result?.data ?? [];
+    : result?.subOrderList ?? result?.list ?? result?.dataList
+      ?? result?.items ?? result?.records ?? result?.goodsList ?? [];
 
-  if (!Array.isArray(products) || !products.length) {
+  if (Array.isArray(products) && products.length) {
+    console.log('[temu] _parseFullManaged: extracted', products.length,
+      'products. first item keys:', Object.keys(products[0]),
+      'sample:', JSON.stringify(products[0]).slice(0, 800));
+  } else {
     console.warn('[temu] _parseFullManaged: no products extracted, full result keys =',
       result && typeof result === 'object' ? Object.keys(result) : 'N/A');
   }
