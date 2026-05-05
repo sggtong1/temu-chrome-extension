@@ -405,8 +405,18 @@ async function processModule(module, rawData) {
     const ordersShipping = ordersRaw ? parseOrdersResponse(ordersRaw) : {};
 
     const rows = buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShipping, skuCostMap);
-    const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', rows);
-    if (error) throw new Error(error);
+    console.log(`[temu] sales: built ${rows.length} rows for ${Object.keys(skuSales).length} SKUs`);
+    if (rows.length === 0) {
+      console.warn('[temu] sales: no rows to write — skuSales sample:', Object.entries(skuSales).slice(0, 3));
+    } else {
+      console.log('[temu] sales: first row sample:', JSON.stringify(rows[0]).slice(0, 500));
+      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', rows);
+      if (error) {
+        console.error('[temu] sales upsert error:', error);
+        throw new Error(error);
+      }
+      console.log(`[temu] sales: upsert OK, count=${count}`);
+    }
   }
 
   if (module === 'orders') {
