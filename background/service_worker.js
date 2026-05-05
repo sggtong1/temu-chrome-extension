@@ -90,7 +90,8 @@ let _state = {
   shopName: '',
   siteType: 'semi_us',
   captured: {},
-  salesPartials: { meta: null, qty: null },
+  salesPartials: {},
+  salesPartialTimers: {},
   supabaseUrl: null,
   supabaseAnonKey: null,
 };
@@ -109,7 +110,8 @@ function resetState() {
   _state.modules = [];
   _state.dates = [];
   _state.captured = {};
-  _state.salesPartials = { meta: null, qty: null };
+  _state.salesPartials = {};
+  _state.salesPartialTimers = {};
 }
 
 function generateDateRange(startDate, endDate) {
@@ -207,7 +209,8 @@ async function handleStartCollection(msg, tabId) {
     shopName: shopName ?? `mall${msg.mallId}`,
     siteType,
     captured: {},
-    salesPartials: { meta: null, qty: null },
+    salesPartials: {},
+    salesPartialTimers: {},
     supabaseUrl,
     supabaseAnonKey,
   };
@@ -223,11 +226,29 @@ async function handleApiData(msg) {
 
   // full_managed SALES needs two API captures (listOverall + querySkuSalesNumber)
   if (msg.module === 'sales' && _state.siteType === 'full_managed' && msg.subType) {
-    _state.salesPartials[msg.subType] = msg.data;
-    if (!_state.salesPartials.meta || !_state.salesPartials.qty) return;
+    const key = `${_state.mallId}|${_state.date}|sales`;
+    if (!_state.salesPartials[key]) _state.salesPartials[key] = { meta: null, qty: null };
+    _state.salesPartials[key][msg.subType] = msg.data;
+
+    if (_state.salesPartialTimers[key]) {
+      clearTimeout(_state.salesPartialTimers[key]);
+      _state.salesPartialTimers[key] = null;
+    }
+
+    const partial = _state.salesPartials[key];
+    if (!partial.meta || !partial.qty) {
+      _state.salesPartialTimers[key] = setTimeout(async () => {
+        if (!_state.active || _state.modules[0] !== 'sales') return;
+        const p = _state.salesPartials[key];
+        if (!p || (!p.meta && !p.qty)) return;
+        console.warn(`[temu] sales partial timeout, degrade write. key=${key}, meta=${!!p.meta}, qty=${!!p.qty}`);
+        await finalizeSalesFromPartial(key, p);
+      }, 10_000);
+      return;
+    }
     // Both captured — merge and fall through to processModule
-    msg = { ...msg, subType: null, data: { meta: _state.salesPartials.meta, qty: _state.salesPartials.qty } };
-    _state.salesPartials = { meta: null, qty: null };
+    msg = { ...msg, subType: null, data: { meta: partial.meta, qty: partial.qty } };
+    delete _state.salesPartials[key];
   }
 
   _state.captured[msg.module] = msg.data;
@@ -253,7 +274,46 @@ async function handleApiData(msg) {
       _state.date = _state.dates[_state.dateIndex];
       _state.modules = [..._state.originalModules];
       _state.captured = {};
-      _state.salesPartials = { meta: null, qty: null };
+      _state.salesPartials = {};
+      _state.salesPartialTimers = {};
+      await sendStatusToTab(null, 'next-date');
+      navigateToNextModule();
+    } else {
+      const collectionTabId = _state.collectionTabId;
+      _state.collectionTabId = null;
+      resetState();
+      if (collectionTabId) {
+        try { chrome.tabs.remove(collectionTabId); } catch {}
+      }
+      await sendStatusToTab(null, 'complete');
+      console.log('[temu] Collection complete');
+    }
+  }
+}
+
+async function finalizeSalesFromPartial(key, partial) {
+  if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
+  delete _state.salesPartialTimers[key];
+  delete _state.salesPartials[key];
+  await sendStatusToTab('sales', 'processing');
+  try {
+    await processModule('sales', { meta: partial.meta ?? { result: [] }, qty: partial.qty ?? { result: [] } });
+    await sendStatusToTab('sales', 'done');
+  } catch (e) {
+    console.error('[temu] process sales(partial) error:', e);
+    await sendStatusToTab('sales', 'error');
+  }
+  _state.modules.shift();
+  if (_state.modules.length > 0) {
+    navigateToNextModule();
+  } else {
+    _state.dateIndex++;
+    if (_state.dateIndex < _state.dates.length) {
+      _state.date = _state.dates[_state.dateIndex];
+      _state.modules = [..._state.originalModules];
+      _state.captured = {};
+      _state.salesPartials = {};
+      _state.salesPartialTimers = {};
       await sendStatusToTab(null, 'next-date');
       navigateToNextModule();
     } else {
@@ -295,8 +355,9 @@ async function navigateToNextModule() {
     return;
   }
 
-  // Encode capture config into URL hash so fetch_hook.js can read it synchronously
+  // Encode capture config into URL query so fetch_hook.js can read it synchronously
   // at document_start — before page APIs fire and before ACTIVATE_CAPTURE arrives.
+  // Keep hash fallback for compatibility.
   const hashCfg = {
     mod,
     date: _state.date,
@@ -304,7 +365,9 @@ async function navigateToNextModule() {
     startDate: _state.dates[0],
     endDate:   _state.dates[_state.dates.length - 1],
   };
-  url += '#__tmu=' + encodeURIComponent(JSON.stringify(hashCfg));
+  const boot = encodeURIComponent(JSON.stringify(hashCfg));
+  url += (url.includes('?') ? '&' : '?') + '__tmu=' + boot;
+  url += '#__tmu=' + boot;
 
   _retryCount = 0;
   if (_state.collectionTabId === null) {
