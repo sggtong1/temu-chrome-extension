@@ -31,9 +31,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Check page health after 2s and report back
     const captureModule = msg.module;
     setTimeout(() => {
-      if (!checkPageReady()) {
-        try { chrome.runtime.sendMessage({ type: 'PAGE_ERROR', module: captureModule }); } catch {}
-      }
+      if (!checkPageReady()) safeSend({ type: 'PAGE_ERROR', module: captureModule });
     }, 2000);
     sendResponse({ ok: true });
   }
@@ -53,15 +51,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-function safeSend(msg) {
+let _contextInvalidated = false;
+function reportContextInvalidated() {
+  if (_contextInvalidated) return;
+  _contextInvalidated = true;
   try {
-    chrome.runtime.sendMessage(msg);
-  } catch (e) {
-    if (String(e).includes('Extension context invalidated')) {
-      try { showBanner('插件已更新，请刷新页面后重新采集', 'warn'); } catch {}
-    }
+    showBanner('插件已更新，请刷新页面（F5）后再操作', 'warn');
+    const startBtn = shadow.getElementById('start-btn');
+    if (startBtn) { startBtn.disabled = true; startBtn.textContent = '⚠ 请刷新页面'; }
+  } catch {}
+}
+function isCtxValid() {
+  try { return !!chrome.runtime?.id; } catch { return false; }
+}
+function safeChrome(fn) {
+  if (!isCtxValid()) { reportContextInvalidated(); return; }
+  try { return fn(); }
+  catch (e) {
+    if (String(e).includes('Extension context invalidated')) reportContextInvalidated();
   }
 }
+function safeSend(msg) { safeChrome(() => chrome.runtime.sendMessage(msg)); }
 
 window.addEventListener('temu:apiCapture', (e) => {
   safeSend({
@@ -249,10 +259,10 @@ function saveState() {
   const startDate = shadow.getElementById('date-start').value;
   const endDate   = shadow.getElementById('date-end').value;
   const mallId    = shadow.getElementById('mall-select').value;
-  chrome.storage.local.set({ panelState: { modules, region, startDate, endDate, mallId } });
+  safeChrome(() => chrome.storage.local.set({ panelState: { modules, region, startDate, endDate, mallId } }));
 }
 
-chrome.storage.local.get('panelState', ({ panelState }) => {
+safeChrome(() => chrome.storage.local.get('panelState', ({ panelState }) => {
   if (!panelState) return;
   if (panelState.modules) {
     shadow.querySelectorAll('input[name=mod]').forEach(el => {
@@ -263,7 +273,7 @@ chrome.storage.local.get('panelState', ({ panelState }) => {
   if (panelState.startDate) shadow.getElementById('date-start').value = panelState.startDate;
   if (panelState.endDate)   shadow.getElementById('date-end').value = panelState.endDate;
   if (panelState.mallId)    _currentMallId = panelState.mallId;
-});
+}));
 
 shadow.querySelectorAll('input[name=mod]').forEach(el => el.addEventListener('change', saveState));
 shadow.getElementById('region').addEventListener('change', saveState);
@@ -318,7 +328,7 @@ function stopDrag() {
   _dragging = false;
   document.removeEventListener('mousemove', onDrag, { capture: true });
   const rect = host.getBoundingClientRect();
-  chrome.storage.local.set({ panelPos: { top: rect.top, left: rect.left } });
+  safeChrome(() => chrome.storage.local.set({ panelPos: { top: rect.top, left: rect.left } }));
 }
 
 shadow.getElementById('drag-header').addEventListener('mousedown', startDrag);
@@ -327,12 +337,12 @@ shadow.getElementById('bar').addEventListener('mousedown', (e) => {
   startDrag(e);
 });
 
-chrome.storage.local.get('panelPos', ({ panelPos }) => {
+safeChrome(() => chrome.storage.local.get('panelPos', ({ panelPos }) => {
   if (!panelPos) return;
   host.style.bottom = 'auto'; host.style.right = 'auto';
   host.style.top  = Math.min(panelPos.top,  window.innerHeight - 60) + 'px';
   host.style.left = Math.min(panelPos.left, window.innerWidth  - 60) + 'px';
-});
+}));
 
 // ── Banner (error / info) ─────────────────────────────────────────────────────
 
@@ -414,12 +424,12 @@ if (urlMallId) {
   select.disabled = false;
   _currentMallId = urlMallId;
   shadow.getElementById('start-btn').disabled = false;
-  chrome.runtime.sendMessage({ type: 'GET_SHOP_INFO', mallId: urlMallId }, (shop) => {
+  safeChrome(() => chrome.runtime.sendMessage({ type: 'GET_SHOP_INFO', mallId: urlMallId }, (shop) => {
     if (shop) {
       const typeLabel = shop.site_type === 'semi_us' ? '半托' : '全托';
       select.options[0].text = `${shop.shop_name} · ${typeLabel} · ID:${urlMallId}`;
     }
-  });
+  }));
 }
 
 // ── Progress rendering ────────────────────────────────────────────────────────
@@ -469,18 +479,11 @@ shadow.getElementById('start-btn').addEventListener('click', () => {
   if (!mallId)         { showBanner('请先选择店铺'); return; }
   if (!startDate)      { showBanner('请选择采集日期'); return; }
 
+  if (!isCtxValid()) { reportContextInvalidated(); return; }
   const totalDates = dateRangeLength(startDate, endDate);
   shadow.getElementById('start-btn').style.display = 'none';
   const siteType = _mallTypeCache[String(mallId)] || null;
-  try {
-    chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId, siteType });
-  } catch (e) {
-    if (String(e).includes('Extension context invalidated')) {
-      shadow.getElementById('start-btn').style.display = '';
-      showBanner('插件已更新，请刷新页面后重试', 'warn');
-    }
-    return;
-  }
+  safeSend({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId, siteType });
   renderProgress(modules, startDate, 1, totalDates);
   shadow.getElementById('bar-sub').textContent = '· 采集中';
 });
