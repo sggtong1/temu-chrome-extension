@@ -471,8 +471,9 @@ shadow.getElementById('start-btn').addEventListener('click', () => {
 
   const totalDates = dateRangeLength(startDate, endDate);
   shadow.getElementById('start-btn').style.display = 'none';
+  const siteType = _mallTypeCache[String(mallId)] || null;
   try {
-    chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId });
+    chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId, siteType });
   } catch (e) {
     if (String(e).includes('Extension context invalidated')) {
       shadow.getElementById('start-btn').style.display = '';

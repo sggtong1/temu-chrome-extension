@@ -169,47 +169,63 @@ async function handleGetShopInfo(mallId) {
 }
 
 async function handleStartCollection(msg, tabId) {
-  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
-  if (!supabaseUrl || !supabaseAnonKey) {
+  console.log('[temu] START_COLLECTION received', { mallId: msg.mallId, modules: msg.modules, siteType: msg.siteType, region: msg.region });
+  try {
+    const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
+    if (!supabaseUrl || !supabaseAnonKey) {
+      console.warn('[temu] missing Supabase config — aborting');
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error-no-supabase' });
+      } catch {}
+      return;
+    }
+
+    // Resolve siteType: msg from panel > userInfo cache > Supabase shops table > 'semi_us'
+    const cached = shopFromCache(msg.mallId);
+    let shopName = cached?.mallName;
+    let siteType = msg.siteType || cached?.siteType;
+
+    if (!siteType) {
+      console.log('[temu] siteType not in msg/cache, querying Supabase shops table');
+      try {
+        const shop = await getShopByMallId(supabaseUrl, supabaseAnonKey, msg.mallId);
+        shopName = shopName ?? shop?.shop_name;
+        siteType = shop?.site_type ?? 'semi_us';
+      } catch (e) {
+        console.warn('[temu] getShopByMallId failed, defaulting to semi_us:', e);
+        siteType = 'semi_us';
+      }
+    }
+    console.log('[temu] resolved siteType=', siteType, 'shopName=', shopName);
+
+    const dates = generateDateRange(msg.startDate ?? msg.date, msg.endDate ?? msg.startDate ?? msg.date);
+
+    _state = {
+      active: true,
+      originTabId: tabId,
+      collectionTabId: null,
+      originalModules: [...msg.modules],
+      modules: [...msg.modules],
+      dates,
+      dateIndex: 0,
+      date: dates[0],
+      region: msg.region,
+      mallId: msg.mallId,
+      shopName: shopName ?? `mall${msg.mallId}`,
+      siteType,
+      captured: {},
+      supabaseUrl,
+      supabaseAnonKey,
+    };
+
+    console.log('[temu] state initialized, calling navigateToNextModule');
+    navigateToNextModule();
+  } catch (e) {
+    console.error('[temu] handleStartCollection failed:', e);
     try {
-      await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error-no-supabase' });
+      await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error' });
     } catch {}
-    return;
   }
-
-  // Prefer userInfo cache for siteType (accurate, no extra request);
-  // fall back to Supabase shops table if cache not yet populated
-  const cached = shopFromCache(msg.mallId);
-  let shopName = cached?.mallName;
-  let siteType = cached?.siteType;
-
-  if (!siteType) {
-    const shop = await getShopByMallId(supabaseUrl, supabaseAnonKey, msg.mallId);
-    shopName = shopName ?? shop?.shop_name;
-    siteType = shop?.site_type ?? 'semi_us';
-  }
-
-  const dates = generateDateRange(msg.startDate ?? msg.date, msg.endDate ?? msg.startDate ?? msg.date);
-
-  _state = {
-    active: true,
-    originTabId: tabId,
-    collectionTabId: null,
-    originalModules: [...msg.modules],
-    modules: [...msg.modules],
-    dates,
-    dateIndex: 0,
-    date: dates[0],
-    region: msg.region,
-    mallId: msg.mallId,
-    shopName: shopName ?? `mall${msg.mallId}`,
-    siteType,
-    captured: {},
-    supabaseUrl,
-    supabaseAnonKey,
-  };
-
-  navigateToNextModule();
 }
 
 async function handleApiData(msg) {
@@ -274,13 +290,15 @@ async function navigateToNextModule() {
   }
 
   let url = moduleUrl(mod, _state.mallId, _state.siteType, _state.region);
-  if (mod === 'activity') {
-    url += `&startDate=${_state.dates[0]}&endDate=${_state.dates[_state.dates.length - 1]}`;
-  }
+  console.log(`[temu] navigateToNextModule mod=${mod}, siteType=${_state.siteType}, region=${_state.region}, url=${url}`);
   if (!url) {
+    console.warn(`[temu] no URL for module=${mod} siteType=${_state.siteType} — skipping`);
     _state.modules.shift();
     navigateToNextModule();
     return;
+  }
+  if (mod === 'activity') {
+    url += `&startDate=${_state.dates[0]}&endDate=${_state.dates[_state.dates.length - 1]}`;
   }
 
   // Encode capture config into URL query so fetch_hook.js can read it synchronously
@@ -299,11 +317,18 @@ async function navigateToNextModule() {
 
   _retryCount = 0;
   if (_state.collectionTabId === null) {
+    console.log('[temu] creating collection tab:', url);
     chrome.tabs.create({ url, active: false }, (tab) => {
+      if (chrome.runtime.lastError) {
+        console.error('[temu] tabs.create failed:', chrome.runtime.lastError.message);
+        return;
+      }
+      console.log('[temu] collection tab created, id=', tab.id);
       _state.collectionTabId = tab.id;
       attachCaptureListener(mod);
     });
   } else {
+    console.log('[temu] updating collection tab', _state.collectionTabId, 'to:', url);
     chrome.tabs.update(_state.collectionTabId, { url }, () => attachCaptureListener(mod));
   }
 }
