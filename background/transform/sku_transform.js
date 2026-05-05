@@ -49,9 +49,22 @@ function _parseSemiUs(rawSales, targetDate) {
 }
 
 function _parseFullManaged(rawSales, targetDate) {
-  // rawSales is the listOverall response directly
-  // result is an array of product objects, each with skuQuantityDetailList
-  const products = rawSales?.result ?? [];
+  // rawSales is the listOverall response. Real shape varies — log keys for diagnosis.
+  const result = rawSales?.result;
+  console.log('[temu] _parseFullManaged result keys:',
+    result && typeof result === 'object' ? Object.keys(result) : typeof result,
+    'sample:', JSON.stringify(result).slice(0, 500));
+
+  // Try common list shapes: result is array | result.list | result.dataList |
+  // result.items | result.records | result.goodsList
+  const products = Array.isArray(result) ? result
+    : result?.list ?? result?.dataList ?? result?.items
+      ?? result?.records ?? result?.goodsList ?? result?.data ?? [];
+
+  if (!Array.isArray(products) || !products.length) {
+    console.warn('[temu] _parseFullManaged: no products extracted, full result keys =',
+      result && typeof result === 'object' ? Object.keys(result) : 'N/A');
+  }
 
   const skuSales = {};
   const skuPrices = {};
