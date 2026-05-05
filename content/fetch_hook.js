@@ -24,8 +24,8 @@ const PATTERNS_SEMI_US = {
 // sales_qty  = querySkuSalesNumber (sales numbers per SKU per date)
 const PATTERNS_FULL_MANAGED = {
   list:       '/api/seller/full/flow/analysis/goods/list',
-  sales_meta: 'listOverall',
-  sales_qty:  'querySkuSalesNumber',
+  sales_meta: ['listOverall', '/sale-manage/list-overall'],
+  sales_qty:  ['querySkuSalesNumber', '/sale-manage/query-sku-sales-number'],
   activity:   '/api/kiana/gamblers/marketing/enroll/list',
   promo:      '/bgn/pc/report/ad-report-detail/query',
 };
@@ -44,7 +44,8 @@ window.addEventListener('temu:setConfig', (e) => {
 function matchModule(url) {
   const patterns = _siteType === 'full_managed' ? PATTERNS_FULL_MANAGED : PATTERNS_SEMI_US;
   for (const [key, pattern] of Object.entries(patterns)) {
-    if (url.includes(pattern)) {
+    const matched = Array.isArray(pattern) ? pattern.some(p => url.includes(p)) : url.includes(pattern);
+    if (matched) {
       if (key === 'sales_meta') return { module: 'sales', subType: 'meta' };
       if (key === 'sales_qty')  return { module: 'sales', subType: 'qty' };
       return { module: key, subType: null };
