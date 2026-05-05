@@ -33,14 +33,15 @@ document.getElementById('test').addEventListener('click', async () => {
   }
   setStatus('测试中...', true);
   try {
-    const resp = await fetch(`${supabaseUrl}/rest/v1/shops?select=mall_id&limit=1`, {
+    // Query root schema endpoint — always 200 if URL + key are valid
+    const resp = await fetch(`${supabaseUrl}/rest/v1/`, {
       headers: { apikey: supabaseAnonKey, Authorization: `Bearer ${supabaseAnonKey}` },
     });
     if (resp.ok) {
       setStatus('✅ 连接成功', true);
     } else {
       const text = await resp.text();
-      setStatus(`❌ HTTP ${resp.status}: ${text.slice(0, 80)}`, false);
+      setStatus(`❌ HTTP ${resp.status}: ${text.slice(0, 120)}`, false);
     }
   } catch (e) {
     setStatus(`❌ ${e.message}`, false);
