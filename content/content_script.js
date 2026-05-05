@@ -11,11 +11,29 @@ const MODULE_LABELS = {
 
 // ── Message bridge ───────────────────────────────────────────────────────────
 
+function checkPageReady() {
+  const title = document.title.toLowerCase();
+  const body  = (document.body?.innerText ?? '').slice(0, 1000).toLowerCase();
+  if (title.includes('just a moment')) return false;   // Cloudflare challenge
+  if (title.includes('error') && !title.includes('seller')) return false;
+  if (body.includes('too many visitors')) return false;
+  if (body.includes('访问人数过多'))       return false;
+  if (body.includes('enable javascript and cookies')) return false;
+  return true;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'ACTIVATE_CAPTURE') {
     window.dispatchEvent(new CustomEvent('temu:setConfig', {
       detail: { activeModule: msg.module, targetDate: msg.targetDate, siteType: msg.siteType },
     }));
+    // Check page health after 2s and report back
+    const captureModule = msg.module;
+    setTimeout(() => {
+      if (!checkPageReady()) {
+        chrome.runtime.sendMessage({ type: 'PAGE_ERROR', module: captureModule });
+      }
+    }, 2000);
     sendResponse({ ok: true });
   }
   if (msg.type === 'DEACTIVATE_CAPTURE') {
@@ -140,6 +158,7 @@ shadow.innerHTML = `
   .badge-running { background: #dbeafe; color: #1e40af; }
   .badge-done    { background: #dcfce7; color: #15803d; }
   .badge-error   { background: #fee2e2; color: #b91c1c; }
+  .badge-retry   { background: #fff7ed; color: #c2410c; }
 </style>
 
 <div class="bar" id="bar" style="display:none">
@@ -360,6 +379,7 @@ function setProgBadge(module, status) {
     processing: ['badge-running', '采集中'],
     done:       ['badge-done',    '✓ 完成'],
     error:      ['badge-error',   '✗ 失败'],
+    retrying:   ['badge-retry',   '↻ 重试'],
   };
   const [cls, label] = map[status] ?? ['badge-wait', '等待'];
   badge.className = `prog-badge ${cls}`;
@@ -418,6 +438,9 @@ function updatePanelStatus(msg) {
   }
   setProgBadge(msg.module, msg.status);
   if (msg.status === 'processing') {
-    shadow.getElementById('bar-sub').textContent = `· 采集中`;
+    shadow.getElementById('bar-sub').textContent = '· 采集中';
+  }
+  if (msg.status === 'retrying') {
+    shadow.getElementById('bar-sub').textContent = '· 重试中';
   }
 }

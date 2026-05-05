@@ -90,10 +90,15 @@ let _state = {
 };
 
 let _captureTimer = null;
+let _retryCount   = 0;
+let _retryTimer   = null;
 
 function resetState() {
   if (_captureTimer) clearTimeout(_captureTimer);
+  if (_retryTimer)   clearTimeout(_retryTimer);
   _captureTimer = null;
+  _retryTimer   = null;
+  _retryCount   = 0;
   _state.active = false;
   _state.modules = [];
   _state.dates = [];
@@ -115,6 +120,10 @@ function generateDateRange(startDate, endDate) {
 // ── Message router ──────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'PAGE_ERROR') {
+    if (_state.active && _state.modules[0] === msg.module) handlePageError();
+    return false;
+  }
   if (msg.type === 'USER_INFO') {
     handleUserInfo(msg.data);
     return false;
@@ -258,27 +267,57 @@ function navigateToNextModule() {
     return;
   }
 
-  chrome.tabs.update(_state.tabId, { url }, () => {
-    const listener = (tabId, changeInfo) => {
-      if (tabId !== _state.tabId || changeInfo.status !== 'complete') return;
-      chrome.tabs.onUpdated.removeListener(listener);
+  _retryCount = 0;
+  chrome.tabs.update(_state.tabId, { url }, () => attachCaptureListener(mod));
+}
 
-      chrome.tabs.sendMessage(_state.tabId, {
-        type: 'ACTIVATE_CAPTURE',
-        module: mod,
-        targetDate: _state.date,
-        siteType: _state.siteType,
-      });
+function attachCaptureListener(mod) {
+  if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
 
-      _captureTimer = setTimeout(async () => {
-        console.warn(`[temu] timeout waiting for ${mod}`);
-        await sendStatusToTab(mod, 'error');
-        _state.modules.shift();
-        navigateToNextModule();
-      }, 60_000);
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-  });
+  const listener = (tabId, changeInfo) => {
+    if (tabId !== _state.tabId || changeInfo.status !== 'complete') return;
+    chrome.tabs.onUpdated.removeListener(listener);
+
+    chrome.tabs.sendMessage(_state.tabId, {
+      type: 'ACTIVATE_CAPTURE',
+      module: mod,
+      targetDate: _state.date,
+      siteType: _state.siteType,
+    });
+
+    // 60s hard timeout — fallback if PAGE_ERROR detection also fails
+    _captureTimer = setTimeout(async () => {
+      console.warn(`[temu] timeout waiting for ${mod}`);
+      await sendStatusToTab(mod, 'error');
+      _state.modules.shift();
+      _retryCount = 0;
+      navigateToNextModule();
+    }, 60_000);
+  };
+  chrome.tabs.onUpdated.addListener(listener);
+}
+
+async function handlePageError() {
+  if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
+  const mod = _state.modules[0];
+  _retryCount++;
+
+  if (_retryCount > 3) {
+    console.warn(`[temu] max retries (3) reached for ${mod}, skipping`);
+    _retryCount = 0;
+    await sendStatusToTab(mod, 'error');
+    _state.modules.shift();
+    navigateToNextModule();
+    return;
+  }
+
+  console.log(`[temu] page error for ${mod}, retry ${_retryCount}/3 in 5s`);
+  await sendStatusToTab(mod, 'retrying');
+
+  _retryTimer = setTimeout(() => {
+    _retryTimer = null;
+    chrome.tabs.reload(_state.tabId, () => attachCaptureListener(mod));
+  }, 5000);
 }
 
 async function processModule(module, rawData) {
