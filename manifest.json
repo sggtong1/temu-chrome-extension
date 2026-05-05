@@ -46,7 +46,7 @@
   },
   "icons": { "48": "icons/icon-48.png" },
   "web_accessible_resources": [{
-    "resources": ["_dev_reload.json"],
+    "resources": ["dev-reload.json"],
     "matches": ["https://agentseller*.temu.com/*"]
   }]
 }

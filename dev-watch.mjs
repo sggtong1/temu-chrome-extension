@@ -14,7 +14,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RELOAD_FILE = path.join(__dirname, '_dev_reload.json');
+const RELOAD_FILE = path.join(__dirname, 'dev-reload.json');
 
 const watcher = chokidar.watch([
   'manifest.json',
@@ -37,4 +37,4 @@ watcher.on('change', triggerReload);
 watcher.on('add', triggerReload);
 
 console.log('👀 Watching for changes... (Ctrl+C to stop)');
-console.log('Make sure _dev_reload.json is listed in web_accessible_resources in manifest.json');
+console.log('Make sure dev-reload.json is listed in web_accessible_resources in manifest.json');
