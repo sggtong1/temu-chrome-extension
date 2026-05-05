@@ -4,11 +4,8 @@
  * semi_us shape:
  *   { result: { saleAnalysisDetailDTOList: [{ productSkuId, productId, skuExtCode, skuSaleDTOList: [{date, saleNum}] }] } }
  *
- * full_managed shape (merged from two APIs):
- *   {
- *     meta: listOverall response — result is array of products with skuQuantityDetailList
- *     qty:  querySkuSalesNumber response — result is array of { date, prodSkuId, salesNumber }
- *   }
+ * full_managed shape (listOverall single-API):
+ *   { result: [ { goodsId, skuQuantityDetailList: [{ productSkuId, skuExtCode, className, ... }] } ] }
  *
  * @param {object} rawSales
  * @param {{ siteType: string, date: string }} ctx
@@ -52,18 +49,9 @@ function _parseSemiUs(rawSales, targetDate) {
 }
 
 function _parseFullManaged(rawSales, targetDate) {
-  // rawSales = { meta: listOverall response, qty: querySkuSalesNumber response }
-  const products = rawSales?.meta?.result ?? [];
-  const qtyItems = rawSales?.qty?.result ?? [];
-
-  // Build sales-number map from querySkuSalesNumber response
-  // Response items: { date, prodSkuId, salesNumber }
-  const salesMap = {};
-  for (const item of qtyItems) {
-    if (item.date === targetDate) {
-      salesMap[String(item.prodSkuId ?? '')] = item.salesNumber ?? 0;
-    }
-  }
+  // rawSales is the listOverall response directly
+  // result is an array of product objects, each with skuQuantityDetailList
+  const products = rawSales?.result ?? [];
 
   const skuSales = {};
   const skuPrices = {};
@@ -75,12 +63,14 @@ function _parseFullManaged(rawSales, targetDate) {
       const id = String(sku.productSkuId ?? '');
       if (!id) continue;
 
-      skuSales[id] = salesMap[id] ?? 0;
+      // listOverall has no per-day sales qty; use 0 as placeholder.
+      // Rows are still written so SKU metadata is captured.
+      skuSales[id] = sku.salesNum ?? sku.saleNum ?? sku.salesNumber ?? 0;
       skuPrices[id] = {
-        activityPrice: null,  // requires kiana/gamblers API
-        dailyPrice: null,
-        extCode: sku.skuExtCode ?? '',
-        properties: sku.className ? { className: sku.className } : {},
+        activityPrice: sku.activityPrice != null ? sku.activityPrice / 100 : null,
+        dailyPrice:    sku.supplierPrice  != null ? sku.supplierPrice  / 100 : null,
+        extCode:       sku.skuExtCode ?? sku.extCode ?? '',
+        properties:    sku.className ? { className: sku.className } : {},
       };
       if (spuId) skuSpuMap[id] = spuId;
     }
@@ -145,7 +135,6 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
 
   for (const skuId of Object.keys(skuSales)) {
     const salesQty = skuSales[skuId] ?? 0;
-    if (!salesQty) continue;
 
     const priceInfo = skuPrices[skuId] ?? {};
     const activityPrice = priceInfo.activityPrice;

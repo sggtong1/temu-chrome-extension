@@ -23,15 +23,13 @@ const PATTERNS_SEMI_US = {
   promo:  '/bgn/pc/report/ad-report-detail/query',
 };
 
-// full_managed: list + sales (two APIs) + activity + promo (no orders)
-// sales_meta = listOverall (SKU metadata: extCode, supplierPrice)
-// sales_qty  = querySkuSalesNumber (sales numbers per SKU per date)
+// full_managed: list + sales + activity + promo (no orders)
+// sales = listOverall only (single-API mode; fires on page load automatically)
 const PATTERNS_FULL_MANAGED = {
-  list:       '/api/seller/full/flow/analysis/goods/list',
-  sales_meta: ['listOverall', '/sale-manage/list-overall'],
-  sales_qty:  ['querySkuSalesNumber', '/sale-manage/query-sku-sales-number'],
-  activity:   '/api/kiana/gamblers/marketing/enroll/list',
-  promo:      '/bgn/pc/report/ad-report-detail/query',
+  list:     '/api/seller/full/flow/analysis/goods/list',
+  sales:    ['listOverall', '/sale-manage/list-overall'],
+  activity: '/api/kiana/gamblers/marketing/enroll/list',
+  promo:    '/bgn/pc/report/ad-report-detail/query',
 };
 
 let _siteType = _hashCfg?.site || 'semi_us';
@@ -50,8 +48,6 @@ function matchModule(url) {
   for (const [key, pattern] of Object.entries(patterns)) {
     const matched = Array.isArray(pattern) ? pattern.some(p => url.includes(p)) : url.includes(pattern);
     if (matched) {
-      if (key === 'sales_meta') return { module: 'sales', subType: 'meta' };
-      if (key === 'sales_qty')  return { module: 'sales', subType: 'qty' };
       return { module: key, subType: null };
     }
   }
