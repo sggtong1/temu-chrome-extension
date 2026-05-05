@@ -3,10 +3,11 @@
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const MODULE_LABELS = {
-  list:   '流量分析',
-  sales:  '销售管理',
-  orders: '订单管理',
-  promo:  '广告报表',
+  list:     '流量分析',
+  sales:    '销售管理',
+  orders:   '订单管理',
+  activity: '营销活动',
+  promo:    '广告报表',
 };
 
 // ── Message bridge ───────────────────────────────────────────────────────────
@@ -181,6 +182,7 @@ shadow.innerHTML = `
           <label><input type="checkbox" name="mod" value="list" checked> 流量分析</label>
           <label><input type="checkbox" name="mod" value="sales"> 销售管理</label>
           <label><input type="checkbox" name="mod" value="orders" checked> 订单管理</label>
+          <label><input type="checkbox" name="mod" value="activity"> 营销活动</label>
           <label><input type="checkbox" name="mod" value="promo" checked> 广告报表</label>
         </div>
       </div>
@@ -228,6 +230,35 @@ function yesterday() {
 const yest = yesterday();
 shadow.getElementById('date-start').value = yest;
 shadow.getElementById('date-end').value = yest;
+
+// ── State persistence ─────────────────────────────────────────────────────────
+
+function saveState() {
+  const modules   = [...shadow.querySelectorAll('input[name=mod]:checked')].map(el => el.value);
+  const region    = shadow.getElementById('region').value;
+  const startDate = shadow.getElementById('date-start').value;
+  const endDate   = shadow.getElementById('date-end').value;
+  const mallId    = shadow.getElementById('mall-select').value;
+  chrome.storage.local.set({ panelState: { modules, region, startDate, endDate, mallId } });
+}
+
+chrome.storage.local.get('panelState', ({ panelState }) => {
+  if (!panelState) return;
+  if (panelState.modules) {
+    shadow.querySelectorAll('input[name=mod]').forEach(el => {
+      el.checked = panelState.modules.includes(el.value);
+    });
+  }
+  if (panelState.region)    shadow.getElementById('region').value = panelState.region;
+  if (panelState.startDate) shadow.getElementById('date-start').value = panelState.startDate;
+  if (panelState.endDate)   shadow.getElementById('date-end').value = panelState.endDate;
+  if (panelState.mallId)    _currentMallId = panelState.mallId;
+});
+
+shadow.querySelectorAll('input[name=mod]').forEach(el => el.addEventListener('change', saveState));
+shadow.getElementById('region').addEventListener('change', saveState);
+shadow.getElementById('date-start').addEventListener('change', saveState);
+shadow.getElementById('date-end').addEventListener('change', saveState);
 
 // ── Collapse / expand ─────────────────────────────────────────────────────────
 
@@ -307,6 +338,26 @@ function hideBanner() {
 // ── Mall selector ─────────────────────────────────────────────────────────────
 
 let _currentMallId = null;
+const _mallTypeCache = {}; // mallId (string) → 'full_managed' | 'semi_us'
+
+// Show/hide modules depending on shop type
+// full_managed: list + sales + activity + promo (no orders)
+// semi_us:      list + orders + promo (no sales, no activity)
+function updateModuleVisibility(siteType) {
+  if (!siteType) return;
+  const isFull = siteType === 'full_managed';
+  setModuleVisible('sales',    isFull);
+  setModuleVisible('activity', isFull);
+  setModuleVisible('orders',  !isFull);
+}
+
+function setModuleVisible(mod, visible) {
+  const input = shadow.querySelector(`input[name=mod][value="${mod}"]`);
+  if (!input) return;
+  const label = input.closest('label');
+  if (label) label.style.display = visible ? '' : 'none';
+  if (!visible) input.checked = false;
+}
 
 function populateMallSelect(malls) {
   if (!malls.length) return;
@@ -318,18 +369,26 @@ function populateMallSelect(malls) {
   ).join('');
   select.disabled = false;
 
+  // Build local type cache from the full mall list
+  for (const m of malls) {
+    _mallTypeCache[String(m.mallId)] = m.managedType === 0 ? 'full_managed' : 'semi_us';
+  }
+
   const urlId = detectMallIdFromUrl();
   const preferred = urlId || prevVal || String(malls[0].mallId);
   const opt = [...select.options].find(o => o.value === String(preferred));
   if (opt) opt.selected = true;
 
   _currentMallId = select.value;
+  updateModuleVisibility(_mallTypeCache[_currentMallId]);
   shadow.getElementById('start-btn').disabled = false;
   hideBanner();
 }
 
 shadow.getElementById('mall-select').addEventListener('change', (e) => {
   _currentMallId = e.target.value;
+  updateModuleVisibility(_mallTypeCache[_currentMallId]);
+  saveState();
 });
 
 function detectMallIdFromUrl() {

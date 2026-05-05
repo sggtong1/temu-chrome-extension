@@ -2,6 +2,7 @@ import { getShopByMallId, getSkuCost, supabaseUpsert } from './supabase.js';
 import { transformListResponse } from './transform/list_transform.js';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
+import { transformActivityResponse } from './transform/activity_transform.js';
 
 // ── Dev-mode auto-reload ────────────────────────────────────────────────────
 // Polls dev-reload.json (written by dev-watch.mjs) and reloads the extension
@@ -35,13 +36,17 @@ function moduleUrl(module, mallId, siteType, region) {
   }
   if (module === 'sales') {
     if (siteType === 'semi_us') {
-      return `${US_BASE}/main/data-center/goods-data?mallId=${mallId}`;
+      return `${US_BASE}/main/data-center/goods-data?mallId=${mallId}&init=true`;
     }
-    // full_managed: agentseller.temu.com regardless of region
-    return `${DEF_BASE}/stock/fully-mgt/sale-manage/main?mallId=${mallId}`;
+    return `${DEF_BASE}/stock/fully-mgt/sale-manage/main?mallId=${mallId}&init=true`;
   }
   if (module === 'orders') {
     return `${US_BASE}/mmsos/orders.html?mallId=${mallId}`;
+  }
+  if (module === 'activity') {
+    // activity is full_managed only; content script fetches the API directly after load
+    const uid = shopFromCache(mallId)?.uniqueId ?? '';
+    return `https://agentseller.temu.com/activity/marketing-activity/log?mallId=${mallId}&uId=${uid}`;
   }
   if (module === 'promo') {
     return `${base}/main/ads-management/ads-report?mallId=${mallId}`;
@@ -73,7 +78,8 @@ function shopFromCache(mallId) {
 
 let _state = {
   active: false,
-  tabId: null,
+  originTabId: null,      // panel tab — receives status updates
+  collectionTabId: null,  // background tab we navigate for collection
   originalModules: [],   // modules chosen by user, reset each date
   modules: [],           // remaining modules for current date
   dates: [],             // all dates in the requested range
@@ -189,7 +195,8 @@ async function handleStartCollection(msg, tabId) {
 
   _state = {
     active: true,
-    tabId,
+    originTabId: tabId,
+    collectionTabId: null,
     originalModules: [...msg.modules],
     modules: [...msg.modules],
     dates,
@@ -211,6 +218,7 @@ async function handleStartCollection(msg, tabId) {
 async function handleApiData(msg) {
   if (!_state.active) return;
   const expected = _state.modules[0];
+  console.log(`[temu] API_DATA received: module=${msg.module}, expected=${expected}, listLen=${msg.data?.result?.list?.length ?? 'n/a'}`);
   if (msg.module !== expected) return;
 
   // full_managed SALES needs two API captures (listOverall + querySkuSalesNumber)
@@ -249,39 +257,79 @@ async function handleApiData(msg) {
       await sendStatusToTab(null, 'next-date');
       navigateToNextModule();
     } else {
+      const collectionTabId = _state.collectionTabId;
+      _state.collectionTabId = null;
       resetState();
+      if (collectionTabId) {
+        try { chrome.tabs.remove(collectionTabId); } catch {}
+      }
       await sendStatusToTab(null, 'complete');
       console.log('[temu] Collection complete');
     }
   }
 }
 
-function navigateToNextModule() {
+async function navigateToNextModule() {
   const mod = _state.modules[0];
-  if (!mod) return;
+  if (!mod) {
+    // No modules left for this date.
+    // If originalModules is also empty (all range-modules done), complete immediately.
+    if (!_state.originalModules.length) {
+      const collectionTabId = _state.collectionTabId;
+      _state.collectionTabId = null;
+      resetState();
+      if (collectionTabId) try { chrome.tabs.remove(collectionTabId); } catch {}
+      await sendStatusToTab(null, 'complete');
+      console.log('[temu] Collection complete');
+    }
+    return;
+  }
 
-  const url = moduleUrl(mod, _state.mallId, _state.siteType, _state.region);
+  let url = moduleUrl(mod, _state.mallId, _state.siteType, _state.region);
+  if (mod === 'activity') {
+    url += `&startDate=${_state.dates[0]}&endDate=${_state.dates[_state.dates.length - 1]}`;
+  }
   if (!url) {
     _state.modules.shift();
     navigateToNextModule();
     return;
   }
 
+  // Encode capture config into URL hash so fetch_hook.js can read it synchronously
+  // at document_start — before page APIs fire and before ACTIVATE_CAPTURE arrives.
+  const hashCfg = {
+    mod,
+    date: _state.date,
+    site: _state.siteType,
+    startDate: _state.dates[0],
+    endDate:   _state.dates[_state.dates.length - 1],
+  };
+  url += '#__tmu=' + encodeURIComponent(JSON.stringify(hashCfg));
+
   _retryCount = 0;
-  chrome.tabs.update(_state.tabId, { url }, () => attachCaptureListener(mod));
+  if (_state.collectionTabId === null) {
+    chrome.tabs.create({ url, active: false }, (tab) => {
+      _state.collectionTabId = tab.id;
+      attachCaptureListener(mod);
+    });
+  } else {
+    chrome.tabs.update(_state.collectionTabId, { url }, () => attachCaptureListener(mod));
+  }
 }
 
 function attachCaptureListener(mod) {
   if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
 
   const listener = (tabId, changeInfo) => {
-    if (tabId !== _state.tabId || changeInfo.status !== 'complete') return;
+    if (tabId !== _state.collectionTabId || changeInfo.status !== 'complete') return;
     chrome.tabs.onUpdated.removeListener(listener);
 
-    chrome.tabs.sendMessage(_state.tabId, {
+    chrome.tabs.sendMessage(_state.collectionTabId, {
       type: 'ACTIVATE_CAPTURE',
       module: mod,
       targetDate: _state.date,
+      startDate: mod === 'activity' ? _state.dates[0] : _state.date,
+      endDate:   mod === 'activity' ? _state.dates[_state.dates.length - 1] : _state.date,
       siteType: _state.siteType,
     });
 
@@ -316,7 +364,7 @@ async function handlePageError() {
 
   _retryTimer = setTimeout(() => {
     _retryTimer = null;
-    chrome.tabs.reload(_state.tabId, () => attachCaptureListener(mod));
+    chrome.tabs.reload(_state.collectionTabId, () => attachCaptureListener(mod));
   }, 5000);
 }
 
@@ -350,6 +398,21 @@ async function processModule(module, rawData) {
     console.log('[temu] orders captured, will merge into SALES processing');
   }
 
+  if (module === 'activity') {
+    const rows = transformActivityResponse(rawData, {
+      shopName: _state.shopName,
+      startDate: _state.dates[0],
+      endDate: _state.dates[_state.dates.length - 1],
+    });
+    if (rows.length > 0) {
+      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_activity_price', rows);
+      if (error) throw new Error(error);
+    }
+    // Full range captured in one shot — remove from subsequent dates
+    _state.originalModules = _state.originalModules.filter(m => m !== 'activity');
+    console.log(`[temu] activity captured: ${rows.length} rows`);
+  }
+
   if (module === 'promo') {
     const rows = transformPromoResponse(rawData, ctx);
     const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows);
@@ -359,7 +422,7 @@ async function processModule(module, rawData) {
 
 async function sendStatusToTab(module, status) {
   try {
-    await chrome.tabs.sendMessage(_state.tabId, {
+    await chrome.tabs.sendMessage(_state.originTabId, {
       type: 'UPDATE_PANEL_STATUS',
       module,
       status,
