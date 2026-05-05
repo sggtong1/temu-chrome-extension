@@ -32,7 +32,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const captureModule = msg.module;
     setTimeout(() => {
       if (!checkPageReady()) {
-        chrome.runtime.sendMessage({ type: 'PAGE_ERROR', module: captureModule });
+        try { chrome.runtime.sendMessage({ type: 'PAGE_ERROR', module: captureModule }); } catch {}
       }
     }, 2000);
     sendResponse({ ok: true });
@@ -53,8 +53,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
+function safeSend(msg) {
+  try {
+    chrome.runtime.sendMessage(msg);
+  } catch (e) {
+    if (String(e).includes('Extension context invalidated')) {
+      try { showBanner('插件已更新，请刷新页面后重新采集', 'warn'); } catch {}
+    }
+  }
+}
+
 window.addEventListener('temu:apiCapture', (e) => {
-  chrome.runtime.sendMessage({
+  safeSend({
     type: 'API_DATA',
     module: e.detail.module,
     subType: e.detail.subType ?? null,
@@ -64,7 +74,7 @@ window.addEventListener('temu:apiCapture', (e) => {
 });
 
 window.addEventListener('temu:userInfo', (e) => {
-  chrome.runtime.sendMessage({ type: 'USER_INFO', data: e.detail });
+  safeSend({ type: 'USER_INFO', data: e.detail });
   populateMallSelect(e.detail?.result?.mallList ?? []);
 });
 
@@ -461,10 +471,17 @@ shadow.getElementById('start-btn').addEventListener('click', () => {
 
   const totalDates = dateRangeLength(startDate, endDate);
   shadow.getElementById('start-btn').style.display = 'none';
+  try {
+    chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId });
+  } catch (e) {
+    if (String(e).includes('Extension context invalidated')) {
+      shadow.getElementById('start-btn').style.display = '';
+      showBanner('插件已更新，请刷新页面后重试', 'warn');
+    }
+    return;
+  }
   renderProgress(modules, startDate, 1, totalDates);
   shadow.getElementById('bar-sub').textContent = '· 采集中';
-
-  chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId });
 });
 
 function dateRangeLength(start, end) {
