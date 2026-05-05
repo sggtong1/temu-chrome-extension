@@ -1,4 +1,21 @@
 import { getShopByMallId, getSkuCost, supabaseUpsert } from './supabase.js';
+
+// ── Dev-mode auto-reload ────────────────────────────────────────────────────
+// Polls _dev_reload.json (written by dev-watch.mjs) and reloads the extension
+// when the file changes. Only active when the file exists.
+(function devWatch() {
+  let _lastTs = 0;
+  async function check() {
+    try {
+      const res = await fetch(chrome.runtime.getURL('_dev_reload.json') + '?t=' + Date.now());
+      if (!res.ok) return;
+      const { ts } = await res.json();
+      if (_lastTs && ts > _lastTs) { chrome.runtime.reload(); return; }
+      _lastTs = ts;
+    } catch {}
+  }
+  setInterval(check, 1500);
+})();
 import { transformListResponse } from './transform/list_transform.js';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
