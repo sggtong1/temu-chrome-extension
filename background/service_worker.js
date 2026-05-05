@@ -158,7 +158,9 @@ async function handleGetShopInfo(mallId) {
 async function handleStartCollection(msg, tabId) {
   const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
   if (!supabaseUrl || !supabaseAnonKey) {
-    console.error('[temu] Supabase not configured');
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error-no-supabase' });
+    } catch {}
     return;
   }
 

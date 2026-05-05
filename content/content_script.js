@@ -1,6 +1,15 @@
 // ISOLATED world — DOM access + chrome.runtime messaging + CustomEvent bridge
 
-// ── Message bridge ──────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const MODULE_LABELS = {
+  list:   '流量分析',
+  sales:  '销售管理',
+  orders: '订单管理',
+  promo:  '广告报表',
+};
+
+// ── Message bridge ───────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'ACTIVATE_CAPTURE') {
@@ -37,9 +46,7 @@ window.addEventListener('temu:apiCapture', (e) => {
 
 window.addEventListener('temu:userInfo', (e) => {
   chrome.runtime.sendMessage({ type: 'USER_INFO', data: e.detail });
-  // Also populate mall selector directly from the event
-  const malls = e.detail?.result?.mallList ?? [];
-  populateMallSelect(malls);
+  populateMallSelect(e.detail?.result?.mallList ?? []);
 });
 
 // ── Shadow DOM panel ─────────────────────────────────────────────────────────
@@ -55,6 +62,7 @@ shadow.innerHTML = `
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   :host { font-family: system-ui; font-size: 12px; }
+
   .bar {
     background: #1e40af; color: white;
     padding: 6px 10px; border-radius: 6px;
@@ -62,36 +70,33 @@ shadow.innerHTML = `
     display: flex; align-items: center; gap: 8px;
     cursor: grab; white-space: nowrap;
   }
-  .bar.dragging { cursor: grabbing; }
   .bar-label { font-weight: 600; }
   .bar-sub { opacity: .65; font-size: 10px; }
   .bar-btn { margin-left: 4px; background: rgba(255,255,255,.2); border-radius: 3px; padding: 1px 5px; font-size: 11px; cursor: pointer; }
-  .panel {
-    width: 340px;
-    box-shadow: 0 4px 20px rgba(0,0,0,.15);
-    border-radius: 8px; overflow: hidden;
-  }
+
+  .panel { width: 340px; box-shadow: 0 4px 20px rgba(0,0,0,.15); border-radius: 8px; overflow: hidden; }
+
   .header {
-    background: #1e40af; color: white;
-    padding: 8px 12px; cursor: grab;
+    background: #1e40af; color: white; padding: 8px 12px; cursor: grab;
     display: flex; justify-content: space-between; align-items: center;
   }
-  .header.dragging { cursor: grabbing; }
   .header-title { font-weight: 600; font-size: 13px; pointer-events: none; }
   .header-btn {
     background: rgba(255,255,255,.2); border: none; color: white;
-    border-radius: 4px; width: 22px; height: 22px;
-    cursor: pointer; font-size: 15px; line-height: 1;
+    border-radius: 4px; width: 22px; height: 22px; cursor: pointer;
+    font-size: 15px; line-height: 1;
     display: flex; align-items: center; justify-content: center;
-    pointer-events: all;
   }
+
   .body { background: white; }
   .two-col { display: flex; border-bottom: 1px solid #e2e8f0; }
   .col { flex: 1; padding: 12px; }
   .col:first-child { border-right: 1px solid #e2e8f0; }
   .col-label { font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: .05em; margin-bottom: 8px; }
+
   .modules { display: flex; flex-direction: column; gap: 6px; }
   .modules label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
   .param-row { margin-bottom: 8px; }
   .param-row:last-child { margin-bottom: 0; }
   .param-label { font-size: 10px; color: #94a3b8; margin-bottom: 3px; }
@@ -99,17 +104,42 @@ shadow.innerHTML = `
     width: 100%; font-size: 11px; padding: 4px;
     border: 1px solid #e2e8f0; border-radius: 4px; background: #f8fafc;
   }
+
   .footer { padding: 10px 12px; }
   .start-btn {
     width: 100%; background: #1e40af; color: white; border: none;
     padding: 8px; border-radius: 5px; font-size: 13px;
-    font-weight: 600; cursor: pointer; letter-spacing: .03em;
+    font-weight: 600; cursor: pointer; letter-spacing: .03em; margin-top: 8px;
   }
   .start-btn:disabled { background: #94a3b8; cursor: default; }
-  .progress { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
-  .prog-date { font-size: 10px; color: #64748b; margin-bottom: 2px; }
-  .prog-row { display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; }
-  .prog-icon { width: 18px; text-align: center; }
+
+  /* Error / info banner */
+  .banner {
+    border-radius: 4px; padding: 6px 8px; margin-top: 8px;
+    font-size: 11px; display: none; align-items: flex-start; gap: 6px;
+  }
+  .banner.error { background: #fef2f2; color: #b91c1c; display: flex; }
+  .banner.info  { background: #eff6ff; color: #1e40af; display: flex; }
+
+  /* Progress */
+  .progress-wrap { margin-top: 8px; display: none; flex-direction: column; gap: 0; }
+  .progress-date {
+    font-size: 10px; color: #64748b; font-weight: 600;
+    padding: 4px 0 4px; border-bottom: 1px solid #f1f5f9; margin-bottom: 4px;
+  }
+  .prog-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border-radius: 4px; margin-bottom: 2px;
+    background: #f8fafc;
+  }
+  .prog-name { font-size: 11px; color: #374151; }
+  .prog-badge {
+    font-size: 10px; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+  }
+  .badge-wait    { background: #f1f5f9; color: #94a3b8; }
+  .badge-running { background: #dbeafe; color: #1e40af; }
+  .badge-done    { background: #dcfce7; color: #15803d; }
+  .badge-error   { background: #fee2e2; color: #b91c1c; }
 </style>
 
 <div class="bar" id="bar" style="display:none">
@@ -129,10 +159,10 @@ shadow.innerHTML = `
       <div class="col">
         <div class="col-label">采集模块</div>
         <div class="modules">
-          <label><input type="checkbox" name="mod" value="list" checked> LIST</label>
-          <label><input type="checkbox" name="mod" value="sales"> SALES</label>
-          <label><input type="checkbox" name="mod" value="orders" checked> ORDERS</label>
-          <label><input type="checkbox" name="mod" value="promo" checked> PROMO</label>
+          <label><input type="checkbox" name="mod" value="list" checked> 流量分析</label>
+          <label><input type="checkbox" name="mod" value="sales"> 销售管理</label>
+          <label><input type="checkbox" name="mod" value="orders" checked> 订单管理</label>
+          <label><input type="checkbox" name="mod" value="promo" checked> 广告报表</label>
         </div>
       </div>
       <div class="col">
@@ -140,9 +170,9 @@ shadow.innerHTML = `
         <div class="param-row">
           <div class="param-label">区域</div>
           <select id="region">
-            <option value="us">🇺🇸 US</option>
-            <option value="eu">🌍 EU</option>
-            <option value="default">🌐 Default</option>
+            <option value="us">🇺🇸 美国</option>
+            <option value="eu">🌍 欧洲</option>
+            <option value="default">🌐 全球</option>
           </select>
         </div>
         <div class="param-row">
@@ -162,114 +192,100 @@ shadow.innerHTML = `
           <option value="">⏳ 等待页面加载...</option>
         </select>
       </div>
-      <button class="start-btn" id="start-btn" style="margin-top:8px" disabled>▶ 开始采集</button>
-      <div class="progress" id="progress" style="display:none"></div>
+      <div class="banner" id="banner"><span id="banner-text"></span></div>
+      <button class="start-btn" id="start-btn" disabled>▶ 开始采集</button>
+      <div class="progress-wrap" id="progress-wrap"></div>
     </div>
   </div>
 </div>
 `;
 
-// ── Date defaults ────────────────────────────────────────────────────────────
+// ── Date defaults ─────────────────────────────────────────────────────────────
 
 function yesterday() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
+  const d = new Date(); d.setDate(d.getDate() - 1);
   return d.toISOString().slice(0, 10);
 }
 const yest = yesterday();
 shadow.getElementById('date-start').value = yest;
 shadow.getElementById('date-end').value = yest;
 
-// ── Collapse / expand ────────────────────────────────────────────────────────
+// ── Collapse / expand ─────────────────────────────────────────────────────────
 
-const bar = shadow.getElementById('bar');
+const bar   = shadow.getElementById('bar');
 const panel = shadow.getElementById('panel');
 
 function togglePanel() {
   if (panel.style.display === 'none') {
-    bar.style.display = 'none';
-    panel.style.display = 'block';
+    bar.style.display = 'none'; panel.style.display = 'block';
   } else {
-    panel.style.display = 'none';
-    bar.style.display = 'flex';
+    panel.style.display = 'none'; bar.style.display = 'flex';
   }
 }
 
 shadow.getElementById('collapse-btn').addEventListener('click', (e) => {
   e.stopPropagation();
-  panel.style.display = 'none';
-  bar.style.display = 'flex';
+  panel.style.display = 'none'; bar.style.display = 'flex';
 });
-
 shadow.getElementById('bar-expand').addEventListener('click', (e) => {
   e.stopPropagation();
-  bar.style.display = 'none';
-  panel.style.display = 'block';
+  bar.style.display = 'none'; panel.style.display = 'block';
 });
 
-// ── Dragging ─────────────────────────────────────────────────────────────────
+// ── Dragging ──────────────────────────────────────────────────────────────────
 
-let _dragging = false;
-let _dragOffX = 0, _dragOffY = 0;
-let _movedPx = 0;
+let _dragging = false, _dragOffX = 0, _dragOffY = 0;
 
 function startDrag(e) {
   if (e.button !== 0) return;
   const rect = host.getBoundingClientRect();
-  // Convert bottom/right anchor to top/left so we can drag freely
-  host.style.bottom = 'auto';
-  host.style.right = 'auto';
-  host.style.top = rect.top + 'px';
+  host.style.bottom = 'auto'; host.style.right = 'auto';
+  host.style.top  = rect.top  + 'px';
   host.style.left = rect.left + 'px';
-
   _dragging = true;
-  _movedPx = 0;
   _dragOffX = e.clientX - rect.left;
   _dragOffY = e.clientY - rect.top;
-
-  e.currentTarget.classList.add('dragging');
   document.addEventListener('mousemove', onDrag, { capture: true });
-  document.addEventListener('mouseup', stopDrag, { capture: true, once: true });
+  document.addEventListener('mouseup',   stopDrag, { capture: true, once: true });
   e.preventDefault();
 }
-
 function onDrag(e) {
   if (!_dragging) return;
-  _movedPx += Math.abs(e.movementX) + Math.abs(e.movementY);
-  const x = Math.max(0, Math.min(e.clientX - _dragOffX, window.innerWidth - host.offsetWidth));
-  const y = Math.max(0, Math.min(e.clientY - _dragOffY, window.innerHeight - host.offsetHeight));
-  host.style.left = x + 'px';
-  host.style.top = y + 'px';
+  host.style.left = Math.max(0, Math.min(e.clientX - _dragOffX, window.innerWidth  - host.offsetWidth))  + 'px';
+  host.style.top  = Math.max(0, Math.min(e.clientY - _dragOffY, window.innerHeight - host.offsetHeight)) + 'px';
 }
-
-function stopDrag(e) {
+function stopDrag() {
   _dragging = false;
-  shadow.getElementById('drag-header').classList.remove('dragging');
-  shadow.getElementById('bar').classList.remove('dragging');
   document.removeEventListener('mousemove', onDrag, { capture: true });
-  // Save position
   const rect = host.getBoundingClientRect();
   chrome.storage.local.set({ panelPos: { top: rect.top, left: rect.left } });
 }
 
 shadow.getElementById('drag-header').addEventListener('mousedown', startDrag);
 shadow.getElementById('bar').addEventListener('mousedown', (e) => {
-  // Only start drag on the bar itself, not the expand button
   if (e.target.id === 'bar-expand') return;
   startDrag(e);
 });
 
-// Restore saved position
 chrome.storage.local.get('panelPos', ({ panelPos }) => {
-  if (panelPos) {
-    host.style.bottom = 'auto';
-    host.style.right = 'auto';
-    host.style.top = Math.min(panelPos.top, window.innerHeight - 60) + 'px';
-    host.style.left = Math.min(panelPos.left, window.innerWidth - 60) + 'px';
-  }
+  if (!panelPos) return;
+  host.style.bottom = 'auto'; host.style.right = 'auto';
+  host.style.top  = Math.min(panelPos.top,  window.innerHeight - 60) + 'px';
+  host.style.left = Math.min(panelPos.left, window.innerWidth  - 60) + 'px';
 });
 
-// ── Mall selector ────────────────────────────────────────────────────────────
+// ── Banner (error / info) ─────────────────────────────────────────────────────
+
+function showBanner(text, type = 'error') {
+  const el = shadow.getElementById('banner');
+  shadow.getElementById('banner-text').textContent = text;
+  el.className = `banner ${type}`;
+}
+function hideBanner() {
+  shadow.getElementById('banner').className = 'banner';
+}
+
+// ── Mall selector ─────────────────────────────────────────────────────────────
 
 let _currentMallId = null;
 
@@ -279,18 +295,18 @@ function populateMallSelect(malls) {
   const prevVal = select.value || _currentMallId;
 
   select.innerHTML = malls.map(m =>
-    `<option value="${m.mallId}">${m.mallName} · ${m.managedType === 0 ? '全托' : '半托'}</option>`
+    `<option value="${m.mallId}">${m.mallName} · ${m.managedType === 0 ? '全托' : '半托'} · ID:${m.mallId}</option>`
   ).join('');
   select.disabled = false;
 
-  // Prefer: URL mallId → previously selected → first
-  const urlMallId = detectMallIdFromUrl();
-  const preferred = urlMallId || prevVal || String(malls[0].mallId);
+  const urlId = detectMallIdFromUrl();
+  const preferred = urlId || prevVal || String(malls[0].mallId);
   const opt = [...select.options].find(o => o.value === String(preferred));
   if (opt) opt.selected = true;
 
   _currentMallId = select.value;
   shadow.getElementById('start-btn').disabled = false;
+  hideBanner();
 }
 
 shadow.getElementById('mall-select').addEventListener('change', (e) => {
@@ -298,42 +314,76 @@ shadow.getElementById('mall-select').addEventListener('change', (e) => {
 });
 
 function detectMallIdFromUrl() {
-  const params = new URL(window.location.href).searchParams;
-  return params.get('mallId') || params.get('mall_id') || null;
+  const p = new URL(window.location.href).searchParams;
+  return p.get('mallId') || p.get('mall_id') || null;
 }
 
-// Try URL first (fast path before userInfo arrives)
+// Fast path from URL before userInfo arrives
 const urlMallId = detectMallIdFromUrl();
 if (urlMallId) {
   const select = shadow.getElementById('mall-select');
-  select.innerHTML = `<option value="${urlMallId}">${urlMallId}</option>`;
+  select.innerHTML = `<option value="${urlMallId}">ID:${urlMallId}</option>`;
   select.disabled = false;
   _currentMallId = urlMallId;
   shadow.getElementById('start-btn').disabled = false;
-  // Enrich with name once background has shop info
   chrome.runtime.sendMessage({ type: 'GET_SHOP_INFO', mallId: urlMallId }, (shop) => {
     if (shop) {
-      const label = `${shop.shop_name} · ${shop.site_type === 'semi_us' ? '半托' : '全托'}`;
-      shadow.getElementById('mall-select').options[0].text = label;
+      const typeLabel = shop.site_type === 'semi_us' ? '半托' : '全托';
+      select.options[0].text = `${shop.shop_name} · ${typeLabel} · ID:${urlMallId}`;
     }
   });
 }
 
-// ── Start collection ─────────────────────────────────────────────────────────
+// ── Progress rendering ────────────────────────────────────────────────────────
+
+let _activeModules = [];
+
+function renderProgress(modules, date, dateIdx, totalDates) {
+  _activeModules = modules;
+  const wrap = shadow.getElementById('progress-wrap');
+  const dateLabel = totalDates > 1
+    ? `<div class="progress-date">日期 ${dateIdx}/${totalDates}：${date}</div>`
+    : `<div class="progress-date">采集日期：${date}</div>`;
+  wrap.innerHTML = dateLabel + modules.map(m =>
+    `<div class="prog-row" id="prog-row-${m}">
+       <span class="prog-name">${MODULE_LABELS[m] ?? m}</span>
+       <span class="prog-badge badge-wait" id="prog-${m}">等待</span>
+     </div>`
+  ).join('');
+  wrap.style.display = 'flex';
+}
+
+function setProgBadge(module, status) {
+  const badge = shadow.getElementById(`prog-${module}`);
+  if (!badge) return;
+  const map = {
+    processing: ['badge-running', '采集中'],
+    done:       ['badge-done',    '✓ 完成'],
+    error:      ['badge-error',   '✗ 失败'],
+  };
+  const [cls, label] = map[status] ?? ['badge-wait', '等待'];
+  badge.className = `prog-badge ${cls}`;
+  badge.textContent = label;
+}
+
+// ── Start collection ──────────────────────────────────────────────────────────
 
 shadow.getElementById('start-btn').addEventListener('click', () => {
-  const modules = [...shadow.querySelectorAll('input[name=mod]:checked')].map(el => el.value);
-  const region = shadow.getElementById('region').value;
+  hideBanner();
+  const modules   = [...shadow.querySelectorAll('input[name=mod]:checked')].map(el => el.value);
+  const region    = shadow.getElementById('region').value;
   const startDate = shadow.getElementById('date-start').value;
-  const endDate = shadow.getElementById('date-end').value;
-  const mallId = shadow.getElementById('mall-select').value;
+  const endDate   = shadow.getElementById('date-end').value;
+  const mallId    = shadow.getElementById('mall-select').value;
 
-  if (!modules.length || !mallId || !startDate) return;
+  if (!modules.length) { showBanner('请至少勾选一个采集模块'); return; }
+  if (!mallId)         { showBanner('请先选择店铺'); return; }
+  if (!startDate)      { showBanner('请选择采集日期'); return; }
 
+  const totalDates = dateRangeLength(startDate, endDate);
   shadow.getElementById('start-btn').style.display = 'none';
-  const progressEl = shadow.getElementById('progress');
-  progressEl.style.display = 'flex';
-  renderProgress(modules, startDate, 1, dateRangeLength(startDate, endDate));
+  renderProgress(modules, startDate, 1, totalDates);
+  shadow.getElementById('bar-sub').textContent = '· 采集中';
 
   chrome.runtime.sendMessage({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId });
 });
@@ -343,33 +393,31 @@ function dateRangeLength(start, end) {
   return Math.max(1, Math.round((b - a) / 86400000) + 1);
 }
 
-function renderProgress(modules, date, dateIdx, totalDates) {
-  const progressEl = shadow.getElementById('progress');
-  const dateLabel = totalDates > 1 ? `<div class="prog-date">日期 ${dateIdx}/${totalDates}：${date}</div>` : '';
-  progressEl.innerHTML = dateLabel + modules.map(m =>
-    `<div class="prog-row"><span>${m.toUpperCase()}</span><span class="prog-icon" id="prog-${m}">—</span></div>`
-  ).join('');
-}
-
-// ── Status updates from background ──────────────────────────────────────────
+// ── Status updates ────────────────────────────────────────────────────────────
 
 function updatePanelStatus(msg) {
+  if (msg.status === 'error-no-supabase') {
+    showBanner('未配置 Supabase，请前往插件选项页填写 URL 和 Anon Key');
+    shadow.getElementById('start-btn').style.display = '';
+    shadow.getElementById('start-btn').disabled = false;
+    shadow.getElementById('progress-wrap').style.display = 'none';
+    shadow.getElementById('bar-sub').textContent = '· 就绪';
+    return;
+  }
   if (msg.status === 'next-date') {
-    // Reset progress rows for the new date
-    const modules = [...shadow.querySelectorAll('input[name=mod]:checked')].map(el => el.value);
-    renderProgress(modules, msg.date, msg.dateIndex + 1, msg.totalDates);
+    renderProgress(_activeModules, msg.date, msg.dateIndex + 1, msg.totalDates);
     shadow.getElementById('bar-sub').textContent = `· 采集中 ${msg.dateIndex + 1}/${msg.totalDates}`;
     return;
   }
   if (msg.status === 'complete') {
     shadow.getElementById('start-btn').style.display = '';
     shadow.getElementById('start-btn').disabled = false;
-    shadow.getElementById('progress').style.display = 'none';
-    shadow.getElementById('bar-sub').textContent = '· 完成';
+    shadow.getElementById('bar-sub').textContent = '· 完成 ✓';
+    showBanner('采集完成', 'info');
     return;
   }
-  const icon = { done: '✅', error: '❌', processing: '⏳' }[msg.status] ?? '—';
-  const el = shadow.getElementById(`prog-${msg.module}`);
-  if (el) el.textContent = icon;
-  shadow.getElementById('bar-sub').textContent = `· 采集中`;
+  setProgBadge(msg.module, msg.status);
+  if (msg.status === 'processing') {
+    shadow.getElementById('bar-sub').textContent = `· 采集中`;
+  }
 }
