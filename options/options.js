@@ -33,11 +33,13 @@ document.getElementById('test').addEventListener('click', async () => {
   }
   setStatus('测试中...', true);
   try {
-    // Query root schema endpoint — always 200 if URL + key are valid
-    const resp = await fetch(`${supabaseUrl}/rest/v1/`, {
+    // anon key can't access /rest/v1/ root (requires service_role).
+    // Query a known table with limit=0 instead.
+    // 200 = table exists; 404 = table not found but key+URL are valid; 401/403 = bad key.
+    const resp = await fetch(`${supabaseUrl}/rest/v1/sku_daily_metrics?limit=0`, {
       headers: { apikey: supabaseAnonKey, Authorization: `Bearer ${supabaseAnonKey}` },
     });
-    if (resp.ok) {
+    if (resp.ok || resp.status === 404) {
       setStatus('✅ 连接成功', true);
     } else {
       const text = await resp.text();
