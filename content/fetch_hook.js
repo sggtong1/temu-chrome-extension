@@ -1,16 +1,20 @@
 // Runs in MAIN world — can access window.fetch and window.XMLHttpRequest
 // Communicates with ISOLATED world via CustomEvent
 
-// Read config from URL hash synchronously at document_start, before any page scripts run.
-// Service worker encodes {mod, date, site, startDate, endDate} into #__tmu=<json> before navigation.
-function _readHashConfig() {
+// Read config from URL synchronously at document_start, before any page scripts run.
+// Service worker encodes {mod, date, site, startDate, endDate} into __tmu query param
+// (and keeps hash fallback for older navigations).
+function _readBootConfig() {
   try {
+    const sp = new URLSearchParams(location.search);
+    const q = sp.get('__tmu');
+    if (q) return JSON.parse(decodeURIComponent(q));
     const m = location.hash.match(/__tmu=([^&\s]*)/);
-    if (m) return JSON.parse(decodeURIComponent(m[1]));
+    if (m?.[1]) return JSON.parse(decodeURIComponent(m[1]));
   } catch {}
   return null;
 }
-const _hashCfg = _readHashConfig();
+const _hashCfg = _readBootConfig();
 
 // semi_us: list + orders + promo (no sales, no activity)
 const PATTERNS_SEMI_US = {

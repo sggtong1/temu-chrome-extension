@@ -355,8 +355,9 @@ async function navigateToNextModule() {
     return;
   }
 
-  // Encode capture config into URL hash so fetch_hook.js can read it synchronously
+  // Encode capture config into URL query so fetch_hook.js can read it synchronously
   // at document_start — before page APIs fire and before ACTIVATE_CAPTURE arrives.
+  // Keep hash fallback for compatibility.
   const hashCfg = {
     mod,
     date: _state.date,
@@ -364,7 +365,9 @@ async function navigateToNextModule() {
     startDate: _state.dates[0],
     endDate:   _state.dates[_state.dates.length - 1],
   };
-  url += '#__tmu=' + encodeURIComponent(JSON.stringify(hashCfg));
+  const boot = encodeURIComponent(JSON.stringify(hashCfg));
+  url += (url.includes('?') ? '&' : '?') + '__tmu=' + boot;
+  url += '#__tmu=' + boot;
 
   _retryCount = 0;
   if (_state.collectionTabId === null) {
