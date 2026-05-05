@@ -74,14 +74,16 @@ function shopFromCache(mallId) {
 let _state = {
   active: false,
   tabId: null,
-  modules: [],
+  originalModules: [],   // modules chosen by user, reset each date
+  modules: [],           // remaining modules for current date
+  dates: [],             // all dates in the requested range
+  dateIndex: 0,          // which date we're currently processing
+  date: null,            // current date string (dates[dateIndex])
   region: 'us',
-  date: null,
   mallId: null,
   shopName: '',
   siteType: 'semi_us',
   captured: {},
-  // full_managed SALES requires two API captures before processing
   salesPartials: { meta: null, qty: null },
   supabaseUrl: null,
   supabaseAnonKey: null,
@@ -94,8 +96,20 @@ function resetState() {
   _captureTimer = null;
   _state.active = false;
   _state.modules = [];
+  _state.dates = [];
   _state.captured = {};
   _state.salesPartials = { meta: null, qty: null };
+}
+
+function generateDateRange(startDate, endDate) {
+  const dates = [];
+  const cur = new Date(startDate);
+  const last = new Date(endDate ?? startDate);
+  while (cur <= last) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return dates;
 }
 
 // ── Message router ──────────────────────────────────────────────────────────
@@ -160,12 +174,17 @@ async function handleStartCollection(msg, tabId) {
     siteType = shop?.site_type ?? 'semi_us';
   }
 
+  const dates = generateDateRange(msg.startDate ?? msg.date, msg.endDate ?? msg.startDate ?? msg.date);
+
   _state = {
     active: true,
     tabId,
+    originalModules: [...msg.modules],
     modules: [...msg.modules],
+    dates,
+    dateIndex: 0,
+    date: dates[0],
     region: msg.region,
-    date: msg.date,
     mallId: msg.mallId,
     shopName: shopName ?? `mall${msg.mallId}`,
     siteType,
@@ -209,8 +228,20 @@ async function handleApiData(msg) {
   if (_state.modules.length > 0) {
     navigateToNextModule();
   } else {
-    resetState();
-    console.log('[temu] Collection complete');
+    // Current date done — advance to next date if any
+    _state.dateIndex++;
+    if (_state.dateIndex < _state.dates.length) {
+      _state.date = _state.dates[_state.dateIndex];
+      _state.modules = [..._state.originalModules];
+      _state.captured = {};
+      _state.salesPartials = { meta: null, qty: null };
+      await sendStatusToTab(null, 'next-date');
+      navigateToNextModule();
+    } else {
+      resetState();
+      await sendStatusToTab(null, 'complete');
+      console.log('[temu] Collection complete');
+    }
   }
 }
 
@@ -287,6 +318,13 @@ async function processModule(module, rawData) {
 
 async function sendStatusToTab(module, status) {
   try {
-    await chrome.tabs.sendMessage(_state.tabId, { type: 'UPDATE_PANEL_STATUS', module, status });
+    await chrome.tabs.sendMessage(_state.tabId, {
+      type: 'UPDATE_PANEL_STATUS',
+      module,
+      status,
+      date: _state.date,
+      dateIndex: _state.dateIndex,
+      totalDates: _state.dates.length,
+    });
   } catch {}
 }
