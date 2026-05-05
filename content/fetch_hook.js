@@ -57,17 +57,31 @@ function maybeInjectDate(body, mod) {
   }
 }
 
+// Always intercept userInfo to build mall-type cache in background
+const USERINFO_PATTERN = '/api/seller/auth/userInfo';
+
 function emit(module, subType, url, data) {
   window.dispatchEvent(new CustomEvent('temu:apiCapture', {
     detail: { module, subType, url, data },
   }));
 }
 
+function emitUserInfo(data) {
+  window.dispatchEvent(new CustomEvent('temu:userInfo', { detail: data }));
+}
+
 const _originalFetch = window.fetch.bind(window);
 window.fetch = async function (input, init = {}) {
   const url = typeof input === 'string' ? input : input.url;
-  const match = matchModule(url);
 
+  // Always-on: capture userInfo for mall-type detection
+  if (url.includes(USERINFO_PATTERN)) {
+    const response = await _originalFetch(input, init);
+    response.clone().json().then(emitUserInfo).catch(() => {});
+    return response;
+  }
+
+  const match = matchModule(url);
   if (match && match.module === _activeModule) {
     const origBody = init.body;
     if (origBody && typeof origBody === 'string') {
@@ -87,12 +101,14 @@ window.XMLHttpRequest = function () {
   const xhr = new _OrigXHR();
   let _url = '';
   let _match = null;
+  let _isUserInfo = false;
   let _body = null;
 
   const _open = xhr.open.bind(xhr);
   xhr.open = function (method, url, ...rest) {
     _url = url;
-    _match = matchModule(url);
+    _isUserInfo = url.includes(USERINFO_PATTERN);
+    _match = _isUserInfo ? null : matchModule(url);
     return _open(method, url, ...rest);
   };
 
@@ -104,11 +120,14 @@ window.XMLHttpRequest = function () {
       _body = body;
     }
     xhr.addEventListener('load', () => {
-      if (_match && _match.module === _activeModule) {
-        try {
-          emit(_match.module, _match.subType, _url, JSON.parse(xhr.responseText));
-        } catch {}
-      }
+      try {
+        const parsed = JSON.parse(xhr.responseText);
+        if (_isUserInfo) {
+          emitUserInfo(parsed);
+        } else if (_match && _match.module === _activeModule) {
+          emit(_match.module, _match.subType, _url, parsed);
+        }
+      } catch {}
     });
     return _send(_body);
   };

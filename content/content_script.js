@@ -30,6 +30,10 @@ window.addEventListener('temu:apiCapture', (e) => {
   });
 });
 
+window.addEventListener('temu:userInfo', (e) => {
+  chrome.runtime.sendMessage({ type: 'USER_INFO', data: e.detail });
+});
+
 const host = document.createElement('div');
 host.id = 'temu-panel-host';
 host.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:2147483647;font-family:system-ui;';

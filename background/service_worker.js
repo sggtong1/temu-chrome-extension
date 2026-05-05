@@ -32,6 +32,26 @@ function moduleUrl(module, mallId, siteType, region) {
   return null;
 }
 
+// ── Mall info cache (populated from userInfo API intercept) ─────────────────
+// mallId (string) → { mallName, siteType, uniqueId }
+// managedType: 0 = full_managed, 1 = semi_us
+const _mallCache = {};
+
+function handleUserInfo(data) {
+  const malls = data?.result?.mallList ?? [];
+  for (const mall of malls) {
+    _mallCache[String(mall.mallId)] = {
+      mallName: mall.mallName ?? '',
+      siteType: mall.managedType === 0 ? 'full_managed' : 'semi_us',
+      uniqueId: mall.uniqueId ?? '',
+    };
+  }
+}
+
+function shopFromCache(mallId) {
+  return _mallCache[String(mallId)] ?? null;
+}
+
 // ── Collection state ────────────────────────────────────────────────────────
 
 let _state = {
@@ -64,6 +84,10 @@ function resetState() {
 // ── Message router ──────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'USER_INFO') {
+    handleUserInfo(msg.data);
+    return false;
+  }
   if (msg.type === 'GET_SHOP_INFO') {
     handleGetShopInfo(msg.mallId).then(sendResponse);
     return true;
@@ -86,6 +110,11 @@ chrome.action.onClicked.addListener((tab) => {
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 async function handleGetShopInfo(mallId) {
+  // Fast path: userInfo cache (populated on page load, no network request)
+  const cached = shopFromCache(mallId);
+  if (cached) return { shop_name: cached.mallName, site_type: cached.siteType };
+
+  // Fallback: Supabase shops table
   const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
   if (!supabaseUrl || !supabaseAnonKey) return null;
   try {
@@ -101,7 +130,18 @@ async function handleStartCollection(msg, tabId) {
     console.error('[temu] Supabase not configured');
     return;
   }
-  const shop = await getShopByMallId(supabaseUrl, supabaseAnonKey, msg.mallId);
+
+  // Prefer userInfo cache for siteType (accurate, no extra request);
+  // fall back to Supabase shops table if cache not yet populated
+  const cached = shopFromCache(msg.mallId);
+  let shopName = cached?.mallName;
+  let siteType = cached?.siteType;
+
+  if (!siteType) {
+    const shop = await getShopByMallId(supabaseUrl, supabaseAnonKey, msg.mallId);
+    shopName = shopName ?? shop?.shop_name;
+    siteType = shop?.site_type ?? 'semi_us';
+  }
 
   _state = {
     active: true,
@@ -110,9 +150,10 @@ async function handleStartCollection(msg, tabId) {
     region: msg.region,
     date: msg.date,
     mallId: msg.mallId,
-    shopName: shop?.shop_name ?? `mall${msg.mallId}`,
-    siteType: shop?.site_type ?? 'semi_us',
+    shopName: shopName ?? `mall${msg.mallId}`,
+    siteType,
     captured: {},
+    salesPartials: { meta: null, qty: null },
     supabaseUrl,
     supabaseAnonKey,
   };
