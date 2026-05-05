@@ -81,6 +81,15 @@ function emit(module, subType, url, data) {
   }));
 }
 
+function shouldCapture(match) {
+  if (!match) return false;
+  if (match.module === _activeModule) return true;
+  // Pragmatic fallback: sales page sometimes fires before boot config is visible.
+  // To prioritize "capture first", allow sales capture even when activeModule is null.
+  if (_activeModule == null && match.module === 'sales') return true;
+  return false;
+}
+
 // For activity: page only fires page 1; fetch remaining pages reusing the same headers
 async function fetchActivityAllPages(originalUrl, originalInit, firstData) {
   const list  = firstData?.result?.list ?? [];
@@ -136,7 +145,7 @@ window.fetch = async function (input, init = {}) {
   if (match?.module === 'sales' || url.includes('listOverall') || url.includes('querySkuSalesNumber')) {
     console.log('[temu-hook] sales URL hit via fetch, activeModule=', _activeModule, 'match=', match?.module, url);
   }
-  if (match && match.module === _activeModule) {
+  if (shouldCapture(match)) {
     const origBody = init.body;
     if (origBody && typeof origBody === 'string') {
       init = { ...init, body: maybeInjectDate(origBody, match.module) };
@@ -192,7 +201,7 @@ window.XMLHttpRequest = function () {
         const parsed = JSON.parse(xhr.responseText);
         if (_isUserInfo) {
           emitUserInfo(parsed);
-        } else if (_match && _match.module === _activeModule) {
+        } else if (shouldCapture(_match)) {
           emit(_match.module, _match.subType, _url, parsed);
         }
       } catch {}
