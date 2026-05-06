@@ -40,6 +40,7 @@ window.addEventListener('temu:setConfig', (e) => {
   _activeModule = e.detail.activeModule || null;
   _targetDate = e.detail.targetDate || null;
   _siteType = e.detail.siteType || 'semi_us';
+  _promoTriggered = false;  // new collection cycle resets the latch
 });
 
 // Returns { module, subType } or null
@@ -291,6 +292,83 @@ function emitUserInfo(data) {
   window.dispatchEvent(new CustomEvent('temu:userInfo', { detail: data }));
 }
 
+// ── Promo: actively trigger ads_report ───────────────────────────────────
+// The page's default tab (店铺数据报表) doesn't fire ads_report; that API
+// only loads when user clicks 商品数据报表. So we replicate the
+// querySkuSalesNumber pattern: listen for ANY ads.temu.com /api/ call to
+// borrow its init (auth headers, cookies), then synthesize the ads_report
+// POST ourselves with columns_type=4 and the user's date range.
+let _promoTriggered = false;
+function _isAdsTemuApi(url) {
+  return /^https?:\/\/ads\.temu\.com\/api\//.test(url);
+}
+
+async function triggerPromoCollection(borrowedInit) {
+  if (_promoTriggered) return;
+  _promoTriggered = true;
+
+  const url = 'https://ads.temu.com/api/v1/coconut/ad/ads_report';
+  const startDate = _hashCfg?.startDate || _hashCfg?.date;
+  const endDate   = _hashCfg?.endDate   || _hashCfg?.date;
+  if (!startDate || !endDate) {
+    console.warn('[temu-hook] promo: no date range in boot config');
+    return;
+  }
+
+  // Body crafted to match the goods report panel's payload shape.
+  const buildBody = (pageNo) => ({
+    ad_status: [],
+    page_number: pageNo,
+    page_size: 50,
+    specific_query_info: '',
+    sort_by: 0,
+    sort_type: 'desc',
+    start_time: cstDateBoundaryMs(startDate, false),
+    end_time:   cstDateBoundaryMs(endDate,   true),
+    source: 1,
+    need_del_status_ad: true,
+    need_calculate_goods_summary: true,
+    columns_type: 4,
+    filter_cooperative_ad_type: 0,
+    data_filter: null,
+    ad_group_list: null,
+    selected_site_id_list: null,
+    ad_phase: -1,
+  });
+
+  console.log(`[temu-hook] promo: actively calling ads_report for ${startDate}..${endDate}`);
+
+  try {
+    const res = await _originalFetch(url, {
+      method: 'POST',
+      headers: borrowedInit.headers || {},
+      body: JSON.stringify(buildBody(1)),
+      credentials: 'include',
+    });
+    const firstData = await res.json();
+    console.log(`[temu-hook] promo page1: status=${res.status}, success=${firstData?.success}`);
+
+    // Detect list key on the response
+    const listKey = _detectPromoListKey(firstData);
+
+    // Paginate using the same machinery
+    const init = {
+      method: 'POST',
+      headers: borrowedInit.headers || {},
+      body: JSON.stringify(buildBody(1)),  // page 1 body for total/etc
+      credentials: 'include',
+    };
+    const allData = await fetchAllPages(url, init, firstData, {
+      listKey, pageNoKey: 'page_number', pageSizeKey: 'page_size', module: 'promo',
+    });
+
+    emit('promo', null, url, allData);
+  } catch (e) {
+    console.error('[temu-hook] promo trigger failed:', e);
+    emit('promo', null, url, { result: {} });
+  }
+}
+
 // Inspect the first ads_report response to find which result.* field holds
 // the row array (different deployments may use different field names).
 function _detectPromoListKey(firstData) {
@@ -325,6 +403,17 @@ window.fetch = async function (input, init = {}) {
     const response = await _originalFetch(input, init);
     response.clone().json().then(emitUserInfo).catch(() => {});
     return response;
+  }
+
+  // Promo: borrow headers from any ads.temu.com /api/ call to fire our own
+  // ads_report (page default tab doesn't trigger it). Single-shot per cycle.
+  if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(url)) {
+    let headers = init.headers;
+    if (!headers && typeof input !== 'string' && input.headers) {
+      headers = {};
+      input.headers.forEach((v, k) => { headers[k] = v; });
+    }
+    triggerPromoCollection({ headers: headers || {} });
   }
 
   const match = matchModule(url);
@@ -428,6 +517,11 @@ window.XMLHttpRequest = function () {
 
   const _send = xhr.send.bind(xhr);
   xhr.send = function (body) {
+    // Promo: borrow this XHR's headers to fire our own ads_report (single-shot).
+    if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(_url)) {
+      triggerPromoCollection({ headers: { ..._headers } });
+    }
+
     if (shouldCapture(_match) && body && typeof body === 'string') {
       _body = maybeInjectDate(body, _match.module);
     } else {
