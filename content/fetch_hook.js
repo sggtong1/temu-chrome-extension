@@ -70,7 +70,7 @@ function ptDateBoundaryMs(dateStr, isEnd) {
 }
 
 function maybeInjectDate(body, mod) {
-  if (!['list', 'sales', 'activity'].includes(mod)) return body;
+  if (!['list', 'sales', 'activity', 'promo'].includes(mod)) return body;
   try {
     const parsed = JSON.parse(body);
     if (_targetDate) {
@@ -99,6 +99,11 @@ function maybeInjectDate(body, mod) {
     const out = JSON.stringify(parsed);
     if ((mod === 'sales' || mod === 'activity') && out !== body) {
       console.log(`[temu-hook] body injected for ${mod}:`, out.slice(0, 600));
+    }
+    // promo: log original body so we can see what params the page sends
+    if (mod === 'promo') {
+      console.log(`[temu-hook] promo body (original):`, body.slice(0, 800));
+      if (out !== body) console.log(`[temu-hook] promo body (injected):`, out.slice(0, 800));
     }
     return out;
   } catch (e) {

@@ -7,7 +7,26 @@
  * ROAS: ad.roas ÷ 10000
  */
 export function transformPromoResponse(rawData, { shopName, date }) {
-  const adList = rawData?.result?.adDetailList ?? rawData?.result?.list ?? [];
+  // Diagnose response shape: try multiple list field names
+  const result = rawData?.result;
+  const adList = result?.adDetailList
+    ?? result?.list
+    ?? result?.dataList
+    ?? result?.items
+    ?? result?.adReportList
+    ?? [];
+
+  if (Array.isArray(result) && !adList.length) {
+    console.log('[temu] promo_transform: result is array, len=', result.length);
+  } else {
+    console.log('[temu] promo_transform: result keys:',
+      result && typeof result === 'object' ? Object.keys(result) : typeof result,
+      'adList len=', adList.length);
+  }
+  if (adList.length > 0) {
+    console.log('[temu] promo_transform: first ad keys:', Object.keys(adList[0]));
+    console.log('[temu] promo_transform: first ad sample:', JSON.stringify(adList[0]).slice(0, 1500));
+  }
 
   return adList.map(ad => {
     const rsd = ad.reports_summary_dto ?? {};
