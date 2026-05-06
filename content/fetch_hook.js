@@ -203,11 +203,7 @@ async function enrichSalesWithDailyNumbers(originalUrl, originalInit, mergedData
         credentials: 'include',
       });
       const data = await res.json();
-      console.log(`[temu-hook] querySkuSalesNumber chunk ${i/CHUNK + 1}: status=${res.status}, ${Date.now() - t0}ms, success=${data?.success}, result type=${Array.isArray(data?.result) ? 'array(' + data.result.length + ')' : typeof data?.result}`);
-      if (i === 0) {
-        // Log first chunk's raw result so we can confirm shape
-        console.log('[temu-hook] querySkuSalesNumber sample:', JSON.stringify(data?.result).slice(0, 800));
-      }
+      console.log(`[temu-hook] querySkuSalesNumber chunk ${i/CHUNK + 1}: status=${res.status}, ${Date.now() - t0}ms, items=${Array.isArray(data?.result) ? data.result.length : 0}`);
       const items = Array.isArray(data?.result) ? data.result
         : data?.result?.list ?? data?.result?.items ?? data?.result?.dataList ?? [];
       allSalesItems.push(...items);
@@ -225,18 +221,9 @@ function emitUserInfo(data) {
   window.dispatchEvent(new CustomEvent('temu:userInfo', { detail: data }));
 }
 
-// ── Diagnostic mode ─────────────────────────────────────────────────────────
-// Set to true temporarily to log ALL /api/ calls (helps find correct patterns)
-const _DIAG = true;
-
 const _originalFetch = window.fetch.bind(window);
 window.fetch = async function (input, init = {}) {
   const url = typeof input === 'string' ? input : input.url;
-
-  // Diagnostic: log all /api/ POST calls so we can find the right patterns
-  if (_DIAG && url.includes('/api/') && (init.method === 'POST' || init.method === 'post')) {
-    console.log('[temu-diag] POST', url, '| activeModule=', _activeModule);
-  }
 
   // Always-on: capture userInfo for mall-type detection
   if (url.includes(USERINFO_PATTERN)) {
@@ -246,13 +233,6 @@ window.fetch = async function (input, init = {}) {
   }
 
   const match = matchModule(url);
-  // Diagnostic: log any activity or sales pattern hit regardless of activeModule
-  if (match?.module === 'activity' || url.includes('enroll/list')) {
-    console.log('[temu-hook] activity URL hit via fetch, activeModule=', _activeModule, 'match=', match?.module, url);
-  }
-  if (match?.module === 'sales' || url.includes('listOverall') || url.includes('querySkuSalesNumber')) {
-    console.log('[temu-hook] sales URL hit via fetch, activeModule=', _activeModule, 'match=', match?.module, url);
-  }
   if (shouldCapture(match)) {
     // Resolve body/method/headers, accounting for fetch(Request) calls where
     // these live on the Request object instead of init.
@@ -274,7 +254,6 @@ window.fetch = async function (input, init = {}) {
     let injected = false;
     let bodyToSend = origBody;
     if (origBody && typeof origBody === 'string') {
-      console.log('[temu-hook] capture', match.module, 'body=', origBody.slice(0, 600));
       bodyToSend = maybeInjectDate(origBody, match.module);
       injected = bodyToSend !== origBody;
     }
@@ -298,12 +277,10 @@ window.fetch = async function (input, init = {}) {
     const clone = response.clone();
     clone.json().then(firstData => {
       if (match.module === 'activity') {
-        console.log('[temu-hook] starting pagination for activity (fetch)');
         fetchAllPages(url, paginationInit, firstData, 'list')
           .then(allData => emit('activity', null, url, allData))
           .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, url, firstData); });
       } else if (match.module === 'sales') {
-        console.log('[temu-hook] starting pagination for sales (fetch)');
         fetchAllPages(url, paginationInit, firstData, 'subOrderList')
           .then(allData => enrichSalesWithDailyNumbers(url, paginationInit, allData))
           .then(enrichedData => emit('sales', null, url, enrichedData))
@@ -334,12 +311,6 @@ window.XMLHttpRequest = function () {
     _url = url;
     _isUserInfo = url.includes(USERINFO_PATTERN);
     _match = _isUserInfo ? null : matchModule(url);
-    if (_match?.module === 'activity' || url.includes('enroll/list')) {
-      console.log('[temu-hook] activity URL hit via XHR, activeModule=', _activeModule, 'match=', _match?.module, url);
-    }
-    if (_match?.module === 'sales' || url.includes('listOverall') || url.includes('querySkuSalesNumber')) {
-      console.log('[temu-hook] sales URL hit via XHR, activeModule=', _activeModule, 'match=', _match?.module, url);
-    }
     return _open(method, url, ...rest);
   };
 
@@ -352,7 +323,6 @@ window.XMLHttpRequest = function () {
   const _send = xhr.send.bind(xhr);
   xhr.send = function (body) {
     if (shouldCapture(_match) && body && typeof body === 'string') {
-      console.log('[temu-hook] capture(XHR)', _match.module, 'body=', body.slice(0, 600));
       _body = maybeInjectDate(body, _match.module);
     } else {
       _body = body;
@@ -370,12 +340,10 @@ window.XMLHttpRequest = function () {
         };
 
         if (_match.module === 'activity') {
-          console.log('[temu-hook] starting pagination for activity (XHR)');
           fetchAllPages(_url, init, parsed, 'list')
             .then(all => emit('activity', null, _url, all))
             .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, _url, parsed); });
         } else if (_match.module === 'sales') {
-          console.log('[temu-hook] starting pagination for sales (XHR)');
           fetchAllPages(_url, init, parsed, 'subOrderList')
             .then(all => enrichSalesWithDailyNumbers(_url, init, all))
             .then(enriched => emit('sales', null, _url, enriched))

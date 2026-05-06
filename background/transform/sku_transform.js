@@ -87,7 +87,8 @@ function _parseFullManaged(rawSales, targetDate) {
   const skuSpuMap = {};
 
   for (const product of onlineProducts) {
-    const spuId = String(product.goodsId ?? product.productSkcId ?? '');
+    // SPU ID prefers productId; fall back to goodsId / productSkcId for safety.
+    const spuId = String(product.productId ?? product.goodsId ?? product.productSkcId ?? '');
     for (const sku of (product.skuQuantityDetailList ?? [])) {
       const id = String(sku.productSkuId ?? '');
       if (!id) continue;
