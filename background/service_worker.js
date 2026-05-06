@@ -358,7 +358,7 @@ function rearmCaptureTimer(mod) {
   if (_captureTimer) clearTimeout(_captureTimer);
   // Sales/activity may paginate hundreds of pages; we rearm on each
   // PAGINATION_PROGRESS so the timer only fires when truly idle.
-  const timeoutMs = (mod === 'sales' || mod === 'activity') ? 300_000 : 60_000;
+  const timeoutMs = (mod === 'sales' || mod === 'activity' || mod === 'promo') ? 300_000 : 60_000;
   _captureTimer = setTimeout(async () => {
     console.warn(`[temu] timeout waiting for ${mod} (${timeoutMs/1000}s)`);
     await sendStatusToTab(mod, 'error');

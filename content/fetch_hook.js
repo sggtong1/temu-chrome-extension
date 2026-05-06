@@ -36,6 +36,23 @@ let _siteType = _hashCfg?.site || 'semi_us';
 let _activeModule = _hashCfg?.mod || null;
 let _targetDate = _hashCfg?.date || null;
 
+console.log('[temu-hook] init at', location.host,
+  '| activeModule=', _activeModule,
+  '| siteType=', _siteType,
+  '| dateRange=', _hashCfg?.startDate, '..', _hashCfg?.endDate);
+
+// Promo fallback: if no API call seen within 8s after page load and we're
+// in promo mode, try firing ads_report with empty headers (same-origin
+// cookies via credentials:'include' may be enough).
+if (_hashCfg?.mod === 'promo') {
+  setTimeout(() => {
+    if (!_promoTriggered) {
+      console.warn('[temu-hook] promo: no API call seen in 8s, firing fallback trigger');
+      triggerPromoCollection({ headers: {} });
+    }
+  }, 8000);
+}
+
 window.addEventListener('temu:setConfig', (e) => {
   _activeModule = e.detail.activeModule || null;
   _targetDate = e.detail.targetDate || null;
@@ -299,8 +316,10 @@ function emitUserInfo(data) {
 // borrow its init (auth headers, cookies), then synthesize the ads_report
 // POST ourselves with columns_type=4 and the user's date range.
 let _promoTriggered = false;
+// Match /api/ regardless of host (URL may be relative when called from same
+// origin: e.g. fetch('/api/v1/...')).
 function _isAdsTemuApi(url) {
-  return /^https?:\/\/ads\.temu\.com\/api\//.test(url);
+  return /\/api\//.test(url);
 }
 
 async function triggerPromoCollection(borrowedInit) {
