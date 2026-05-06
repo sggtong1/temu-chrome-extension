@@ -16,6 +16,12 @@
 export function transformActivityResponse(rawData, { shopName, startDate, endDate }) {
   const activities = rawData?.result?.list ?? [];
 
+  if (activities.length > 0) {
+    const a = activities[0];
+    console.log('[temu] activity_transform: first activity keys:', Object.keys(a));
+    console.log('[temu] activity_transform: first activity sample:', JSON.stringify(a).slice(0, 800));
+  }
+
   // Build the requested date list (UTC to avoid local-tz shift)
   const dates = [];
   let cur = new Date(startDate + 'T00:00:00Z');

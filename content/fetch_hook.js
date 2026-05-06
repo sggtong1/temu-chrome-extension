@@ -153,32 +153,51 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
   let pageNo = 2;
   const MAX_PAGES = 200;
 
+  // activity API is rate-limit sensitive — slower throttle + retry on "too frequent"
+  const isActivity = listKey === 'list';
+  const baseDelayMs = isActivity ? 600 : 150;
+
   while (pageNo <= MAX_PAGES) {
     let page = [];
-    try {
-      const t0 = Date.now();
-      const res  = await _originalFetch(originalUrl, { ...originalInit, method, body: JSON.stringify({ ...body, pageNo }) });
-      const data = await res.json();
-      page = data?.result?.[listKey] ?? [];
-      console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
-      // Temu's errorCode=1000000 + success=true is the normal success response.
-      // Only stop if the API explicitly says success=false, otherwise trust items.
-      if (data?.success === false) {
-        console.warn(`[temu-hook] page ${pageNo} success=false:`, data?.errorMsg, data?.errorCode);
+    let aborted = false;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const t0 = Date.now();
+        const res  = await _originalFetch(originalUrl, { ...originalInit, method, body: JSON.stringify({ ...body, pageNo }) });
+        const data = await res.json();
+        page = data?.result?.[listKey] ?? [];
+        console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
+
+        if (data?.success === false) {
+          const msg = String(data?.errorMsg ?? '');
+          if (/frequent|too many|限制|限频/i.test(msg) && attempt < 2) {
+            const backoff = 5000 * (attempt + 1); // 5s, 10s
+            console.warn(`[temu-hook] page ${pageNo} rate-limited, sleep ${backoff}ms (attempt ${attempt + 1}/3)`);
+            await new Promise(r => setTimeout(r, backoff));
+            page = [];
+            continue;
+          }
+          console.warn(`[temu-hook] page ${pageNo} success=false:`, msg, data?.errorCode);
+          aborted = true;
+        }
+        break; // either success or non-rate-limit failure
+      } catch (e) {
+        console.error(`[temu-hook] page ${pageNo} fetch failed:`, e);
+        aborted = true;
         break;
       }
-    } catch (e) {
-      console.error(`[temu-hook] page ${pageNo} fetch failed:`, e);
-      break;
     }
+
+    if (aborted) break;
     if (page.length === 0) break;
     allList.push(...page);
     if (page.length < pageSize) { pageNo++; break; }   // last page reached
     pageNo++;
     // Notify content_script that pagination is still progressing so it can
     // ping the service_worker (avoids the 120s timeout firing mid-pagination).
-    window.dispatchEvent(new CustomEvent('temu:paginationProgress', { detail: { module: 'sales', pageNo, gotSoFar: allList.length } }));
-    await new Promise(r => setTimeout(r, 150));
+    window.dispatchEvent(new CustomEvent('temu:paginationProgress', { detail: { module: isActivity ? 'activity' : 'sales', pageNo, gotSoFar: allList.length } }));
+    await new Promise(r => setTimeout(r, baseDelayMs));
   }
 
   console.log(`[temu-hook] paginated ${listKey}: fetched=${allList.length}, pages=${pageNo - 1}`);
