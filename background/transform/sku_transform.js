@@ -212,7 +212,9 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
       skuId,
       'sku规格': skuSpec,
       '货号': extCode,
-      '活动售价': activityPrice != null ? Math.round(activityPrice * 100) / 100 : null,
+      // '活动售价' column dropped in migration 005 — listOverall has no
+      // activityPrice field; authoritative activity price now lives in
+      // sku_activity_price (view) / sku_activity_history (table).
       '日常售价': dailyPrice != null ? Math.round(dailyPrice * 100) / 100 : null,
       '销售件数': salesQty,
       '销售额': salesAmount,
