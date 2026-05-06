@@ -41,16 +41,15 @@ console.log('[temu-hook] init at', location.host,
   '| siteType=', _siteType,
   '| dateRange=', _hashCfg?.startDate, '..', _hashCfg?.endDate);
 
-// Promo fallback: if no API call seen within 8s after page load and we're
-// in promo mode, try firing ads_report with empty headers (same-origin
-// cookies via credentials:'include' may be enough).
+// Promo fallback: if auth headers haven't been observed within 12s, fire
+// with whatever we collected. Cookies (credentials:'include') may suffice.
 if (_hashCfg?.mod === 'promo') {
   setTimeout(() => {
     if (!_promoTriggered) {
-      console.warn('[temu-hook] promo: no API call seen in 8s, firing fallback trigger');
-      triggerPromoCollection({ headers: {} });
+      console.warn(`[temu-hook] promo: 12s fallback fire | captured ${Object.keys(_capturedHeaders).length} headers: [${Object.keys(_capturedHeaders).join(', ')}]`);
+      triggerPromoCollection({ headers: { ..._capturedHeaders } });
     }
-  }, 8000);
+  }, 12000);
 }
 
 window.addEventListener('temu:setConfig', (e) => {
@@ -318,6 +317,28 @@ function emitUserInfo(data) {
 // borrow its init (auth headers, cookies), then synthesize the ads_report
 // POST ourselves with columns_type=4 and the user's date range.
 let _promoTriggered = false;
+
+// Cumulative header bag: every fetch/XHR on this page contributes its
+// request headers. We use this to assemble a complete auth header set
+// before firing our own ads_report (a single call may only carry
+// Content-Type while another call carries anti-content/mallid/etc).
+const _capturedHeaders = {};
+function _absorbHeaders(h) {
+  if (!h) return;
+  if (typeof h.forEach === 'function' && !Array.isArray(h)) {
+    // Headers instance
+    h.forEach((v, k) => { _capturedHeaders[k.toLowerCase()] = v; });
+  } else if (typeof h === 'object') {
+    for (const [k, v] of Object.entries(h)) {
+      if (typeof v === 'string') _capturedHeaders[k.toLowerCase()] = v;
+    }
+  }
+}
+function _hasAuthHeaders() {
+  return Object.keys(_capturedHeaders).some(k =>
+    /anti-content|mallid|csrf|verifyauth|x-token|user-agent-platform/i.test(k));
+}
+
 // Match /api/ regardless of host (URL may be relative when called from same
 // origin: e.g. fetch('/api/v1/...')).
 function _isAdsTemuApi(url) {
@@ -448,15 +469,16 @@ window.fetch = async function (input, init = {}) {
     return response;
   }
 
-  // Promo: borrow headers from any ads.temu.com /api/ call to fire our own
-  // ads_report (page default tab doesn't trigger it). Single-shot per cycle.
-  if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(url)) {
+  // Promo: accumulate headers from every /api/ call; trigger ads_report
+  // once we've seen at least one auth-bearing header. Different page calls
+  // may carry different subsets — cumulating gives us the full set.
+  if (_activeModule === 'promo' && _isAdsTemuApi(url)) {
     let headers = init.headers;
-    if (!headers && typeof input !== 'string' && input.headers) {
-      headers = {};
-      input.headers.forEach((v, k) => { headers[k] = v; });
+    if (!headers && typeof input !== 'string' && input.headers) headers = input.headers;
+    _absorbHeaders(headers);
+    if (!_promoTriggered && _hasAuthHeaders()) {
+      triggerPromoCollection({ headers: { ..._capturedHeaders } });
     }
-    triggerPromoCollection({ headers: headers || {} });
   }
 
   const match = matchModule(url);
@@ -555,14 +577,16 @@ window.XMLHttpRequest = function () {
   const _setHeader = xhr.setRequestHeader.bind(xhr);
   xhr.setRequestHeader = function (name, value) {
     _headers[name] = value;
+    _capturedHeaders[name.toLowerCase()] = value;  // contribute to global bag
     return _setHeader(name, value);
   };
 
   const _send = xhr.send.bind(xhr);
   xhr.send = function (body) {
-    // Promo: borrow this XHR's headers to fire our own ads_report (single-shot).
-    if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(_url)) {
-      triggerPromoCollection({ headers: { ..._headers } });
+    // Promo: this XHR's headers were already absorbed via setRequestHeader
+    // hook. Try triggering whenever we see an /api/ call and now have auth.
+    if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(_url) && _hasAuthHeaders()) {
+      triggerPromoCollection({ headers: { ..._capturedHeaders } });
     }
 
     if (shouldCapture(_match) && body && typeof body === 'string') {
