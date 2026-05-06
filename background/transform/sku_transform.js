@@ -67,6 +67,21 @@ function _parseFullManaged(rawSales, targetDate) {
   const onlineProducts = products.filter(p => (p.onSalesDurationOffline ?? 0) > 0);
   console.log(`[temu] _parseFullManaged: ${products.length} products, ${onlineProducts.length} online (onSalesDurationOffline>0)`);
 
+  // Build skuId → salesNumber map for the target date from querySkuSalesNumber data
+  const dailySalesItems = rawSales?.salesNumbers ?? [];
+  const dailySalesMap = {};
+  let matchedDate = 0;
+  for (const item of dailySalesItems) {
+    const itemDate = item.date ?? item.statDate ?? item.saleDate ?? '';
+    const skuId = String(item.prodSkuId ?? item.productSkuId ?? '');
+    const num = item.salesNumber ?? item.saleNum ?? item.salesNum ?? 0;
+    if (itemDate === targetDate && skuId) {
+      dailySalesMap[skuId] = num;
+      matchedDate++;
+    }
+  }
+  console.log(`[temu] _parseFullManaged: ${dailySalesItems.length} sales records, ${matchedDate} match target date ${targetDate}`);
+
   const skuSales = {};
   const skuPrices = {};
   const skuSpuMap = {};
@@ -77,9 +92,9 @@ function _parseFullManaged(rawSales, targetDate) {
       const id = String(sku.productSkuId ?? '');
       if (!id) continue;
 
-      // listOverall has no per-day sales qty; use 0 as placeholder.
-      // Rows are still written so SKU metadata is captured.
-      skuSales[id] = sku.salesNum ?? sku.saleNum ?? sku.salesNumber ?? 0;
+      // Real daily sales qty comes from querySkuSalesNumber (dailySalesMap).
+      // Fallback to 0 if that API didn't return data for this SKU/date.
+      skuSales[id] = dailySalesMap[id] ?? 0;
       skuPrices[id] = {
         activityPrice: sku.activityPrice != null ? sku.activityPrice / 100 : null,
         dailyPrice:    sku.supplierPrice  != null ? sku.supplierPrice  / 100 : null,

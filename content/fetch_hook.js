@@ -160,6 +160,67 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
   return { ...firstData, result: { ...firstData.result, [listKey]: allList } };
 }
 
+// After listOverall pagination completes, actively query daily sales numbers
+// for all collected SKUs by calling querySkuSalesNumber. This API is normally
+// only invoked when user clicks 销售趋势 on a product row; we synthesize the
+// call here using the same auth headers/cookies as the listOverall request.
+async function enrichSalesWithDailyNumbers(originalUrl, originalInit, mergedData) {
+  const subOrderList = mergedData?.result?.subOrderList ?? [];
+  const skuIds = [];
+  for (const product of subOrderList) {
+    for (const sku of (product.skuQuantityDetailList ?? [])) {
+      const id = sku.productSkuId;
+      if (id != null) skuIds.push(id);
+    }
+  }
+  if (skuIds.length === 0) {
+    console.log('[temu-hook] no SKUs found, skipping querySkuSalesNumber');
+    return mergedData;
+  }
+
+  const startDate = _hashCfg?.startDate || _hashCfg?.date;
+  const endDate   = _hashCfg?.endDate   || _hashCfg?.date;
+  if (!startDate || !endDate) {
+    console.warn('[temu-hook] no date range in boot config, skipping querySkuSalesNumber');
+    return mergedData;
+  }
+
+  const queryUrl = originalUrl.replace(/\/listOverall(\?.*)?$/, '/querySkuSalesNumber$1');
+  console.log(`[temu-hook] calling querySkuSalesNumber for ${skuIds.length} SKUs, ${startDate}..${endDate}`);
+
+  // Some installs may rate-limit a giant SKU array. Chunk in groups of 100.
+  const CHUNK = 100;
+  const allSalesItems = [];
+  for (let i = 0; i < skuIds.length; i += CHUNK) {
+    const chunk = skuIds.slice(i, i + CHUNK);
+    const body = JSON.stringify({ productSkuIds: chunk, startDate, endDate });
+    try {
+      const t0 = Date.now();
+      const res = await _originalFetch(queryUrl, {
+        method: 'POST',
+        headers: originalInit.headers || {},
+        body,
+        credentials: 'include',
+      });
+      const data = await res.json();
+      console.log(`[temu-hook] querySkuSalesNumber chunk ${i/CHUNK + 1}: status=${res.status}, ${Date.now() - t0}ms, success=${data?.success}, result type=${Array.isArray(data?.result) ? 'array(' + data.result.length + ')' : typeof data?.result}`);
+      if (i === 0) {
+        // Log first chunk's raw result so we can confirm shape
+        console.log('[temu-hook] querySkuSalesNumber sample:', JSON.stringify(data?.result).slice(0, 800));
+      }
+      const items = Array.isArray(data?.result) ? data.result
+        : data?.result?.list ?? data?.result?.items ?? data?.result?.dataList ?? [];
+      allSalesItems.push(...items);
+    } catch (e) {
+      console.warn(`[temu-hook] querySkuSalesNumber chunk ${i/CHUNK + 1} failed:`, e);
+    }
+    if (i + CHUNK < skuIds.length) await new Promise(r => setTimeout(r, 150));
+  }
+
+  console.log(`[temu-hook] querySkuSalesNumber: collected ${allSalesItems.length} sales records`);
+  return { ...mergedData, salesNumbers: allSalesItems };
+}
+
 function emitUserInfo(data) {
   window.dispatchEvent(new CustomEvent('temu:userInfo', { detail: data }));
 }
@@ -244,8 +305,9 @@ window.fetch = async function (input, init = {}) {
       } else if (match.module === 'sales') {
         console.log('[temu-hook] starting pagination for sales (fetch)');
         fetchAllPages(url, paginationInit, firstData, 'subOrderList')
-          .then(allData => emit('sales', null, url, allData))
-          .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('sales', null, url, firstData); });
+          .then(allData => enrichSalesWithDailyNumbers(url, paginationInit, allData))
+          .then(enrichedData => emit('sales', null, url, enrichedData))
+          .catch(err => { console.warn('[temu-hook] sales pipeline failed', err); emit('sales', null, url, firstData); });
       } else {
         emit(match.module, match.subType, url, firstData);
       }
@@ -315,8 +377,9 @@ window.XMLHttpRequest = function () {
         } else if (_match.module === 'sales') {
           console.log('[temu-hook] starting pagination for sales (XHR)');
           fetchAllPages(_url, init, parsed, 'subOrderList')
-            .then(all => emit('sales', null, _url, all))
-            .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('sales', null, _url, parsed); });
+            .then(all => enrichSalesWithDailyNumbers(_url, init, all))
+            .then(enriched => emit('sales', null, _url, enriched))
+            .catch(err => { console.warn('[temu-hook] sales pipeline failed', err); emit('sales', null, _url, parsed); });
         } else {
           emit(_match.module, _match.subType, _url, parsed);
         }
