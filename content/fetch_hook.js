@@ -57,7 +57,9 @@ window.addEventListener('temu:setConfig', (e) => {
   _activeModule = e.detail.activeModule || null;
   _targetDate = e.detail.targetDate || null;
   _siteType = e.detail.siteType || 'semi_us';
-  _promoTriggered = false;  // new collection cycle resets the latch
+  // Don't reset _promoTriggered here — setConfig fires on every page load
+  // (after navigateToNextModule sends ACTIVATE_CAPTURE) so we'd retrigger
+  // mid-flight. Fresh navigations get a fresh fetch_hook (file scope reset).
 });
 
 // Returns { module, subType } or null
@@ -334,11 +336,20 @@ async function triggerPromoCollection(borrowedInit) {
     return;
   }
 
+  // list_id is a client-issued UUID required by the server (without it, 500).
+  // Use crypto.randomUUID where available, fallback to a manual generator.
+  const listId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0; const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+
   // Body crafted to match the goods report panel's payload shape.
   const buildBody = (pageNo) => ({
     ad_status: [],
     page_number: pageNo,
-    page_size: 50,
+    page_size: 10,                     // match page default to avoid limit issues
     specific_query_info: '',
     sort_by: 0,
     sort_type: 'desc',
@@ -348,6 +359,7 @@ async function triggerPromoCollection(borrowedInit) {
     need_del_status_ad: true,
     need_calculate_goods_summary: true,
     columns_type: 4,
+    list_id: listId,
     filter_cooperative_ad_type: 0,
     data_filter: null,
     ad_group_list: null,
@@ -355,7 +367,8 @@ async function triggerPromoCollection(borrowedInit) {
     ad_phase: -1,
   });
 
-  console.log(`[temu-hook] promo: actively calling ads_report for ${startDate}..${endDate}`);
+  const headerKeys = Object.keys(borrowedInit.headers || {});
+  console.log(`[temu-hook] promo: actively calling ads_report for ${startDate}..${endDate} | list_id=${listId} | borrowed ${headerKeys.length} headers: [${headerKeys.join(', ')}]`);
 
   try {
     const res = await _originalFetch(url, {
@@ -364,8 +377,19 @@ async function triggerPromoCollection(borrowedInit) {
       body: JSON.stringify(buildBody(1)),
       credentials: 'include',
     });
-    const firstData = await res.json();
-    console.log(`[temu-hook] promo page1: status=${res.status}, success=${firstData?.success}`);
+    let firstData;
+    try { firstData = await res.json(); }
+    catch (e) {
+      const errText = await res.clone().text().catch(() => '');
+      console.error(`[temu-hook] promo HTTP ${res.status}: response not JSON. body=${errText.slice(0, 500)}`);
+      emit('promo', null, url, { result: {} });
+      return;
+    }
+    if (!res.ok) {
+      console.error(`[temu-hook] promo HTTP ${res.status}: body=${JSON.stringify(firstData).slice(0, 800)}`);
+    } else {
+      console.log(`[temu-hook] promo page1: status=${res.status}, success=${firstData?.success}`);
+    }
 
     // Detect list key on the response
     const listKey = _detectPromoListKey(firstData);
