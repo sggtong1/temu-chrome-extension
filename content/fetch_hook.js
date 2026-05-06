@@ -122,6 +122,10 @@ function maybeInjectDate(body, mod) {
       if (start) parsed.sessionStartTimeFrom = ptDateBoundaryMs(start, false) - MARGIN_MS;
       if (end)   parsed.sessionEndTimeTo     = ptDateBoundaryMs(end, true)   + MARGIN_MS;
       if (!('sessionStatus' in parsed)) parsed.sessionStatus = 2;
+      // 40 is the maximum page size the seller-center accepts; quartering
+      // the round-trip count (vs default 10) noticeably shortens activity
+      // collection without changing the rate-limit footprint per page.
+      parsed.pageSize = 40;
     }
     // promo (coconut/ad/ads_report): force columns_type=4 (商品数据报表) and
     // set start_time/end_time as Beijing-time epoch ms. The page may default
