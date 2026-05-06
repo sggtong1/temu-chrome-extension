@@ -55,13 +55,22 @@ function matchModule(url) {
 }
 
 function maybeInjectDate(body, mod) {
-  if (!_targetDate || !['list', 'sales'].includes(mod)) return body;
+  if (!['list', 'sales'].includes(mod)) return body;
   try {
     const parsed = JSON.parse(body);
-    if ('statDate' in parsed) parsed.statDate = _targetDate;
-    if ('date' in parsed) parsed.date = _targetDate;
-    if ('startDate' in parsed) parsed.startDate = _targetDate;
-    if ('endDate' in parsed) parsed.endDate = _targetDate;
+    if (_targetDate) {
+      if ('statDate' in parsed) parsed.statDate = _targetDate;
+      if ('date' in parsed) parsed.date = _targetDate;
+      if ('startDate' in parsed) parsed.startDate = _targetDate;
+      if ('endDate' in parsed) parsed.endDate = _targetDate;
+    }
+    // For full_managed sales (listOverall): inject the page filter that user can
+    // set manually as 选品状态=已加入站点. selectStatusList=[12] = added-to-site.
+    // Page default has no filter, so listOverall returns offline/halted SKUs too.
+    if (mod === 'sales') {
+      parsed.selectStatusList = [12];
+      if (!('isLack' in parsed)) parsed.isLack = 0;
+    }
     return JSON.stringify(parsed);
   } catch {
     return body;

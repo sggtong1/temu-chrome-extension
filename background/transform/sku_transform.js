@@ -56,28 +56,22 @@ function _parseFullManaged(rawSales, targetDate) {
     : result?.subOrderList ?? result?.list ?? result?.dataList
       ?? result?.items ?? result?.records ?? result?.goodsList ?? [];
 
-  if (Array.isArray(products) && products.length) {
-    console.log('[temu] _parseFullManaged: extracted', products.length, 'products');
-    // Log status fields of all products so user can identify the "online" marker
-    const statusKeys = ['productName', 'stockStatus', 'haltSalesType', 'haltSalesStartTime',
-      'closeJitStatus', 'supplyStatus', 'inBlackList', 'illegalImpactType',
-      'isLack', 'isEnoughStock', 'isFirst', 'onSalesDurationOffline', 'mark',
-      'pictureAuditStatus', 'productBsOptions', 'skcLabels'];
-    for (const p of products) {
-      const status = {};
-      for (const k of statusKeys) if (k in p) status[k] = p[k];
-      console.log('[temu-status]', p.productName?.slice(0, 30), status);
-    }
-  } else {
+  if (!Array.isArray(products) || !products.length) {
     console.warn('[temu] _parseFullManaged: no products extracted, full result keys =',
       result && typeof result === 'object' ? Object.keys(result) : 'N/A');
   }
+
+  // Belt-and-suspenders filter: drop products that aren't actively listed.
+  // selectStatusList=[12] in the request already filters server-side, but
+  // onSalesDurationOffline > 0 is a reliable client-side check for "在线".
+  const onlineProducts = products.filter(p => (p.onSalesDurationOffline ?? 0) > 0);
+  console.log(`[temu] _parseFullManaged: ${products.length} products, ${onlineProducts.length} online (onSalesDurationOffline>0)`);
 
   const skuSales = {};
   const skuPrices = {};
   const skuSpuMap = {};
 
-  for (const product of products) {
+  for (const product of onlineProducts) {
     const spuId = String(product.goodsId ?? product.productSkcId ?? '');
     for (const sku of (product.skuQuantityDetailList ?? [])) {
       const id = String(sku.productSkuId ?? '');
