@@ -57,9 +57,17 @@ function _parseFullManaged(rawSales, targetDate) {
       ?? result?.items ?? result?.records ?? result?.goodsList ?? [];
 
   if (Array.isArray(products) && products.length) {
-    console.log('[temu] _parseFullManaged: extracted', products.length,
-      'products. first item keys:', Object.keys(products[0]),
-      'sample:', JSON.stringify(products[0]).slice(0, 800));
+    console.log('[temu] _parseFullManaged: extracted', products.length, 'products');
+    // Log status fields of all products so user can identify the "online" marker
+    const statusKeys = ['productName', 'stockStatus', 'haltSalesType', 'haltSalesStartTime',
+      'closeJitStatus', 'supplyStatus', 'inBlackList', 'illegalImpactType',
+      'isLack', 'isEnoughStock', 'isFirst', 'onSalesDurationOffline', 'mark',
+      'pictureAuditStatus', 'productBsOptions', 'skcLabels'];
+    for (const p of products) {
+      const status = {};
+      for (const k of statusKeys) if (k in p) status[k] = p[k];
+      console.log('[temu-status]', p.productName?.slice(0, 30), status);
+    }
   } else {
     console.warn('[temu] _parseFullManaged: no products extracted, full result keys =',
       result && typeof result === 'object' ? Object.keys(result) : 'N/A');

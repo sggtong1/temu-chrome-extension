@@ -144,6 +144,7 @@ window.fetch = async function (input, init = {}) {
   if (shouldCapture(match)) {
     const origBody = init.body;
     if (origBody && typeof origBody === 'string') {
+      console.log('[temu-hook] capture', match.module, 'body=', origBody.slice(0, 600));
       init = { ...init, body: maybeInjectDate(origBody, match.module) };
     }
     const response = await _originalFetch(input, init);
