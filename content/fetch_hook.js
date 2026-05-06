@@ -20,7 +20,7 @@ const _hashCfg = _readBootConfig();
 const PATTERNS_SEMI_US = {
   list:   '/api/flow/analysis/list',
   orders: '/mmsos/order/recentOrderList',
-  promo:  '/bgn/pc/report/ad-report-detail/query',
+  promo:  '/api/v1/coconut/ad/ads_report',
 };
 
 // full_managed: list + sales + activity + promo (no orders)
@@ -29,7 +29,7 @@ const PATTERNS_FULL_MANAGED = {
   list:     '/api/seller/full/flow/analysis/goods/list',
   sales:    ['listOverall', '/sale-manage/list-overall'],
   activity: '/api/kiana/gamblers/marketing/enroll/list',
-  promo:    '/bgn/pc/report/ad-report-detail/query',
+  promo:    '/api/v1/coconut/ad/ads_report',
 };
 
 let _siteType = _hashCfg?.site || 'semi_us';
@@ -52,6 +52,13 @@ function matchModule(url) {
     }
   }
   return null;
+}
+
+// Compute the millisecond timestamp at 00:00 (or 23:59:59.999) Beijing Time
+// (UTC+8, no DST) for a YYYY-MM-DD date string. Used by promo's ads_report API.
+function cstDateBoundaryMs(dateStr, isEnd) {
+  const time = isEnd ? '23:59:59.999' : '00:00:00';
+  return new Date(`${dateStr}T${time}+08:00`).getTime();
 }
 
 // Compute the millisecond timestamp at 00:00 (or 23:59:59.999) Pacific Time
@@ -96,14 +103,23 @@ function maybeInjectDate(body, mod) {
       if (end)   parsed.sessionEndTimeTo     = ptDateBoundaryMs(end, true)   + MARGIN_MS;
       if (!('sessionStatus' in parsed)) parsed.sessionStatus = 2;
     }
-    const out = JSON.stringify(parsed);
-    if ((mod === 'sales' || mod === 'activity') && out !== body) {
-      console.log(`[temu-hook] body injected for ${mod}:`, out.slice(0, 600));
-    }
-    // promo: log original body so we can see what params the page sends
+    // promo (coconut/ad/ads_report): force columns_type=4 (商品数据报表) and
+    // set start_time/end_time as Beijing-time epoch ms. The page may default
+    // to 店铺数据报表 (columns_type=1); we override so the first fetch already
+    // returns the goods-level data we want.
     if (mod === 'promo') {
-      console.log(`[temu-hook] promo body (original):`, body.slice(0, 800));
-      if (out !== body) console.log(`[temu-hook] promo body (injected):`, out.slice(0, 800));
+      const start = _hashCfg?.startDate || _hashCfg?.date;
+      const end   = _hashCfg?.endDate   || _hashCfg?.date;
+      if (start) parsed.start_time = cstDateBoundaryMs(start, false);
+      if (end)   parsed.end_time   = cstDateBoundaryMs(end, true);
+      parsed.columns_type = 4;
+      // Restore some sensible defaults if missing
+      if (parsed.page_size == null) parsed.page_size = 50;  // bigger pages for fewer round-trips
+      if (parsed.page_number == null) parsed.page_number = 1;
+    }
+    const out = JSON.stringify(parsed);
+    if ((mod === 'sales' || mod === 'activity' || mod === 'promo') && out !== body) {
+      console.log(`[temu-hook] body injected for ${mod}:`, out.slice(0, 800));
     }
     return out;
   } catch (e) {
@@ -131,16 +147,23 @@ function shouldCapture(match) {
 }
 
 // Generic pagination helper: fetches remaining pages reusing original headers.
-// Don't trust result.total — for listOverall it appears to be an unrelated metric,
-// not the product count. Instead keep fetching until an empty or short page.
-async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
+// opts: { listKey, pageNoKey?, pageSizeKey?, module?, baseDelayMs? }
+// listKey: where the array of items lives in result; pageNoKey/pageSizeKey:
+// body field names for pagination (defaults pageNo / pageSize).
+async function fetchAllPages(originalUrl, originalInit, firstData, opts) {
+  const listKey      = typeof opts === 'string' ? opts : opts.listKey;
+  const pageNoKey    = (typeof opts === 'object' && opts.pageNoKey)   || 'pageNo';
+  const pageSizeKey  = (typeof opts === 'object' && opts.pageSizeKey) || 'pageSize';
+  const moduleName   = (typeof opts === 'object' && opts.module)      || (listKey === 'list' ? 'activity' : 'sales');
+  const baseDelayMs  = (typeof opts === 'object' && opts.baseDelayMs) || (moduleName === 'activity' ? 600 : 150);
+
   const firstList = firstData?.result?.[listKey] ?? [];
   console.log(`[temu-hook] pagination ${listKey}: page1 size=${firstList.length}, total field=`,
     firstData?.result?.total, 'totalSkcNum=', firstData?.result?.totalSkcNum);
 
   let body = {};
   try { body = JSON.parse(originalInit.body ?? '{}'); } catch {}
-  const pageSize = body.pageSize ?? 10;
+  const pageSize = body[pageSizeKey] ?? 10;
 
   // Page 1 returned fewer than a full page → no more pages
   if (firstList.length < pageSize) {
@@ -149,18 +172,13 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
   }
 
   // Force POST. originalInit may lack method when the caller used fetch(Request)
-  // — method lives on the Request object, not in init. listOverall/enroll-list
-  // are always POST anyway, so coercing GET/HEAD avoids "method cannot have body".
+  // — method lives on the Request object, not in init.
   const rawMethod = (originalInit.method || 'POST').toUpperCase();
   const method = (rawMethod === 'GET' || rawMethod === 'HEAD') ? 'POST' : rawMethod;
 
   const allList = [...firstList];
   let pageNo = 2;
   const MAX_PAGES = 200;
-
-  // activity API is rate-limit sensitive — slower throttle + retry on "too frequent"
-  const isActivity = listKey === 'list';
-  const baseDelayMs = isActivity ? 600 : 150;
 
   while (pageNo <= MAX_PAGES) {
     let page = [];
@@ -169,7 +187,10 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const t0 = Date.now();
-        const res  = await _originalFetch(originalUrl, { ...originalInit, method, body: JSON.stringify({ ...body, pageNo }) });
+        const res  = await _originalFetch(originalUrl, {
+          ...originalInit, method,
+          body: JSON.stringify({ ...body, [pageNoKey]: pageNo }),
+        });
         const data = await res.json();
         page = data?.result?.[listKey] ?? [];
         console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
@@ -201,7 +222,7 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
     pageNo++;
     // Notify content_script that pagination is still progressing so it can
     // ping the service_worker (avoids the 120s timeout firing mid-pagination).
-    window.dispatchEvent(new CustomEvent('temu:paginationProgress', { detail: { module: isActivity ? 'activity' : 'sales', pageNo, gotSoFar: allList.length } }));
+    window.dispatchEvent(new CustomEvent('temu:paginationProgress', { detail: { module: moduleName, pageNo, gotSoFar: allList.length } }));
     await new Promise(r => setTimeout(r, baseDelayMs));
   }
 
@@ -270,6 +291,31 @@ function emitUserInfo(data) {
   window.dispatchEvent(new CustomEvent('temu:userInfo', { detail: data }));
 }
 
+// Inspect the first ads_report response to find which result.* field holds
+// the row array (different deployments may use different field names).
+function _detectPromoListKey(firstData) {
+  const r = firstData?.result;
+  if (!r || typeof r !== 'object') return 'list';
+  const candidates = ['adDetailList', 'list', 'dataList', 'items', 'records',
+                      'goods_data_list', 'goods_report_list', 'report_list',
+                      'data_list', 'goods_list', 'ad_report_list'];
+  for (const k of candidates) {
+    if (Array.isArray(r[k])) {
+      console.log(`[temu-hook] promo list key detected: ${k} (len=${r[k].length})`);
+      return k;
+    }
+  }
+  // Fallback: pick any array-typed key on result
+  for (const [k, v] of Object.entries(r)) {
+    if (Array.isArray(v)) {
+      console.log(`[temu-hook] promo list key fallback: ${k} (len=${v.length})`);
+      return k;
+    }
+  }
+  console.warn('[temu-hook] promo: no array list key found on result. result keys:', Object.keys(r));
+  return 'list';
+}
+
 const _originalFetch = window.fetch.bind(window);
 window.fetch = async function (input, init = {}) {
   const url = typeof input === 'string' ? input : input.url;
@@ -326,14 +372,25 @@ window.fetch = async function (input, init = {}) {
     const clone = response.clone();
     clone.json().then(firstData => {
       if (match.module === 'activity') {
-        fetchAllPages(url, paginationInit, firstData, 'list')
+        fetchAllPages(url, paginationInit, firstData, { listKey: 'list', module: 'activity' })
           .then(allData => emit('activity', null, url, allData))
           .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, url, firstData); });
       } else if (match.module === 'sales') {
-        fetchAllPages(url, paginationInit, firstData, 'subOrderList')
+        fetchAllPages(url, paginationInit, firstData, { listKey: 'subOrderList', module: 'sales' })
           .then(allData => enrichSalesWithDailyNumbers(url, paginationInit, allData))
           .then(enrichedData => emit('sales', null, url, enrichedData))
           .catch(err => { console.warn('[temu-hook] sales pipeline failed', err); emit('sales', null, url, firstData); });
+      } else if (match.module === 'promo') {
+        // ads_report uses page_number / page_size (snake_case). The list field
+        // name is unknown until we see the first response; promo_transform
+        // handles multiple shapes via fallbacks.
+        fetchAllPages(url, paginationInit, firstData, {
+          listKey: _detectPromoListKey(firstData),
+          pageNoKey: 'page_number', pageSizeKey: 'page_size',
+          module: 'promo',
+        })
+          .then(allData => emit('promo', null, url, allData))
+          .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, url, firstData); });
       } else {
         emit(match.module, match.subType, url, firstData);
       }
@@ -389,14 +446,22 @@ window.XMLHttpRequest = function () {
         };
 
         if (_match.module === 'activity') {
-          fetchAllPages(_url, init, parsed, 'list')
+          fetchAllPages(_url, init, parsed, { listKey: 'list', module: 'activity' })
             .then(all => emit('activity', null, _url, all))
             .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, _url, parsed); });
         } else if (_match.module === 'sales') {
-          fetchAllPages(_url, init, parsed, 'subOrderList')
+          fetchAllPages(_url, init, parsed, { listKey: 'subOrderList', module: 'sales' })
             .then(all => enrichSalesWithDailyNumbers(_url, init, all))
             .then(enriched => emit('sales', null, _url, enriched))
             .catch(err => { console.warn('[temu-hook] sales pipeline failed', err); emit('sales', null, _url, parsed); });
+        } else if (_match.module === 'promo') {
+          fetchAllPages(_url, init, parsed, {
+            listKey: _detectPromoListKey(parsed),
+            pageNoKey: 'page_number', pageSizeKey: 'page_size',
+            module: 'promo',
+          })
+            .then(all => emit('promo', null, _url, all))
+            .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, _url, parsed); });
         } else {
           emit(_match.module, _match.subType, _url, parsed);
         }
