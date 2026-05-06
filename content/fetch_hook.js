@@ -118,6 +118,12 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
     return firstData;
   }
 
+  // Force POST. originalInit may lack method when the caller used fetch(Request)
+  // — method lives on the Request object, not in init. listOverall/enroll-list
+  // are always POST anyway, so coercing GET/HEAD avoids "method cannot have body".
+  const rawMethod = (originalInit.method || 'POST').toUpperCase();
+  const method = (rawMethod === 'GET' || rawMethod === 'HEAD') ? 'POST' : rawMethod;
+
   const allList = [...firstList];
   let pageNo = 2;
   const MAX_PAGES = 200;
@@ -126,7 +132,7 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
     let page = [];
     try {
       const t0 = Date.now();
-      const res  = await _originalFetch(originalUrl, { ...originalInit, body: JSON.stringify({ ...body, pageNo }) });
+      const res  = await _originalFetch(originalUrl, { ...originalInit, method, body: JSON.stringify({ ...body, pageNo }) });
       const data = await res.json();
       page = data?.result?.[listKey] ?? [];
       console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
@@ -185,22 +191,57 @@ window.fetch = async function (input, init = {}) {
     console.log('[temu-hook] sales URL hit via fetch, activeModule=', _activeModule, 'match=', match?.module, url);
   }
   if (shouldCapture(match)) {
-    const origBody = init.body;
+    // Resolve body/method/headers, accounting for fetch(Request) calls where
+    // these live on the Request object instead of init.
+    const isRequestObj = typeof input !== 'string' && !(input instanceof URL);
+    const reqMethod = (init.method || (isRequestObj ? input.method : 'POST') || 'POST').toUpperCase();
+
+    let origBody = init.body;
+    if (origBody === undefined && isRequestObj && reqMethod !== 'GET' && reqMethod !== 'HEAD') {
+      try { origBody = await input.clone().text(); }
+      catch (e) { console.warn('[temu-hook] reading Request body failed:', e); }
+    }
+
+    let reqHeaders = init.headers;
+    if (!reqHeaders && isRequestObj && input.headers) {
+      reqHeaders = {};
+      input.headers.forEach((v, k) => { reqHeaders[k] = v; });
+    }
+
+    let injected = false;
+    let bodyToSend = origBody;
     if (origBody && typeof origBody === 'string') {
       console.log('[temu-hook] capture', match.module, 'body=', origBody.slice(0, 600));
-      init = { ...init, body: maybeInjectDate(origBody, match.module) };
+      bodyToSend = maybeInjectDate(origBody, match.module);
+      injected = bodyToSend !== origBody;
     }
-    const response = await _originalFetch(input, init);
+
+    // If we modified the body, must build a fresh init (mutating Request-derived
+    // body in-place isn't possible). Otherwise use the original input/init verbatim.
+    let response;
+    if (injected) {
+      response = await _originalFetch(url, {
+        method: reqMethod, headers: reqHeaders || {}, body: bodyToSend, credentials: init.credentials || 'include',
+      });
+    } else {
+      response = await _originalFetch(input, init);
+    }
+
+    // Pagination uses the resolved init (with the body we'd want for subsequent pages)
+    const paginationInit = {
+      method: reqMethod, headers: reqHeaders || {}, body: bodyToSend, credentials: 'include',
+    };
+
     const clone = response.clone();
     clone.json().then(firstData => {
       if (match.module === 'activity') {
         console.log('[temu-hook] starting pagination for activity (fetch)');
-        fetchAllPages(url, init, firstData, 'list')
+        fetchAllPages(url, paginationInit, firstData, 'list')
           .then(allData => emit('activity', null, url, allData))
           .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, url, firstData); });
       } else if (match.module === 'sales') {
         console.log('[temu-hook] starting pagination for sales (fetch)');
-        fetchAllPages(url, init, firstData, 'subOrderList')
+        fetchAllPages(url, paginationInit, firstData, 'subOrderList')
           .then(allData => emit('sales', null, url, allData))
           .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('sales', null, url, firstData); });
       } else {
