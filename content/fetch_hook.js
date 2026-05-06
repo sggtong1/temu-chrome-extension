@@ -54,8 +54,23 @@ function matchModule(url) {
   return null;
 }
 
+// Compute the millisecond timestamp at 00:00 (or 23:59:59.999) Pacific Time
+// for a YYYY-MM-DD date string. Handles PST/PDT automatically via Intl.
+function ptDateBoundaryMs(dateStr, isEnd) {
+  const probe = new Date(`${dateStr}T12:00:00Z`);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', timeZoneName: 'shortOffset',
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value || 'GMT-8';
+  const m = tzPart.match(/GMT([+-]?\d+)/);
+  const offH = m ? parseInt(m[1], 10) : -8;
+  const sign = offH >= 0 ? '+' : '-';
+  const offStr = `${sign}${String(Math.abs(offH)).padStart(2, '0')}:00`;
+  const time = isEnd ? '23:59:59.999' : '00:00:00';
+  return new Date(`${dateStr}T${time}${offStr}`).getTime();
+}
+
 function maybeInjectDate(body, mod) {
-  if (!['list', 'sales'].includes(mod)) return body;
+  if (!['list', 'sales', 'activity'].includes(mod)) return body;
   try {
     const parsed = JSON.parse(body);
     if (_targetDate) {
@@ -64,16 +79,23 @@ function maybeInjectDate(body, mod) {
       if ('startDate' in parsed) parsed.startDate = _targetDate;
       if ('endDate' in parsed) parsed.endDate = _targetDate;
     }
-    // For full_managed sales (listOverall): inject the page filter that user can
-    // set manually as 选品状态=已加入站点. selectStatusList=[12] = added-to-site.
-    // Page default has no filter, so listOverall returns offline/halted SKUs too.
+    // full_managed sales: 选品状态=已加入站点 server-side filter
     if (mod === 'sales') {
       parsed.selectStatusList = [12];
       if (!('isLack' in parsed)) parsed.isLack = 0;
     }
+    // activity (enroll/list): sessionStatus=2 (进行中) + PT timestamps for the
+    // user's selected date range. API expects ms epoch in Pacific Time.
+    if (mod === 'activity') {
+      const start = _hashCfg?.startDate || _hashCfg?.date;
+      const end   = _hashCfg?.endDate   || _hashCfg?.date;
+      if (start) parsed.sessionStartTimeFrom = ptDateBoundaryMs(start, false);
+      if (end)   parsed.sessionEndTimeTo     = ptDateBoundaryMs(end, true);
+      if (!('sessionStatus' in parsed)) parsed.sessionStatus = 2;
+    }
     const out = JSON.stringify(parsed);
-    if (mod === 'sales' && out !== body) {
-      console.log('[temu-hook] body injected for sales:', out.slice(0, 600));
+    if ((mod === 'sales' || mod === 'activity') && out !== body) {
+      console.log(`[temu-hook] body injected for ${mod}:`, out.slice(0, 600));
     }
     return out;
   } catch (e) {
