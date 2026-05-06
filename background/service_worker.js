@@ -170,6 +170,10 @@ async function handleGetShopInfo(mallId) {
 
 async function handleStartCollection(msg, tabId) {
   console.log('[temu] START_COLLECTION received', { mallId: msg.mallId, modules: msg.modules, siteType: msg.siteType, region: msg.region });
+  if (_state.active) {
+    console.warn('[temu] START_COLLECTION ignored — collection already active (possible duplicate message)');
+    return;
+  }
   try {
     const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
     if (!supabaseUrl || !supabaseAnonKey) {

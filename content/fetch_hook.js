@@ -174,13 +174,15 @@ window.fetch = async function (input, init = {}) {
     const clone = response.clone();
     clone.json().then(firstData => {
       if (match.module === 'activity') {
+        console.log('[temu-hook] starting pagination for activity (fetch)');
         fetchAllPages(url, init, firstData, 'list')
           .then(allData => emit('activity', null, url, allData))
-          .catch(() => emit('activity', null, url, firstData));
+          .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, url, firstData); });
       } else if (match.module === 'sales') {
+        console.log('[temu-hook] starting pagination for sales (fetch)');
         fetchAllPages(url, init, firstData, 'subOrderList')
           .then(allData => emit('sales', null, url, allData))
-          .catch(() => emit('sales', null, url, firstData));
+          .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('sales', null, url, firstData); });
       } else {
         emit(match.module, match.subType, url, firstData);
       }
@@ -195,12 +197,15 @@ const _OrigXHR = window.XMLHttpRequest;
 window.XMLHttpRequest = function () {
   const xhr = new _OrigXHR();
   let _url = '';
+  let _method = 'POST';
   let _match = null;
   let _isUserInfo = false;
   let _body = null;
+  const _headers = {};
 
   const _open = xhr.open.bind(xhr);
   xhr.open = function (method, url, ...rest) {
+    _method = method;
     _url = url;
     _isUserInfo = url.includes(USERINFO_PATTERN);
     _match = _isUserInfo ? null : matchModule(url);
@@ -213,9 +218,16 @@ window.XMLHttpRequest = function () {
     return _open(method, url, ...rest);
   };
 
+  const _setHeader = xhr.setRequestHeader.bind(xhr);
+  xhr.setRequestHeader = function (name, value) {
+    _headers[name] = value;
+    return _setHeader(name, value);
+  };
+
   const _send = xhr.send.bind(xhr);
   xhr.send = function (body) {
-    if (_match && _match.module === _activeModule && body) {
+    if (shouldCapture(_match) && body && typeof body === 'string') {
+      console.log('[temu-hook] capture(XHR)', _match.module, 'body=', body.slice(0, 600));
       _body = maybeInjectDate(body, _match.module);
     } else {
       _body = body;
@@ -223,9 +235,26 @@ window.XMLHttpRequest = function () {
     xhr.addEventListener('load', () => {
       try {
         const parsed = JSON.parse(xhr.responseText);
-        if (_isUserInfo) {
-          emitUserInfo(parsed);
-        } else if (shouldCapture(_match)) {
+        if (_isUserInfo) { emitUserInfo(parsed); return; }
+        if (!shouldCapture(_match)) return;
+
+        // Reconstruct an init for fetchAllPages — uses headers we tracked
+        // via setRequestHeader. credentials:'include' so cookies go with it.
+        const init = {
+          method: _method, headers: _headers, body: _body, credentials: 'include',
+        };
+
+        if (_match.module === 'activity') {
+          console.log('[temu-hook] starting pagination for activity (XHR)');
+          fetchAllPages(_url, init, parsed, 'list')
+            .then(all => emit('activity', null, _url, all))
+            .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('activity', null, _url, parsed); });
+        } else if (_match.module === 'sales') {
+          console.log('[temu-hook] starting pagination for sales (XHR)');
+          fetchAllPages(_url, init, parsed, 'subOrderList')
+            .then(all => emit('sales', null, _url, all))
+            .catch(err => { console.warn('[temu-hook] pagination failed', err); emit('sales', null, _url, parsed); });
+        } else {
           emit(_match.module, _match.subType, _url, parsed);
         }
       } catch {}
