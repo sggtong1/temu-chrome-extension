@@ -49,7 +49,9 @@ function moduleUrl(module, mallId, siteType, region) {
     return `https://agentseller.temu.com/activity/marketing-activity/log?mallId=${mallId}&uId=${uid}`;
   }
   if (module === 'promo') {
-    return `${base}/main/ads-management/ads-report?mallId=${mallId}`;
+    // Ad report page lives on a separate subdomain (ads.temu.com), not the
+    // seller-center base. mallId can still be appended for context.
+    return `https://ads.temu.com/data-report.html?mallId=${mallId}`;
   }
   return null;
 }

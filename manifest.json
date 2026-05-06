@@ -9,6 +9,7 @@
     "https://agentseller-us.temu.com/*",
     "https://agentseller-eu.temu.com/*",
     "https://agentseller.temu.com/*",
+    "https://ads.temu.com/*",
     "https://*.supabase.co/*"
   ],
   "background": {
@@ -20,7 +21,8 @@
       "matches": [
         "https://agentseller-us.temu.com/*",
         "https://agentseller-eu.temu.com/*",
-        "https://agentseller.temu.com/*"
+        "https://agentseller.temu.com/*",
+        "https://ads.temu.com/*"
       ],
       "js": ["content/fetch_hook.js"],
       "run_at": "document_start",
@@ -30,7 +32,8 @@
       "matches": [
         "https://agentseller-us.temu.com/*",
         "https://agentseller-eu.temu.com/*",
-        "https://agentseller.temu.com/*"
+        "https://agentseller.temu.com/*",
+        "https://ads.temu.com/*"
       ],
       "js": ["content/content_script.js"],
       "run_at": "document_idle"
