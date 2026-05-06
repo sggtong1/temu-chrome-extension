@@ -24,11 +24,20 @@ export async function supabaseGet(supabaseUrl, anonKey, table, qs = '') {
 
 /**
  * Upsert rows into a Supabase table.
+ * @param onConflict optional comma-separated column list. Required when the
+ *   table's "natural" unique key is a UNIQUE constraint rather than the
+ *   primary key — e.g. ad_spend_daily has bigint id PK plus UNIQUE on
+ *   (日期, 店铺名称, 商品id, 平台). Without on_conflict PostgREST tries to
+ *   merge by PK, can't find a row (id is auto-generated), then the INSERT
+ *   violates the UNIQUE → HTTP 409.
  * Returns { count, error } where error is null on success.
  */
-export async function supabaseUpsert(supabaseUrl, anonKey, table, rows) {
+export async function supabaseUpsert(supabaseUrl, anonKey, table, rows, onConflict) {
   if (!rows.length) return { count: 0, error: null };
-  const resp = await fetch(`${supabaseUrl}/rest/v1/${table}`, {
+  const qs = onConflict
+    ? `?on_conflict=${onConflict.split(',').map(c => encodeURIComponent(c.trim())).join(',')}`
+    : '';
+  const resp = await fetch(`${supabaseUrl}/rest/v1/${table}${qs}`, {
     method: 'POST',
     headers: {
       ...makeHeaders(anonKey),

@@ -18,19 +18,6 @@ export function transformPromoResponse(rawData, { shopName, date }) {
     ?? result?.adReportList
     ?? [];
 
-  // Store-wide summary (same shape as per-ad reports_summary_dto, aggregated
-  // across all ads in the result set — i.e. the user's date-range filter).
-  const summary = result?.reports_summary ?? {};
-  if (Object.keys(summary).length > 0) {
-    console.log('[temu] promo_transform: reports_summary keys:', Object.keys(summary));
-  }
-  const sumVal = key => (summary[key]?.val ?? null);
-
-  // Store ACOS (费比) and store transaction_cost (每笔成交花费) — these go on
-  // every row since they describe the whole shop's totals, not per-ad.
-  const store_费比 = sumVal('acos_all') != null ? Math.round(sumVal('acos_all') / 100 * 100) / 100 : null;
-  const store_每笔成交花费 = sumVal('transaction_cost') != null ? Math.round(sumVal('transaction_cost') / 100 * 100) / 100 : null;
-
   return adList.map(ad => {
     const rsd = ad.reports_summary_dto ?? {};
     const val = key => (rsd[key]?.val ?? rsd[key] ?? 0);
@@ -52,15 +39,10 @@ export function transformPromoResponse(rawData, { shopName, date }) {
       '点击量': Math.round(val('clk_cnt_all')),
       '点击率': Math.round(val('ctr_all') / 100 * 100) / 100,
       '转化率': Math.round(val('cvr') / 100 * 100) / 100,
-      // 费比 (per-ad ACOS) = ad_spend / sales_amount; val is in 1/100 percent
-      '费比': val('acos_all') != null ? Math.round(val('acos_all') / 100 * 100) / 100 : null,
-      // ROAS comes from reports_summary_dto.roas_all (val/1000 = displayed
-      // ratio). The top-level ad.roas field is something else (possibly a
-      // long-window aggregate) and doesn't match what the UI shows.
+      // ROAS comes from reports_summary_dto.roas_all.val / 1000 — this matches
+      // the seller-center UI. The top-level ad.roas field gives a different
+      // (incorrect) value, do not use it.
       ROAS: rsd.roas_all?.val != null ? Math.round(rsd.roas_all.val / 1000 * 100) / 100 : null,
-      // Store-wide metrics duplicated on each row (for convenient JOINs)
-      '费比_全店': store_费比,
-      '每笔成交花费_全店': store_每笔成交花费,
     };
   });
 }

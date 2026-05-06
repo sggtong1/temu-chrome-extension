@@ -512,7 +512,10 @@ async function processModule(module, rawData) {
   if (module === 'promo') {
     const rows = transformPromoResponse(rawData, ctx);
     if (rows.length > 0) {
-      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows);
+      const { count, error } = await supabaseUpsert(
+        supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows,
+        '日期,店铺名称,商品id,平台'  // unique constraint, not the bigint id PK
+      );
       if (error) { console.error('[temu] promo upsert error:', error); throw new Error(error); }
       console.log(`[temu] promo: upsert OK, count=${count}`);
     } else {
