@@ -511,12 +511,12 @@ async function processModule(module, rawData) {
 
   if (module === 'promo') {
     const rows = transformPromoResponse(rawData, ctx);
-    console.log(`[temu] promo: built ${rows.length} rows`);
     if (rows.length > 0) {
-      console.log('[temu] promo: first row sample:', JSON.stringify(rows[0]).slice(0, 500));
       const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows);
       if (error) { console.error('[temu] promo upsert error:', error); throw new Error(error); }
       console.log(`[temu] promo: upsert OK, count=${count}`);
+    } else {
+      console.log('[temu] promo: 0 rows (no ads in range)');
     }
   }
 }

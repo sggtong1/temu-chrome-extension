@@ -36,10 +36,11 @@ let _siteType = _hashCfg?.site || 'semi_us';
 let _activeModule = _hashCfg?.mod || null;
 let _targetDate = _hashCfg?.date || null;
 
-console.log('[temu-hook] init at', location.host,
-  '| activeModule=', _activeModule,
-  '| siteType=', _siteType,
-  '| dateRange=', _hashCfg?.startDate, '..', _hashCfg?.endDate);
+if (_activeModule) {
+  console.log('[temu-hook] init at', location.host,
+    '| activeModule=', _activeModule,
+    '| dateRange=', _hashCfg?.startDate, '..', _hashCfg?.endDate);
+}
 
 // Promo fallback: if auth headers haven't been observed within 12s, fire
 // with whatever we collected. Cookies (credentials:'include') may suffice.

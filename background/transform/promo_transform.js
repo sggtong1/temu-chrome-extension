@@ -7,23 +7,16 @@
  * ROAS: ad.roas ÷ 10000
  */
 export function transformPromoResponse(rawData, { shopName, date }) {
-  // Diagnose response shape: try multiple list field names
+  // ads_detail is the field used by /api/v1/coconut/ad/ads_report.
+  // Fallbacks kept for older deployments / different endpoints.
   const result = rawData?.result;
-  const adList = result?.ads_detail            // coconut/ads_report (current)
-    ?? result?.adDetailList                    // legacy
+  const adList = result?.ads_detail
+    ?? result?.adDetailList
     ?? result?.list
     ?? result?.dataList
     ?? result?.items
     ?? result?.adReportList
     ?? [];
-
-  console.log('[temu] promo_transform: result keys:',
-    result && typeof result === 'object' ? Object.keys(result) : typeof result,
-    'adList len=', adList.length);
-  if (adList.length > 0) {
-    console.log('[temu] promo_transform: first ad keys:', Object.keys(adList[0]));
-    console.log('[temu] promo_transform: first ad sample:', JSON.stringify(adList[0]).slice(0, 2000));
-  }
 
   return adList.map(ad => {
     const rsd = ad.reports_summary_dto ?? {};
