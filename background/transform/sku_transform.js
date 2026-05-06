@@ -170,7 +170,6 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
     const salesQty = skuSales[skuId] ?? 0;
 
     const priceInfo = skuPrices[skuId] ?? {};
-    const activityPrice = priceInfo.activityPrice;
     const dailyPrice = priceInfo.dailyPrice;
     const extCode = priceInfo.extCode ?? '';
     const properties = priceInfo.properties ?? {};
@@ -178,33 +177,20 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
 
     const skuSpec = priceInfo.specText
       || Object.entries(properties).map(([k, v]) => `${k}:${v}`).join('、');
-    const salesAmount = activityPrice != null ? Math.round(salesQty * activityPrice * 100) / 100 : null;
 
     const costTuple = extCode ? skuCostMap[extCode] : null;
     const costPrice = costTuple?.[0] ?? null;
-    let shippingCost = costTuple?.[1] ?? 0;
     const costSource = costPrice != null ? 'sku_cost' : null;
-
-    const orderShip = ordersShipping[skuId];
-    let actualShippingPerUnit = null;
-    if (orderShip?.per_unit) {
-      actualShippingPerUnit = orderShip.per_unit;
-      shippingCost = actualShippingPerUnit;
-    }
-
     const missingCost = costPrice == null;
-    let salesCost = null, grossProfit = null, margin = null;
-    if (!missingCost && salesQty) {
-      const unitCost = costPrice + shippingCost;
-      salesCost = Math.round(unitCost * salesQty * 100) / 100;
-      if (salesAmount != null) {
-        grossProfit = Math.round((salesAmount - salesCost) * 100) / 100;
-      }
-      if (activityPrice) {
-        margin = Math.round(((activityPrice - unitCost) / activityPrice) * 10000) / 10000;
-      }
-    }
 
+    // Actual shipping fee (per unit) from orders API — semi_us only
+    const orderShip = ordersShipping[skuId];
+    const actualShippingPerUnit = orderShip?.per_unit ?? null;
+
+    // Derived metrics (销售额 / 销售成本 / 毛利润 / 毛利率) are now computed
+    // by the sku_daily_with_activity view from these fact columns plus
+    // sku_activity_price.活动价格. Migration 006 dropped the columns from
+    // sku_daily_metrics — don't write them here.
     const row = {
       '日期': date,
       '店铺名称': shopName,
@@ -212,20 +198,13 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
       skuId,
       'sku规格': skuSpec,
       '货号': extCode,
-      // '活动售价' column dropped in migration 005 — listOverall has no
-      // activityPrice field; authoritative activity price now lives in
-      // sku_activity_price (view) / sku_activity_history (table).
       '日常售价': dailyPrice != null ? Math.round(dailyPrice * 100) / 100 : null,
       '销售件数': salesQty,
-      '销售额': salesAmount,
       '成本价': costPrice != null ? Math.round(costPrice * 100) / 100 : null,
-      '销售成本': salesCost,
-      '毛利润': grossProfit,
-      '毛利率': margin,
       '成本缺失': missingCost,
       '成本来源': costSource,
+      '实际运费': actualShippingPerUnit,
     };
-    if (actualShippingPerUnit != null) row['実際運費'] = actualShippingPerUnit;
     rows.push(row);
   }
   return rows;
