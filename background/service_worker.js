@@ -258,8 +258,17 @@ async function handleApiData(msg) {
   _state.modules.shift();
   if (_state.modules.length > 0) {
     navigateToNextModule();
+  } else if (_state.originalModules.length === 0) {
+    // All selected modules were range-only (e.g. sales/activity captured
+    // the whole range in one shot). Skip per-date iteration → complete now.
+    const collectionTabId = _state.collectionTabId;
+    _state.collectionTabId = null;
+    resetState();
+    void collectionTabId;
+    await sendStatusToTab(null, 'complete');
+    console.log('[temu] Collection complete (range modules only)');
   } else {
-    // Current date done — advance to next date if any
+    // There are per-date modules left — advance to next date if any
     _state.dateIndex++;
     if (_state.dateIndex < _state.dates.length) {
       _state.date = _state.dates[_state.dateIndex];
@@ -271,8 +280,6 @@ async function handleApiData(msg) {
       const collectionTabId = _state.collectionTabId;
       _state.collectionTabId = null;
       resetState();
-      // Keep collection tab open for log inspection / debugging.
-      // (was: chrome.tabs.remove(collectionTabId))
       void collectionTabId;
       await sendStatusToTab(null, 'complete');
       console.log('[temu] Collection complete');

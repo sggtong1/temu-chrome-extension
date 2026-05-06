@@ -440,13 +440,17 @@ if (urlMallId) {
 
 let _activeModules = [];
 
-function renderProgress(modules, date, dateIdx, totalDates) {
+// Modules that capture the entire date range in one shot (no per-date iteration)
+function isRangeOnlyMode(modules, siteType) {
+  return modules.length > 0 && modules.every(m =>
+    m === 'activity' || (m === 'sales' && siteType === 'full_managed')
+  );
+}
+
+function renderProgress(modules, dateLabelText) {
   _activeModules = modules;
   const wrap = shadow.getElementById('progress-wrap');
-  const dateLabel = totalDates > 1
-    ? `<div class="progress-date">日期 ${dateIdx}/${totalDates}：${date}</div>`
-    : `<div class="progress-date">采集日期：${date}</div>`;
-  wrap.innerHTML = dateLabel + modules.map(m =>
+  wrap.innerHTML = `<div class="progress-date">${dateLabelText}</div>` + modules.map(m =>
     `<div class="prog-row" id="prog-row-${m}">
        <span class="prog-name">${MODULE_LABELS[m] ?? m}</span>
        <span class="prog-badge badge-wait" id="prog-${m}">等待</span>
@@ -487,8 +491,19 @@ shadow.getElementById('start-btn').addEventListener('click', () => {
   const totalDates = dateRangeLength(startDate, endDate);
   shadow.getElementById('start-btn').style.display = 'none';
   const siteType = _mallTypeCache[String(mallId)] || null;
+  const effectiveEnd = endDate || startDate;
   safeSend({ type: 'START_COLLECTION', modules, region, startDate, endDate, mallId, siteType });
-  renderProgress(modules, startDate, 1, totalDates);
+  // Date label depends on collection mode: range-only modules don't iterate
+  // dates, so show start~end. Per-date modules show 日期 N/M.
+  let dateLabel;
+  if (isRangeOnlyMode(modules, siteType)) {
+    dateLabel = startDate === effectiveEnd
+      ? `采集日期：${startDate}`
+      : `采集范围：${startDate} ~ ${effectiveEnd}`;
+  } else {
+    dateLabel = totalDates > 1 ? `日期 1/${totalDates}：${startDate}` : `采集日期：${startDate}`;
+  }
+  renderProgress(modules, dateLabel);
   shadow.getElementById('bar-sub').textContent = '· 采集中';
 });
 
@@ -509,7 +524,7 @@ function updatePanelStatus(msg) {
     return;
   }
   if (msg.status === 'next-date') {
-    renderProgress(_activeModules, msg.date, msg.dateIndex + 1, msg.totalDates);
+    renderProgress(_activeModules, `日期 ${msg.dateIndex + 1}/${msg.totalDates}：${msg.date}`);
     shadow.getElementById('bar-sub').textContent = `· 采集中 ${msg.dateIndex + 1}/${msg.totalDates}`;
     return;
   }
