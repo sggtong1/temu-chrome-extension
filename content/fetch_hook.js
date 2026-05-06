@@ -136,8 +136,10 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
       const data = await res.json();
       page = data?.result?.[listKey] ?? [];
       console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
-      if (data?.success === false || data?.errorCode) {
-        console.warn(`[temu-hook] page ${pageNo} returned error:`, data?.errorMsg, data?.errorCode);
+      // Temu's errorCode=1000000 + success=true is the normal success response.
+      // Only stop if the API explicitly says success=false, otherwise trust items.
+      if (data?.success === false) {
+        console.warn(`[temu-hook] page ${pageNo} success=false:`, data?.errorMsg, data?.errorCode);
         break;
       }
     } catch (e) {
