@@ -9,23 +9,20 @@
 export function transformPromoResponse(rawData, { shopName, date }) {
   // Diagnose response shape: try multiple list field names
   const result = rawData?.result;
-  const adList = result?.adDetailList
+  const adList = result?.ads_detail            // coconut/ads_report (current)
+    ?? result?.adDetailList                    // legacy
     ?? result?.list
     ?? result?.dataList
     ?? result?.items
     ?? result?.adReportList
     ?? [];
 
-  if (Array.isArray(result) && !adList.length) {
-    console.log('[temu] promo_transform: result is array, len=', result.length);
-  } else {
-    console.log('[temu] promo_transform: result keys:',
-      result && typeof result === 'object' ? Object.keys(result) : typeof result,
-      'adList len=', adList.length);
-  }
+  console.log('[temu] promo_transform: result keys:',
+    result && typeof result === 'object' ? Object.keys(result) : typeof result,
+    'adList len=', adList.length);
   if (adList.length > 0) {
     console.log('[temu] promo_transform: first ad keys:', Object.keys(adList[0]));
-    console.log('[temu] promo_transform: first ad sample:', JSON.stringify(adList[0]).slice(0, 1500));
+    console.log('[temu] promo_transform: first ad sample:', JSON.stringify(adList[0]).slice(0, 2000));
   }
 
   return adList.map(ad => {

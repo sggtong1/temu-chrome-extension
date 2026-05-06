@@ -438,7 +438,8 @@ async function triggerPromoCollection(borrowedInit) {
 function _detectPromoListKey(firstData) {
   const r = firstData?.result;
   if (!r || typeof r !== 'object') return 'list';
-  const candidates = ['adDetailList', 'list', 'dataList', 'items', 'records',
+  const candidates = ['ads_detail',                // coconut/ads_report (current)
+                      'adDetailList', 'list', 'dataList', 'items', 'records',
                       'goods_data_list', 'goods_report_list', 'report_list',
                       'data_list', 'goods_list', 'ad_report_list'];
   for (const k of candidates) {
