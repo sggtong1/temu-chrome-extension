@@ -149,12 +149,15 @@ shadow.innerHTML = `
   }
 
   .footer { padding: 10px 12px; }
-  .start-btn {
-    width: 100%; background: #1e40af; color: white; border: none;
+  .start-btn, .export-btn {
+    width: 100%; color: white; border: none;
     padding: 8px; border-radius: 5px; font-size: 13px;
     font-weight: 600; cursor: pointer; letter-spacing: .03em; margin-top: 8px;
   }
-  .start-btn:disabled { background: #94a3b8; cursor: default; }
+  .start-btn          { background: #1e40af; }
+  .export-btn         { background: #059669; }
+  .start-btn:disabled,
+  .export-btn:disabled { background: #94a3b8; cursor: default; }
 
   /* Error / info banner */
   .banner {
@@ -239,6 +242,7 @@ shadow.innerHTML = `
       </div>
       <div class="banner" id="banner"><span id="banner-text"></span></div>
       <button class="start-btn" id="start-btn" disabled>▶ 开始采集</button>
+      <button class="export-btn" id="export-btn" disabled>📊 导出 Excel</button>
       <div class="progress-wrap" id="progress-wrap"></div>
     </div>
   </div>
@@ -406,6 +410,7 @@ function populateMallSelect(malls) {
   _currentMallId = select.value;
   updateModuleVisibility(_mallTypeCache[_currentMallId]);
   shadow.getElementById('start-btn').disabled = false;
+  shadow.getElementById('export-btn').disabled = false;
   hideBanner();
 }
 
@@ -428,6 +433,7 @@ if (urlMallId) {
   select.disabled = false;
   _currentMallId = urlMallId;
   shadow.getElementById('start-btn').disabled = false;
+  shadow.getElementById('export-btn').disabled = false;
   safeChrome(() => chrome.runtime.sendMessage({ type: 'GET_SHOP_INFO', mallId: urlMallId }, (shop) => {
     if (shop) {
       const typeLabel = shop.site_type === 'semi_us' ? '半托' : '全托';
@@ -510,6 +516,99 @@ shadow.getElementById('start-btn').addEventListener('click', () => {
 function dateRangeLength(start, end) {
   const a = new Date(start), b = new Date(end ?? start);
   return Math.max(1, Math.round((b - a) / 86400000) + 1);
+}
+
+// ── Export Excel ──────────────────────────────────────────────────────────────
+
+// Template A: 13 core PnL columns (the recommended starter)
+const EXPORT_TEMPLATE_A = [
+  { src: '日期',          name: '日期' },
+  { src: 'sku_id',        name: 'SKU ID' },
+  { src: 'ext_code',      name: '货号' },
+  { src: 'sku规格',       name: '规格' },
+  { src: '销售件数',      name: '销售件数' },
+  { src: '销售额',        name: '销售额' },
+  { src: '成本价',        name: '成本价' },
+  { src: '销售成本',      name: '销售成本' },
+  { src: '毛利润',        name: '毛利润' },
+  { src: '毛利率',        name: '毛利率' },
+  { src: '广告花费分摊',  name: '广告花费' },
+  { src: '净利润',        name: '净利润' },
+  { src: '净利率',        name: '净利率' },
+];
+
+shadow.getElementById('export-btn').addEventListener('click', () => {
+  hideBanner();
+  if (typeof XLSX === 'undefined') { showBanner('XLSX 库未加载，请重载插件'); return; }
+  const startDate = shadow.getElementById('date-start').value;
+  const endDate   = shadow.getElementById('date-end').value || startDate;
+  const mallId    = shadow.getElementById('mall-select').value;
+
+  if (!startDate) { showBanner('请选择开始日期'); return; }
+  if (!mallId)    { showBanner('请先选择店铺'); return; }
+  if (!isCtxValid()) { reportContextInvalidated(); return; }
+
+  // Shop name from select option text: "THE TELOS PRODUCT · 全托 · ID:..."
+  const select = shadow.getElementById('mall-select');
+  const optionText = select.options[select.selectedIndex].text;
+  const shopName = optionText.split(' · ')[0];
+
+  exportExcel(startDate, endDate, shopName);
+});
+
+function exportExcel(startDate, endDate, shopName) {
+  const exportBtn = shadow.getElementById('export-btn');
+  const originalLabel = exportBtn.textContent;
+  exportBtn.disabled = true;
+  exportBtn.textContent = '⏳ 拉取数据...';
+
+  safeChrome(() => chrome.runtime.sendMessage(
+    { type: 'EXPORT_REPORT', startDate, endDate, shopName },
+    (resp) => {
+      exportBtn.disabled = false;
+      exportBtn.textContent = originalLabel;
+
+      if (!resp) { showBanner('导出失败：服务未响应'); return; }
+      if (resp.error === 'no-supabase') {
+        showBanner('未配置 Supabase，请前往选项页设置');
+        return;
+      }
+      if (resp.error) { showBanner(`导出失败: ${resp.error}`); return; }
+
+      const rows = resp.rows ?? [];
+      if (rows.length === 0) {
+        showBanner(`${startDate} ~ ${endDate} 范围内无数据`, 'warn');
+        return;
+      }
+
+      // Map view rows → template A columns with friendly names
+      const mapped = rows.map(r => {
+        const out = {};
+        for (const col of EXPORT_TEMPLATE_A) {
+          let v = r[col.src];
+          // numeric strings (Postgres numeric type) → numbers for Excel
+          if (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v)) v = Number(v);
+          out[col.name] = v ?? null;
+        }
+        return out;
+      });
+
+      try {
+        const ws = XLSX.utils.json_to_sheet(mapped);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, '销售PnL');
+        const safeName = shopName.replace(/[\\/:*?"<>|]/g, '_');
+        const fname = startDate === endDate
+          ? `${safeName}_${startDate}.xlsx`
+          : `${safeName}_${startDate}_to_${endDate}.xlsx`;
+        XLSX.writeFile(wb, fname);
+        showBanner(`✓ 已导出 ${rows.length} 行 → ${fname}`, 'info');
+      } catch (e) {
+        console.error('[temu] export xlsx failed:', e);
+        showBanner(`导出失败: ${e?.message || e}`);
+      }
+    }
+  ));
 }
 
 // ── Status updates ────────────────────────────────────────────────────────────

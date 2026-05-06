@@ -150,7 +150,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handlePaginationProgress(msg);
     return false;
   }
+  if (msg.type === 'EXPORT_REPORT') {
+    handleExportReport(msg).then(sendResponse);
+    return true;
+  }
 });
+
+async function handleExportReport({ startDate, endDate, shopName }) {
+  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
+  if (!supabaseUrl || !supabaseAnonKey) return { error: 'no-supabase' };
+  if (!startDate || !endDate || !shopName) return { error: 'invalid-params' };
+
+  // Build query manually (Chinese column names need URL-encoding both as keys and values)
+  const enc = encodeURIComponent;
+  const qs = [
+    `${enc('日期')}=gte.${startDate}`,
+    `${enc('日期')}=lte.${endDate}`,
+    `${enc('店铺名称')}=eq.${enc(shopName)}`,
+    `order=${enc('日期')}.desc,${enc('销售件数')}.desc.nullslast`,
+  ].join('&');
+
+  console.log(`[temu] EXPORT_REPORT: ${shopName} ${startDate}..${endDate}`);
+  try {
+    const resp = await fetch(`${supabaseUrl}/rest/v1/sku_daily_with_activity?${qs}`, {
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: `Bearer ${supabaseAnonKey}`,
+        // PostgREST default limit is 1000; raise it via Range header
+        Range: '0-49999',
+        'Range-Unit': 'items',
+      },
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      return { error: `HTTP ${resp.status}: ${body.slice(0, 200)}` };
+    }
+    const rows = await resp.json();
+    console.log(`[temu] EXPORT_REPORT: fetched ${rows.length} rows`);
+    return { rows };
+  } catch (e) {
+    return { error: String(e?.message ?? e) };
+  }
+}
 
 // Show/hide panel on extension icon click
 chrome.action.onClicked.addListener((tab) => {
