@@ -95,31 +95,40 @@ function shouldCapture(match) {
   return false;
 }
 
-// Generic pagination helper: fetches remaining pages reusing original headers
-// listKey: field on result that holds the page items (e.g. 'list', 'subOrderList')
+// Generic pagination helper: fetches remaining pages reusing original headers.
+// Don't trust result.total — for listOverall it appears to be an unrelated metric,
+// not the product count. Instead keep fetching until an empty or short page.
 async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
   const firstList = firstData?.result?.[listKey] ?? [];
-  const total = firstData?.result?.total ?? firstData?.result?.totalCount ?? firstData?.result?.totalSize ?? 0;
-  if (!total || firstList.length >= total) return firstData;
+  console.log(`[temu-hook] pagination ${listKey}: page1 size=${firstList.length}, total field=`,
+    firstData?.result?.total, 'totalSkcNum=', firstData?.result?.totalSkcNum);
+
+  let body = {};
+  try { body = JSON.parse(originalInit.body ?? '{}'); } catch {}
+  const pageSize = body.pageSize ?? 10;
+
+  // Page 1 returned fewer than a full page → no more pages
+  if (firstList.length < pageSize) {
+    console.log(`[temu-hook] ${listKey}: only 1 page (got ${firstList.length}, pageSize=${pageSize})`);
+    return firstData;
+  }
 
   const allList = [...firstList];
   let pageNo = 2;
-  let body = {};
-  try { body = JSON.parse(originalInit.body ?? '{}'); } catch {}
-
   const MAX_PAGES = 200;
-  while (allList.length < total && pageNo <= MAX_PAGES) {
+
+  while (pageNo <= MAX_PAGES) {
     const res  = await _originalFetch(originalUrl, { ...originalInit, body: JSON.stringify({ ...body, pageNo }) });
     const data = await res.json();
     const page = data?.result?.[listKey] ?? [];
     if (page.length === 0) break;
     allList.push(...page);
+    if (page.length < pageSize) { pageNo++; break; }   // last page reached
     pageNo++;
-    // light throttle to avoid hammering the API
     await new Promise(r => setTimeout(r, 150));
   }
 
-  console.log(`[temu-hook] paginated ${listKey}: total=${total}, fetched=${allList.length}, pages=${pageNo - 1}`);
+  console.log(`[temu-hook] paginated ${listKey}: fetched=${allList.length}, pages=${pageNo - 1}`);
   return { ...firstData, result: { ...firstData.result, [listKey]: allList } };
 }
 
