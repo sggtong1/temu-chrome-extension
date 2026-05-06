@@ -439,27 +439,41 @@ async function processModule(module, rawData) {
     if (error) throw new Error(error);
   }
 
-  if (module === 'sales') {
+  if (module === 'sales' && _state.siteType === 'full_managed') {
+    // querySkuSalesNumber returns up to ~30 days regardless of requested range,
+    // so we capture ONCE and slice rows for every date in the user's range.
+    const allRows = [];
+    let totalSkus = 0;
+    for (const date of _state.dates) {
+      const dateCtx = { ...ctx, date };
+      const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData, dateCtx);
+      const extCodes = [...new Set(Object.values(skuPrices).map(p => p.extCode).filter(Boolean))];
+      const skuCostMap = await getSkuCost(supabaseUrl, supabaseAnonKey, extCodes, date, _state.siteType);
+      const rows = buildSkuRows(dateCtx, { skuSales, skuPrices, skuSpuMap }, {}, skuCostMap);
+      allRows.push(...rows);
+      totalSkus = Math.max(totalSkus, Object.keys(skuSales).length);
+    }
+    console.log(`[temu] sales (full_managed): built ${allRows.length} rows for ${_state.dates.length} dates × ${totalSkus} SKUs`);
+    if (allRows.length > 0) {
+      console.log('[temu] sales: first row sample:', JSON.stringify(allRows[0]).slice(0, 500));
+      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', allRows);
+      if (error) { console.error('[temu] sales upsert error:', error); throw new Error(error); }
+      console.log(`[temu] sales: upsert OK, count=${count}`);
+    }
+    // Captured the full range in one shot — skip subsequent date iterations
+    _state.originalModules = _state.originalModules.filter(m => m !== 'sales');
+  } else if (module === 'sales') {
+    // semi_us: per-date capture (existing behavior)
     const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData, ctx);
-    // Cost lookup uses 货号 (extCode) directly — matches sku_cost.sku_id column
     const extCodes = [...new Set(Object.values(skuPrices).map(p => p.extCode).filter(Boolean))];
     const skuCostMap = await getSkuCost(supabaseUrl, supabaseAnonKey, extCodes, _state.date, _state.siteType);
-
-    // Merge orders shipping if ORDERS was already captured in this session
     const ordersRaw = _state.captured['orders'];
     const ordersShipping = ordersRaw ? parseOrdersResponse(ordersRaw) : {};
-
     const rows = buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShipping, skuCostMap);
-    console.log(`[temu] sales: built ${rows.length} rows for ${Object.keys(skuSales).length} SKUs`);
-    if (rows.length === 0) {
-      console.warn('[temu] sales: no rows to write — skuSales sample:', Object.entries(skuSales).slice(0, 3));
-    } else {
-      console.log('[temu] sales: first row sample:', JSON.stringify(rows[0]).slice(0, 500));
+    console.log(`[temu] sales (semi_us): built ${rows.length} rows for ${Object.keys(skuSales).length} SKUs`);
+    if (rows.length > 0) {
       const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', rows);
-      if (error) {
-        console.error('[temu] sales upsert error:', error);
-        throw new Error(error);
-      }
+      if (error) { console.error('[temu] sales upsert error:', error); throw new Error(error); }
       console.log(`[temu] sales: upsert OK, count=${count}`);
     }
   }
