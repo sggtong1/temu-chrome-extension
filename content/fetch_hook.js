@@ -84,13 +84,16 @@ function maybeInjectDate(body, mod) {
       parsed.selectStatusList = [12];
       if (!('isLack' in parsed)) parsed.isLack = 0;
     }
-    // activity (enroll/list): sessionStatus=2 (进行中) + PT timestamps for the
-    // user's selected date range. API expects ms epoch in Pacific Time.
+    // activity (enroll/list): widen the time window so activities that cross
+    // the user's range boundary are also returned (their start may be before
+    // user range OR end may be after). The transform layer trims to exact overlap.
+    // API expects PT epoch ms.
     if (mod === 'activity') {
       const start = _hashCfg?.startDate || _hashCfg?.date;
       const end   = _hashCfg?.endDate   || _hashCfg?.date;
-      if (start) parsed.sessionStartTimeFrom = ptDateBoundaryMs(start, false);
-      if (end)   parsed.sessionEndTimeTo     = ptDateBoundaryMs(end, true);
+      const MARGIN_MS = 90 * 86_400_000; // 90-day padding catches typical 30/60/90-day campaigns
+      if (start) parsed.sessionStartTimeFrom = ptDateBoundaryMs(start, false) - MARGIN_MS;
+      if (end)   parsed.sessionEndTimeTo     = ptDateBoundaryMs(end, true)   + MARGIN_MS;
       if (!('sessionStatus' in parsed)) parsed.sessionStatus = 2;
     }
     const out = JSON.stringify(parsed);

@@ -497,12 +497,14 @@ async function processModule(module, rawData) {
       endDate: _state.dates[_state.dates.length - 1],
     });
     if (rows.length > 0) {
-      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_activity_price', rows);
-      if (error) throw new Error(error);
+      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_activity_history', rows);
+      if (error) { console.error('[temu] activity upsert error:', error); throw new Error(error); }
+      console.log(`[temu] activity: upsert OK, count=${count}`);
+    } else {
+      console.log('[temu] activity: 0 rows generated (no activities overlap user range)');
     }
     // Full range captured in one shot — remove from subsequent dates
     _state.originalModules = _state.originalModules.filter(m => m !== 'activity');
-    console.log(`[temu] activity captured: ${rows.length} rows`);
   }
 
   if (module === 'promo') {
