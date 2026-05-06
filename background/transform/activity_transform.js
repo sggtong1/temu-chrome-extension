@@ -13,44 +13,58 @@
  *
  * Monetary values are in fen (÷100 = 元).
  */
-// Extract SKU IDs from various nesting shapes that Temu uses across endpoints.
-function _extractSkuIds(act) {
-  if (Array.isArray(act.productSkuIds)) return act.productSkuIds;
-  if (Array.isArray(act.skuIds))         return act.skuIds;
-  const ids = [];
-  for (const skc of (act.skcList ?? [])) {
-    // Common nesting: skcList[i].skuList[j].{productSkuId|skuId}
-    for (const sku of (skc.skuList ?? skc.productSkuList ?? [])) {
-      const id = sku.productSkuId ?? sku.skuId ?? sku.id;
-      if (id != null) ids.push(id);
-    }
-    // Or flat array of IDs on the SKC itself
-    for (const id of (skc.productSkuIdList ?? skc.skuIdList ?? [])) ids.push(id);
-    // Or single SKU directly on the SKC
-    if (skc.productSkuId != null) ids.push(skc.productSkuId);
-    else if (skc.skuId != null) ids.push(skc.skuId);
+// Extract per-SKU records (skuId + price + extCode) from various nesting shapes.
+// Real Temu enroll/list response: prices live on each SKU inside skcList[].skuList[]
+// (activity-level and SKC-level activityPrice/dailyPrice are null).
+function _extractSkuRecords(act) {
+  // Legacy fallback: flat array of IDs at activity level (then prices come from act)
+  if (Array.isArray(act.productSkuIds)) {
+    return act.productSkuIds.map(id => ({
+      skuId: id,
+      activityPrice: act.activityPrice ?? null,
+      dailyPrice: act.dailyPrice ?? act.supplierPrice ?? null,
+      extCode: act.extCode ?? '',
+    }));
   }
-  return ids;
-}
+  if (Array.isArray(act.skuIds)) {
+    return act.skuIds.map(id => ({
+      skuId: id,
+      activityPrice: act.activityPrice ?? null,
+      dailyPrice: act.dailyPrice ?? null,
+      extCode: act.extCode ?? '',
+    }));
+  }
 
-// Pick the SKC's price/extCode if the activity-level fields are missing.
-function _firstSkc(act) {
-  const skcs = act.skcList ?? [];
-  return skcs[0] ?? null;
+  // Nested form: skcList[].skuList[] with per-SKU prices
+  const records = [];
+  for (const skc of (act.skcList ?? [])) {
+    for (const sku of (skc.skuList ?? skc.productSkuList ?? [])) {
+      const id = sku.skuId ?? sku.productSkuId ?? sku.id;
+      if (id == null) continue;
+      records.push({
+        skuId: id,
+        // Per-SKU prices first; SKC then activity as fallback
+        activityPrice: sku.activityPrice ?? skc.activityPrice ?? act.activityPrice ?? null,
+        dailyPrice:    sku.dailyPrice    ?? skc.dailyPrice    ?? act.dailyPrice    ?? null,
+        extCode:       sku.extCode       ?? skc.extCode       ?? act.extCode       ?? '',
+      });
+    }
+    // Also handle SKCs that expose flat ID arrays without skuList
+    for (const id of (skc.productSkuIdList ?? skc.skuIdList ?? [])) {
+      records.push({
+        skuId: id,
+        activityPrice: skc.activityPrice ?? act.activityPrice ?? null,
+        dailyPrice:    skc.dailyPrice    ?? act.dailyPrice    ?? null,
+        extCode:       skc.extCode       ?? act.extCode       ?? '',
+      });
+    }
+  }
+  return records;
 }
 
 export function transformActivityResponse(rawData, { shopName, startDate, endDate }) {
   const activities = rawData?.result?.list ?? [];
 
-  if (activities.length > 0) {
-    const a = activities[0];
-    console.log('[temu] activity_transform: first activity keys:', Object.keys(a));
-    console.log('[temu] activity_transform: first activity sample:', JSON.stringify(a).slice(0, 2000));
-    if (Array.isArray(a.skcList) && a.skcList.length > 0) {
-      console.log('[temu] activity_transform: skcList[0] keys:', Object.keys(a.skcList[0]));
-      console.log('[temu] activity_transform: skcList[0] sample:', JSON.stringify(a.skcList[0]).slice(0, 2000));
-    }
-  }
 
   // Build the requested date list (UTC to avoid local-tz shift)
   const dates = [];
@@ -71,17 +85,15 @@ export function transformActivityResponse(rawData, { shopName, startDate, endDat
     const actId = act.enrollId ?? act.activityId ?? act.id ?? act.sessionId ?? null;
     if (actId == null) { skippedNoId++; continue; }
 
-    const skuIds = _extractSkuIds(act);
-    if (skuIds.length === 0) { skippedNoSku++; continue; }
+    const skuRecords = _extractSkuRecords(act);
+    if (skuRecords.length === 0) { skippedNoSku++; continue; }
 
-    const skc        = _firstSkc(act) ?? {};
-    const actPrice   = act.activityPrice ?? skc.activityPrice ?? 0;
-    const dailyPrice = act.dailyPrice ?? act.supplierPrice ?? skc.supplierPrice ?? skc.dailyPrice ?? 0;
-    const extCode    = act.extCode ?? act.skcExtCode ?? skc.extCode ?? skc.skcExtCode ?? '';
-    const actName    = act.activityThematicName ?? act.activityName ?? act.name ?? '';
-    const actType    = act.activityTypeName ?? act.activityType ?? '';
-    const startMs    = act.sessionStartTime ?? act.startTime ?? 0;
-    const endMs      = act.sessionEndTime   ?? act.endTime   ?? 0;
+    // Activity-level metadata. activityThematicName may be null (not all
+    // activities are 专题); fall back to product-level name then to type label.
+    const actName  = act.activityThematicName || act.activityTypeName || act.productName || '';
+    const actType  = act.activityTypeName ?? '';
+    const startMs  = act.sessionStartTime ?? act.startTime ?? 0;
+    const endMs    = act.sessionEndTime   ?? act.endTime   ?? 0;
 
     const actStart = startMs ? new Date(startMs).toISOString().slice(0, 10) : startDate;
     const actEnd   = endMs   ? new Date(endMs).toISOString().slice(0, 10)   : endDate;
@@ -90,19 +102,19 @@ export function transformActivityResponse(rawData, { shopName, startDate, endDat
     // Activities crossing the boundary contribute only their overlap days.
     const activeDates = dates.filter(d => d >= actStart && d <= actEnd);
 
-    for (const skuId of skuIds) {
-      const sku = String(skuId);
+    for (const rec of skuRecords) {
+      const sku = String(rec.skuId);
       for (const date of activeDates) {
         rows.push({
           '日期':         date,
           '店铺名称':     shopName,
           'sku_id':       sku,
           '活动ID':       actId,
-          '活动名称':     actName,
+          '活动名称':     actName || null,
           '活动类型':     actType || null,
-          '活动价格':     Math.round(actPrice)   / 100,
-          '日常价格':     Math.round(dailyPrice) / 100,
-          'ext_code':     extCode,
+          '活动价格':     rec.activityPrice != null ? Math.round(rec.activityPrice) / 100 : null,
+          '日常价格':     rec.dailyPrice    != null ? Math.round(rec.dailyPrice)    / 100 : null,
+          'ext_code':     rec.extCode || '',
           '活动开始时间': startMs ? new Date(startMs).toISOString() : null,
           '活动结束时间': endMs   ? new Date(endMs).toISOString()   : null,
         });
