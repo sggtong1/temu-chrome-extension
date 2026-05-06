@@ -316,9 +316,11 @@ async function navigateToNextModule() {
   url += '#__tmu=' + boot;
 
   _retryCount = 0;
+  // Use active=true to avoid Chrome's background tab throttling (which can stall
+  // POST responses for >60s). User can switch back manually after collection.
   if (_state.collectionTabId === null) {
     console.log('[temu] creating collection tab:', url);
-    chrome.tabs.create({ url, active: false }, (tab) => {
+    chrome.tabs.create({ url, active: true }, (tab) => {
       if (chrome.runtime.lastError) {
         console.error('[temu] tabs.create failed:', chrome.runtime.lastError.message);
         return;
@@ -329,7 +331,7 @@ async function navigateToNextModule() {
     });
   } else {
     console.log('[temu] updating collection tab', _state.collectionTabId, 'to:', url);
-    chrome.tabs.update(_state.collectionTabId, { url }, () => attachCaptureListener(mod));
+    chrome.tabs.update(_state.collectionTabId, { url, active: true }, () => attachCaptureListener(mod));
   }
 }
 
@@ -349,14 +351,35 @@ function attachCaptureListener(mod) {
       siteType: _state.siteType,
     });
 
-    // 60s hard timeout — fallback if PAGE_ERROR detection also fails
+    // Hard timeout — sales/activity pages with lots of items can be slow.
+    // On timeout, advance state cleanly (avoids leak where modules=[] but originalModules!=[]
+    // leaves _state.active=true and drops next API_DATA as 'expected=undefined').
+    const timeoutMs = (mod === 'sales' || mod === 'activity') ? 120_000 : 60_000;
     _captureTimer = setTimeout(async () => {
-      console.warn(`[temu] timeout waiting for ${mod}`);
+      console.warn(`[temu] timeout waiting for ${mod} (${timeoutMs/1000}s)`);
       await sendStatusToTab(mod, 'error');
       _state.modules.shift();
       _retryCount = 0;
-      navigateToNextModule();
-    }, 60_000);
+      // If no more modules for current date, advance to next date (or complete)
+      if (_state.modules.length === 0) {
+        _state.dateIndex++;
+        if (_state.dateIndex < _state.dates.length) {
+          _state.date = _state.dates[_state.dateIndex];
+          _state.modules = [..._state.originalModules];
+          _state.captured = {};
+          await sendStatusToTab(null, 'next-date');
+          navigateToNextModule();
+        } else {
+          const collectionTabId = _state.collectionTabId;
+          _state.collectionTabId = null;
+          resetState();
+          if (collectionTabId) try { chrome.tabs.remove(collectionTabId); } catch {}
+          await sendStatusToTab(null, 'complete');
+        }
+      } else {
+        navigateToNextModule();
+      }
+    }, timeoutMs);
   };
   chrome.tabs.onUpdated.addListener(listener);
 }
