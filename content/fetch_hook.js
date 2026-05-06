@@ -95,27 +95,32 @@ function shouldCapture(match) {
   return false;
 }
 
-// For activity: page only fires page 1; fetch remaining pages reusing the same headers
-async function fetchActivityAllPages(originalUrl, originalInit, firstData) {
-  const list  = firstData?.result?.list ?? [];
+// Generic pagination helper: fetches remaining pages reusing original headers
+// listKey: field on result that holds the page items (e.g. 'list', 'subOrderList')
+async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
+  const firstList = firstData?.result?.[listKey] ?? [];
   const total = firstData?.result?.total ?? firstData?.result?.totalCount ?? firstData?.result?.totalSize ?? 0;
-  if (!total || list.length >= total) return firstData;
+  if (!total || firstList.length >= total) return firstData;
 
-  const allList = [...list];
+  const allList = [...firstList];
   let pageNo = 2;
   let body = {};
   try { body = JSON.parse(originalInit.body ?? '{}'); } catch {}
 
-  while (allList.length < total) {
+  const MAX_PAGES = 200;
+  while (allList.length < total && pageNo <= MAX_PAGES) {
     const res  = await _originalFetch(originalUrl, { ...originalInit, body: JSON.stringify({ ...body, pageNo }) });
     const data = await res.json();
-    const page = data?.result?.list ?? [];
+    const page = data?.result?.[listKey] ?? [];
     if (page.length === 0) break;
     allList.push(...page);
     pageNo++;
+    // light throttle to avoid hammering the API
+    await new Promise(r => setTimeout(r, 150));
   }
 
-  return { ...firstData, result: { ...firstData.result, list: allList } };
+  console.log(`[temu-hook] paginated ${listKey}: total=${total}, fetched=${allList.length}, pages=${pageNo - 1}`);
+  return { ...firstData, result: { ...firstData.result, [listKey]: allList } };
 }
 
 function emitUserInfo(data) {
@@ -160,9 +165,13 @@ window.fetch = async function (input, init = {}) {
     const clone = response.clone();
     clone.json().then(firstData => {
       if (match.module === 'activity') {
-        fetchActivityAllPages(url, init, firstData)
+        fetchAllPages(url, init, firstData, 'list')
           .then(allData => emit('activity', null, url, allData))
           .catch(() => emit('activity', null, url, firstData));
+      } else if (match.module === 'sales') {
+        fetchAllPages(url, init, firstData, 'subOrderList')
+          .then(allData => emit('sales', null, url, allData))
+          .catch(() => emit('sales', null, url, firstData));
       } else {
         emit(match.module, match.subType, url, firstData);
       }
