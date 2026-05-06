@@ -13,13 +13,43 @@
  *
  * Monetary values are in fen (÷100 = 元).
  */
+// Extract SKU IDs from various nesting shapes that Temu uses across endpoints.
+function _extractSkuIds(act) {
+  if (Array.isArray(act.productSkuIds)) return act.productSkuIds;
+  if (Array.isArray(act.skuIds))         return act.skuIds;
+  const ids = [];
+  for (const skc of (act.skcList ?? [])) {
+    // Common nesting: skcList[i].skuList[j].{productSkuId|skuId}
+    for (const sku of (skc.skuList ?? skc.productSkuList ?? [])) {
+      const id = sku.productSkuId ?? sku.skuId ?? sku.id;
+      if (id != null) ids.push(id);
+    }
+    // Or flat array of IDs on the SKC itself
+    for (const id of (skc.productSkuIdList ?? skc.skuIdList ?? [])) ids.push(id);
+    // Or single SKU directly on the SKC
+    if (skc.productSkuId != null) ids.push(skc.productSkuId);
+    else if (skc.skuId != null) ids.push(skc.skuId);
+  }
+  return ids;
+}
+
+// Pick the SKC's price/extCode if the activity-level fields are missing.
+function _firstSkc(act) {
+  const skcs = act.skcList ?? [];
+  return skcs[0] ?? null;
+}
+
 export function transformActivityResponse(rawData, { shopName, startDate, endDate }) {
   const activities = rawData?.result?.list ?? [];
 
   if (activities.length > 0) {
     const a = activities[0];
     console.log('[temu] activity_transform: first activity keys:', Object.keys(a));
-    console.log('[temu] activity_transform: first activity sample:', JSON.stringify(a).slice(0, 800));
+    console.log('[temu] activity_transform: first activity sample:', JSON.stringify(a).slice(0, 2000));
+    if (Array.isArray(a.skcList) && a.skcList.length > 0) {
+      console.log('[temu] activity_transform: skcList[0] keys:', Object.keys(a.skcList[0]));
+      console.log('[temu] activity_transform: skcList[0] sample:', JSON.stringify(a.skcList[0]).slice(0, 2000));
+    }
   }
 
   // Build the requested date list (UTC to avoid local-tz shift)
@@ -32,20 +62,24 @@ export function transformActivityResponse(rawData, { shopName, startDate, endDat
   }
 
   const rows = [];
-  let skipped = 0;
+  let skippedNoId = 0, skippedNoSku = 0;
 
   for (const act of activities) {
     if (act.activityStock === 1) continue; // test/placeholder activity
 
-    const actId = act.activityId ?? act.id ?? act.sessionId ?? null;
-    if (actId == null) { skipped++; continue; }
+    // Activity ID: enrollId is the unique participation record per shop+activity.
+    const actId = act.enrollId ?? act.activityId ?? act.id ?? act.sessionId ?? null;
+    if (actId == null) { skippedNoId++; continue; }
 
-    const skuIds     = act.productSkuIds ?? act.skuIds ?? [];
-    const actPrice   = act.activityPrice ?? 0;
-    const dailyPrice = act.dailyPrice ?? act.supplierPrice ?? 0;
-    const extCode    = act.extCode ?? '';
-    const actName    = act.activityName ?? act.name ?? '';
-    const actType    = act.activityType ?? act.type ?? '';
+    const skuIds = _extractSkuIds(act);
+    if (skuIds.length === 0) { skippedNoSku++; continue; }
+
+    const skc        = _firstSkc(act) ?? {};
+    const actPrice   = act.activityPrice ?? skc.activityPrice ?? 0;
+    const dailyPrice = act.dailyPrice ?? act.supplierPrice ?? skc.supplierPrice ?? skc.dailyPrice ?? 0;
+    const extCode    = act.extCode ?? act.skcExtCode ?? skc.extCode ?? skc.skcExtCode ?? '';
+    const actName    = act.activityThematicName ?? act.activityName ?? act.name ?? '';
+    const actType    = act.activityTypeName ?? act.activityType ?? '';
     const startMs    = act.sessionStartTime ?? act.startTime ?? 0;
     const endMs      = act.sessionEndTime   ?? act.endTime   ?? 0;
 
@@ -76,6 +110,8 @@ export function transformActivityResponse(rawData, { shopName, startDate, endDat
     }
   }
 
-  if (skipped) console.warn(`[temu] activity_transform: skipped ${skipped} entries with no activityId`);
+  if (skippedNoId)  console.warn(`[temu] activity_transform: skipped ${skippedNoId} entries with no enrollId`);
+  if (skippedNoSku) console.warn(`[temu] activity_transform: skipped ${skippedNoSku} entries with no SKUs`);
+  console.log(`[temu] activity_transform: ${activities.length} activities → ${rows.length} rows`);
   return rows;
 }
