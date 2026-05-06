@@ -520,12 +520,13 @@ function dateRangeLength(start, end) {
 
 // ── Export Excel ──────────────────────────────────────────────────────────────
 
-// Template A: 13 core PnL columns (the recommended starter)
+// Template A: 14 core PnL columns
 const EXPORT_TEMPLATE_A = [
   { src: '日期',          name: '日期' },
   { src: 'sku_id',        name: 'SKU ID' },
   { src: 'ext_code',      name: '货号' },
   { src: 'sku规格',       name: '规格' },
+  { src: '活动价格',      name: '活动售价' },
   { src: '销售件数',      name: '销售件数' },
   { src: '销售额',        name: '销售额' },
   { src: '成本价',        name: '成本价' },
