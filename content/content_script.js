@@ -83,6 +83,10 @@ window.addEventListener('temu:apiCapture', (e) => {
   });
 });
 
+window.addEventListener('temu:paginationProgress', (e) => {
+  safeSend({ type: 'PAGINATION_PROGRESS', module: e.detail.module, pageNo: e.detail.pageNo, gotSoFar: e.detail.gotSoFar });
+});
+
 window.addEventListener('temu:userInfo', (e) => {
   safeSend({ type: 'USER_INFO', data: e.detail });
   populateMallSelect(e.detail?.result?.mallList ?? []);

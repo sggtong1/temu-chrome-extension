@@ -144,6 +144,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleApiData(msg).then(sendResponse);
     return true;
   }
+  if (msg.type === 'PAGINATION_PROGRESS') {
+    handlePaginationProgress(msg);
+    return false;
+  }
 });
 
 // Show/hide panel on extension icon click
@@ -267,9 +271,9 @@ async function handleApiData(msg) {
       const collectionTabId = _state.collectionTabId;
       _state.collectionTabId = null;
       resetState();
-      if (collectionTabId) {
-        try { chrome.tabs.remove(collectionTabId); } catch {}
-      }
+      // Keep collection tab open for log inspection / debugging.
+      // (was: chrome.tabs.remove(collectionTabId))
+      void collectionTabId;
       await sendStatusToTab(null, 'complete');
       console.log('[temu] Collection complete');
     }
@@ -286,7 +290,7 @@ async function navigateToNextModule() {
       const collectionTabId = _state.collectionTabId;
       _state.collectionTabId = null;
       resetState();
-      if (collectionTabId) try { chrome.tabs.remove(collectionTabId); } catch {}
+      void collectionTabId; // keep tab open for debugging
       await sendStatusToTab(null, 'complete');
       console.log('[temu] Collection complete');
     }
@@ -339,8 +343,48 @@ async function navigateToNextModule() {
   }
 }
 
+let _activeMod = null;
+
+function rearmCaptureTimer(mod) {
+  if (_captureTimer) clearTimeout(_captureTimer);
+  // Sales/activity may paginate hundreds of pages; we rearm on each
+  // PAGINATION_PROGRESS so the timer only fires when truly idle.
+  const timeoutMs = (mod === 'sales' || mod === 'activity') ? 300_000 : 60_000;
+  _captureTimer = setTimeout(async () => {
+    console.warn(`[temu] timeout waiting for ${mod} (${timeoutMs/1000}s)`);
+    await sendStatusToTab(mod, 'error');
+    _state.modules.shift();
+    _retryCount = 0;
+    if (_state.modules.length === 0) {
+      _state.dateIndex++;
+      if (_state.dateIndex < _state.dates.length) {
+        _state.date = _state.dates[_state.dateIndex];
+        _state.modules = [..._state.originalModules];
+        _state.captured = {};
+        await sendStatusToTab(null, 'next-date');
+        navigateToNextModule();
+      } else {
+        const collectionTabId = _state.collectionTabId;
+        _state.collectionTabId = null;
+        resetState();
+        void collectionTabId; // keep tab open for debugging
+        await sendStatusToTab(null, 'complete');
+      }
+    } else {
+      navigateToNextModule();
+    }
+  }, timeoutMs);
+}
+
+function handlePaginationProgress(msg) {
+  if (!_state.active || _state.modules[0] !== msg.module) return;
+  console.log(`[temu] pagination progress: ${msg.module} page=${msg.pageNo}, items=${msg.gotSoFar} — rearming timer`);
+  rearmCaptureTimer(msg.module);
+}
+
 function attachCaptureListener(mod) {
   if (_captureTimer) { clearTimeout(_captureTimer); _captureTimer = null; }
+  _activeMod = mod;
 
   const listener = (tabId, changeInfo) => {
     if (tabId !== _state.collectionTabId || changeInfo.status !== 'complete') return;
@@ -355,35 +399,9 @@ function attachCaptureListener(mod) {
       siteType: _state.siteType,
     });
 
-    // Hard timeout — sales/activity pages with lots of items can be slow.
-    // On timeout, advance state cleanly (avoids leak where modules=[] but originalModules!=[]
-    // leaves _state.active=true and drops next API_DATA as 'expected=undefined').
-    const timeoutMs = (mod === 'sales' || mod === 'activity') ? 120_000 : 60_000;
-    _captureTimer = setTimeout(async () => {
-      console.warn(`[temu] timeout waiting for ${mod} (${timeoutMs/1000}s)`);
-      await sendStatusToTab(mod, 'error');
-      _state.modules.shift();
-      _retryCount = 0;
-      // If no more modules for current date, advance to next date (or complete)
-      if (_state.modules.length === 0) {
-        _state.dateIndex++;
-        if (_state.dateIndex < _state.dates.length) {
-          _state.date = _state.dates[_state.dateIndex];
-          _state.modules = [..._state.originalModules];
-          _state.captured = {};
-          await sendStatusToTab(null, 'next-date');
-          navigateToNextModule();
-        } else {
-          const collectionTabId = _state.collectionTabId;
-          _state.collectionTabId = null;
-          resetState();
-          if (collectionTabId) try { chrome.tabs.remove(collectionTabId); } catch {}
-          await sendStatusToTab(null, 'complete');
-        }
-      } else {
-        navigateToNextModule();
-      }
-    }, timeoutMs);
+    // Use rearmCaptureTimer — PAGINATION_PROGRESS messages will rearm the timer
+    // so paginating hundreds of pages doesn't trip a stale-data timeout.
+    rearmCaptureTimer(mod);
   };
   chrome.tabs.onUpdated.addListener(listener);
 }

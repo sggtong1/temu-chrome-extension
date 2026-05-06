@@ -71,8 +71,13 @@ function maybeInjectDate(body, mod) {
       parsed.selectStatusList = [12];
       if (!('isLack' in parsed)) parsed.isLack = 0;
     }
-    return JSON.stringify(parsed);
-  } catch {
+    const out = JSON.stringify(parsed);
+    if (mod === 'sales' && out !== body) {
+      console.log('[temu-hook] body injected for sales:', out.slice(0, 600));
+    }
+    return out;
+  } catch (e) {
+    console.warn('[temu-hook] maybeInjectDate parse failed:', e, 'body type=', typeof body);
     return body;
   }
 }
@@ -118,13 +123,28 @@ async function fetchAllPages(originalUrl, originalInit, firstData, listKey) {
   const MAX_PAGES = 200;
 
   while (pageNo <= MAX_PAGES) {
-    const res  = await _originalFetch(originalUrl, { ...originalInit, body: JSON.stringify({ ...body, pageNo }) });
-    const data = await res.json();
-    const page = data?.result?.[listKey] ?? [];
+    let page = [];
+    try {
+      const t0 = Date.now();
+      const res  = await _originalFetch(originalUrl, { ...originalInit, body: JSON.stringify({ ...body, pageNo }) });
+      const data = await res.json();
+      page = data?.result?.[listKey] ?? [];
+      console.log(`[temu-hook] page ${pageNo}: ${page.length} items, status=${res.status}, ${Date.now() - t0}ms, total=${allList.length + page.length}`);
+      if (data?.success === false || data?.errorCode) {
+        console.warn(`[temu-hook] page ${pageNo} returned error:`, data?.errorMsg, data?.errorCode);
+        break;
+      }
+    } catch (e) {
+      console.error(`[temu-hook] page ${pageNo} fetch failed:`, e);
+      break;
+    }
     if (page.length === 0) break;
     allList.push(...page);
     if (page.length < pageSize) { pageNo++; break; }   // last page reached
     pageNo++;
+    // Notify content_script that pagination is still progressing so it can
+    // ping the service_worker (avoids the 120s timeout firing mid-pagination).
+    window.dispatchEvent(new CustomEvent('temu:paginationProgress', { detail: { module: 'sales', pageNo, gotSoFar: allList.length } }));
     await new Promise(r => setTimeout(r, 150));
   }
 
