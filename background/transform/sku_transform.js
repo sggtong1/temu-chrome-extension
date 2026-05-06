@@ -84,7 +84,10 @@ function _parseFullManaged(rawSales, targetDate) {
         activityPrice: sku.activityPrice != null ? sku.activityPrice / 100 : null,
         dailyPrice:    sku.supplierPrice  != null ? sku.supplierPrice  / 100 : null,
         extCode:       sku.skuExtCode ?? sku.extCode ?? '',
-        properties:    sku.className ? { className: sku.className } : {},
+        // className is the SKU spec text (color/size/variant). Store raw value;
+        // buildSkuRows uses specText if present, otherwise falls back to properties.
+        properties:    {},
+        specText:      sku.className ?? '',
       };
       if (spuId) skuSpuMap[id] = spuId;
     }
@@ -157,7 +160,8 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
     const properties = priceInfo.properties ?? {};
     const spuId = skuSpuMap[skuId] ?? '';
 
-    const skuSpec = Object.entries(properties).map(([k, v]) => `${k}:${v}`).join('、');
+    const skuSpec = priceInfo.specText
+      || Object.entries(properties).map(([k, v]) => `${k}:${v}`).join('、');
     const salesAmount = activityPrice != null ? Math.round(salesQty * activityPrice * 100) / 100 : null;
 
     const costTuple = extCode ? skuCostMap[extCode] : null;
