@@ -595,7 +595,7 @@ async function triggerListCollection(borrowedInit) {
   });
 
   const headerKeys = Object.keys(borrowedInit.headers || {});
-  console.log(`[temu-hook] list: actively firing /api/flow/analysis/list for ${targetDate} | borrowed ${headerKeys.length} headers: [${headerKeys.join(', ')}]`);
+  console.log(`[temu-hook] list: actively firing /api/flow/analysis/list | borrowed ${headerKeys.length} headers: [${headerKeys.join(', ')}]`);
 
   try {
     const res = await _originalFetch(url, {
