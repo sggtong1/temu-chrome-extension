@@ -293,12 +293,12 @@ async function fetchAllPages(originalUrl, originalInit, firstData, opts) {
 // per productId borrowing the list request's headers + cookies. Phase 1: just
 // log the first response shape so we can design the transform/schema next.
 async function enrichListWithDailyDetails(originalUrl, originalInit, firstData) {
-  const list = firstData?.result?.list ?? [];
-  if (list.length === 0) {
+  const items = firstData?.result?.pageItems ?? [];
+  if (items.length === 0) {
     console.log('[temu-hook] list empty, skipping detail enrichment');
     return firstData;
   }
-  const prodIds = list.map(it => it.productId).filter(id => id != null);
+  const prodIds = items.map(it => it.productId).filter(id => id != null);
   if (prodIds.length === 0) {
     console.warn('[temu-hook] no productId on list items, skipping detail enrichment. sample item keys:', Object.keys(list[0] || {}));
     return firstData;
@@ -615,14 +615,8 @@ async function triggerListCollection(borrowedInit) {
     if (!res.ok) {
       console.error(`[temu-hook] list HTTP ${res.status}: body=${JSON.stringify(firstData).slice(0, 800)}`);
     } else {
-      const listLen = firstData?.result?.list?.length;
-      console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, listLen=${listLen ?? 'n/a'}`);
-      if (listLen == null || listLen === 0) {
-        const r = firstData?.result;
-        const keys = r && typeof r === 'object' ? Object.keys(r).join(',') : 'n/a';
-        console.error(`[temu-hook] !!DIAG!! list result keys = ${keys}`);
-        console.error(`[temu-hook] !!DIAG!! list full body (first 3000 chars) = ${JSON.stringify(firstData).slice(0, 3000)}`);
-      }
+      const listLen = firstData?.result?.pageItems?.length;
+      console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, pageItems=${listLen ?? 'n/a'}, total=${firstData?.result?.total ?? 'n/a'}`);
     }
 
     const init = {
@@ -632,7 +626,7 @@ async function triggerListCollection(borrowedInit) {
       credentials: 'include',
     };
     const allData = await fetchAllPages(url, init, firstData, {
-      listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+      listKey: 'pageItems', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
     });
     const enriched = await enrichListWithDailyDetails(url, init, allData);
     emit('list', null, url, enriched);
@@ -747,7 +741,7 @@ window.fetch = async function (input, init = {}) {
         } else {
           _listTriggered = true;
           fetchAllPages(url, paginationInit, firstData, {
-            listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+            listKey: 'pageItems', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
           })
             .then(allData => enrichListWithDailyDetails(url, paginationInit, allData))
             .then(enriched => emit('list', null, url, enriched))
@@ -842,7 +836,7 @@ window.XMLHttpRequest = function () {
           } else {
             _listTriggered = true;
             fetchAllPages(_url, init, parsed, {
-              listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+              listKey: 'pageItems', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
             })
               .then(all => enrichListWithDailyDetails(_url, init, all))
               .then(enriched => emit('list', null, _url, enriched))
