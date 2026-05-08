@@ -149,15 +149,17 @@ shadow.innerHTML = `
   }
 
   .footer { padding: 10px 12px; }
-  .start-btn, .export-btn {
+  .start-btn, .export-btn, .clear-btn {
     width: 100%; color: white; border: none;
     padding: 8px; border-radius: 5px; font-size: 13px;
     font-weight: 600; cursor: pointer; letter-spacing: .03em; margin-top: 8px;
   }
   .start-btn          { background: #1e40af; }
   .export-btn         { background: #059669; }
+  .clear-btn          { background: #ea580c; }
   .start-btn:disabled,
-  .export-btn:disabled { background: #94a3b8; cursor: default; }
+  .export-btn:disabled,
+  .clear-btn:disabled { background: #94a3b8; cursor: default; }
 
   /* Error / info banner */
   .banner {
@@ -193,6 +195,7 @@ shadow.innerHTML = `
   <span>🛒</span>
   <span class="bar-label">Temu 采集</span>
   <span class="bar-sub" id="bar-sub">· 就绪</span>
+  <span class="bar-btn" id="bar-clear" title="一键清除弹窗">🧹</span>
   <span class="bar-btn" id="bar-expand">＋</span>
 </div>
 
@@ -243,6 +246,7 @@ shadow.innerHTML = `
       <div class="banner" id="banner"><span id="banner-text"></span></div>
       <button class="start-btn" id="start-btn" disabled>▶ 开始采集</button>
       <button class="export-btn" id="export-btn" disabled>📊 导出 Excel</button>
+      <button class="clear-btn" id="clear-btn" title="隐藏页面上所有弹窗 / 弹出层 / 遮罩">🧹 一键清除弹窗</button>
       <div class="progress-wrap" id="progress-wrap"></div>
     </div>
   </div>
@@ -341,7 +345,7 @@ function stopDrag() {
 
 shadow.getElementById('drag-header').addEventListener('mousedown', startDrag);
 shadow.getElementById('bar').addEventListener('mousedown', (e) => {
-  if (e.target.id === 'bar-expand') return;
+  if (e.target.id === 'bar-expand' || e.target.id === 'bar-clear') return;
   startDrag(e);
 });
 
@@ -611,6 +615,103 @@ function exportExcel(startDate, endDate, shopName) {
     }
   ));
 }
+
+// ── Clear popups / overlays ───────────────────────────────────────────────────
+
+// Heuristic three-layer cleaner: known modal selectors → covering high-z fixed
+// elements → unlock body/html scroll. Excludes our own panel container.
+const POPUP_SELECTORS = [
+  '.modal', '.modal-mask', '.modal-wrap', '.modal-backdrop',
+  '.dialog', '.popup', '.popover', '.overlay', '.mask', '.backdrop',
+  '.ant-modal', '.ant-modal-mask', '.ant-modal-wrap', '.ant-modal-root',
+  '.ant-drawer', '.ant-drawer-mask', '.ant-popover', '.ant-message',
+  '.ant-notification', '.ant-tooltip',
+  '[role="dialog"]', '[role="alertdialog"]',
+  '[class*="Modal_"]', '[class*="Dialog_"]', '[class*="Popup_"]',
+  '[class*="Overlay_"]', '[class*="Mask_"]', '[class*="Drawer_"]',
+  '[class*="popup"]', '[class*="dialog"]', '[class*="overlay"]',
+  '[class*="-mask"]', '[class*="_mask"]',
+];
+
+function isOurPanel(el) {
+  return el === host || host.contains(el) || el.contains(host);
+}
+
+function hideEl(el) {
+  if (el.dataset._temuPopupHidden) return false;
+  el.dataset._temuPopupHidden = '1';
+  el.style.setProperty('display', 'none', 'important');
+  return true;
+}
+
+function clearAllPopups() {
+  let hidden = 0;
+
+  // Layer 1: known selectors
+  document.querySelectorAll(POPUP_SELECTORS.join(',')).forEach(el => {
+    if (isOurPanel(el)) return;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none') return;
+    if (hideEl(el)) hidden++;
+  });
+
+  // Layer 2: high z-index fixed/absolute elements covering most of viewport
+  const vpW = window.innerWidth, vpH = window.innerHeight;
+  const vpArea = vpW * vpH;
+  document.querySelectorAll('body *').forEach(el => {
+    if (isOurPanel(el)) return;
+    if (el.dataset._temuPopupHidden) return;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return;
+    if (cs.position !== 'fixed' && cs.position !== 'absolute') return;
+    const z = parseInt(cs.zIndex, 10);
+    if (!Number.isFinite(z) || z < 1000) return;
+    const r = el.getBoundingClientRect();
+    const coversArea = (r.width * r.height) > vpArea * 0.5;
+    const coversBoth = r.width > vpW * 0.7 && r.height > vpH * 0.7;
+    if (coversArea || coversBoth) {
+      if (hideEl(el)) hidden++;
+    }
+  });
+
+  // Layer 3: unlock body/html scroll lock that modals often impose
+  for (const el of [document.body, document.documentElement]) {
+    if (!el) continue;
+    const cs = getComputedStyle(el);
+    if (cs.overflow === 'hidden' || cs.overflowY === 'hidden') {
+      el.style.setProperty('overflow', 'auto', 'important');
+    }
+    if (el.style.paddingRight) el.style.paddingRight = '';
+  }
+
+  return hidden;
+}
+
+let _barSubResetTimer = null;
+function flashBarSub(text, holdMs = 2000) {
+  const sub = shadow.getElementById('bar-sub');
+  if (!sub) return;
+  const prev = sub.textContent;
+  sub.textContent = text;
+  if (_barSubResetTimer) clearTimeout(_barSubResetTimer);
+  _barSubResetTimer = setTimeout(() => { sub.textContent = prev; }, holdMs);
+}
+
+function onClearClick() {
+  const n = clearAllPopups();
+  const msg = n > 0 ? `已清除 ${n} 个弹窗 / 弹层` : '未发现可清除的弹窗';
+  if (panel.style.display !== 'none') {
+    showBanner(msg, 'info');
+  } else {
+    flashBarSub(`· ${msg}`);
+  }
+}
+
+shadow.getElementById('clear-btn').addEventListener('click', onClearClick);
+shadow.getElementById('bar-clear').addEventListener('click', (e) => {
+  e.stopPropagation();
+  onClearClick();
+});
 
 // ── Status updates ────────────────────────────────────────────────────────────
 
