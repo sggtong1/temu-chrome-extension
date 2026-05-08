@@ -62,3 +62,94 @@ export function transformListResponse(rawData, { shopName, region, date }) {
     return row;
   });
 }
+
+// semi_us /api/flow/analysis/goods/detail per-day metric field names
+// (slightly different vocabulary than full_managed list response).
+const DETAIL_FIELD_MAP_SEMI_US = {
+  exposeNum:           '曝光量',
+  clickNum:            '点击量',
+  payGoodsNum:         '支付件数',
+  payOrderNum:         '支付订单数',
+  goodsBrowseNum:      '商品详情页访问量',
+  goodsVisitorNum:     '商品详情页访客数',
+  goodsAddNum:         '加购人数',
+  goodsCollectNum:     '收藏人数',
+  exposeOrderRatio:    '曝光支付转化率',
+  clickRatio:          '曝光点击转化率',
+  clickOrderRatio:     '点击支付转化率',
+  searchExposeNum:     '搜索曝光量',
+  searchClickNum:      '搜索点击量',
+  searchPayGoodsNum:   '搜索支付件数',
+  searchPayOrderNum:   '搜索支付订单数',
+  recommendExposeNum:  '推荐曝光量',
+  recommendClickNum:   '推荐点击量',
+  recommendPayGoodsNum:'推荐支付件数',
+  recommendPayOrderNum:'推荐支付订单数',
+};
+
+/**
+ * Transform semi_us list+detail response into per-product × per-date rows.
+ * list = product metadata (name, image, category, productId).
+ * detail.result.list = one entry per date with all traffic metrics.
+ * Output: one row per (product, statDate) where statDate ∈ user's range.
+ *
+ * @param {object} rawData - list response with mounted dailyDetails array
+ * @param {{ shopName: string, region: string, dates: string[] }} ctx
+ * @returns {object[]} rows for dashboard_metrics upsert
+ */
+export function transformSemiUsListResponse(rawData, { shopName, region, dates }) {
+  const items = rawData?.result?.pageItems ?? [];
+  const dailyDetails = rawData?.dailyDetails ?? [];
+
+  const detailByProdId = {};
+  for (const d of dailyDetails) {
+    if (d?.prodId != null) {
+      detailByProdId[String(d.prodId)] = d?.data?.result?.list ?? [];
+    }
+  }
+
+  const dateSet = new Set(dates ?? []);
+  const rows = [];
+
+  for (const item of items) {
+    const productId = String(item.productId ?? '');
+    if (!productId) continue;
+
+    const goodsName    = item.goodsName    ?? item.productName ?? '';
+    const goodsId      = String(item.goodsId ?? '');
+    const mainImageUrl = item.mainImageUrl ?? '';
+
+    const dailyList = detailByProdId[productId] ?? [];
+    for (const day of dailyList) {
+      const statDate = day?.statDate;
+      if (!statDate) continue;
+      if (dateSet.size > 0 && !dateSet.has(statDate)) continue;
+
+      const row = {
+        '店铺名称': shopName,
+        shop_name: shopName,
+        '区域': REGION_LABELS[region] || region,
+        region,
+        '日期': statDate,
+        '商品SPUID': productId,
+        productSpuId: productId,
+        '商品ID': goodsId,
+        '商品名称': goodsName,
+        '商品图片URL': mainImageUrl,
+      };
+
+      for (const [k, col] of Object.entries(DETAIL_FIELD_MAP_SEMI_US)) {
+        if (day[k] != null) row[col] = day[k];
+      }
+
+      const cat = item.category ?? {};
+      for (const [k, col] of Object.entries(CAT_MAP)) {
+        if (cat[k] != null) row[col] = String(cat[k]);
+      }
+
+      rows.push(row);
+    }
+  }
+
+  return rows;
+}

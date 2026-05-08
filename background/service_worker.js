@@ -1,5 +1,5 @@
 import { getShopByMallId, getSkuCost, supabaseUpsert } from './supabase.js';
-import { transformListResponse } from './transform/list_transform.js';
+import { transformListResponse, transformSemiUsListResponse } from './transform/list_transform.js';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
 import { transformActivityResponse } from './transform/activity_transform.js';
@@ -484,9 +484,27 @@ async function processModule(module, rawData) {
   const { supabaseUrl, supabaseAnonKey } = _state;
 
   if (module === 'list') {
-    const rows = transformListResponse(rawData, ctx);
-    const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows);
-    if (error) throw new Error(error);
+    if (_state.siteType === 'semi_us') {
+      // Range capture: detail returns all available days; slice rows for every
+      // date in the user's requested range. Single tab open covers all dates.
+      const rows = transformSemiUsListResponse(rawData, {
+        shopName: _state.shopName,
+        region: _state.region,
+        dates: _state.dates,
+      });
+      console.log(`[temu] list (semi_us): built ${rows.length} rows for ${_state.dates.length} dates × ${rawData?.result?.pageItems?.length ?? 0} products`);
+      if (rows.length > 0) {
+        console.log('[temu] list (semi_us): first row sample:', JSON.stringify(rows[0]).slice(0, 500));
+        const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows);
+        if (error) throw new Error(error);
+      }
+      // Captured the full range in one shot — skip subsequent date iterations
+      _state.originalModules = _state.originalModules.filter(m => m !== 'list');
+    } else {
+      const rows = transformListResponse(rawData, ctx);
+      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows);
+      if (error) throw new Error(error);
+    }
   }
 
   if (module === 'sales' && _state.siteType === 'full_managed') {
