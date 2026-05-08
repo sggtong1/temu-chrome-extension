@@ -16,6 +16,27 @@ function _readBootConfig() {
 }
 const _hashCfg = _readBootConfig();
 
+// Strip __tmu from URL before the SPA reads location. Some pages (e.g.
+// flux-analysis) refuse to auto-fire their bootstrap API when the URL has
+// unrecognized query/hash params. We've already captured the config above;
+// the page never needs to see __tmu.
+if (_hashCfg) {
+  try {
+    const u = new URL(location.href);
+    u.searchParams.delete('__tmu');
+    let hash = u.hash;
+    if (hash) {
+      hash = hash.replace(/(^#|&)__tmu=[^&]*/, (_, lead) => lead === '#' ? '#' : '');
+      if (hash === '#') hash = '';
+    }
+    const newUrl = u.pathname + u.search + hash;
+    history.replaceState(null, '', newUrl);
+    console.log('[temu-hook] stripped __tmu from URL →', newUrl);
+  } catch (e) {
+    console.warn('[temu-hook] failed to strip __tmu from URL:', e);
+  }
+}
+
 // semi_us: list + orders + promo (no sales, no activity)
 const PATTERNS_SEMI_US = {
   list:   '/api/flow/analysis/list',
@@ -252,6 +273,81 @@ async function fetchAllPages(originalUrl, originalInit, firstData, opts) {
 
   console.log(`[temu-hook] paginated ${listKey}: fetched=${allList.length}, pages=${pageNo - 1}`);
   return { ...firstData, result: { ...firstData.result, [listKey]: allList } };
+}
+
+// semi_us list: enrich with /api/flow/analysis/goods/detail per product.
+// detail is normally fired only when user clicks a row; we synthesize one call
+// per productId borrowing the list request's headers + cookies. Phase 1: just
+// log the first response shape so we can design the transform/schema next.
+async function enrichListWithDailyDetails(originalUrl, originalInit, firstData) {
+  const list = firstData?.result?.list ?? [];
+  if (list.length === 0) {
+    console.log('[temu-hook] list empty, skipping detail enrichment');
+    return firstData;
+  }
+  const prodIds = list.map(it => it.productId).filter(id => id != null);
+  if (prodIds.length === 0) {
+    console.warn('[temu-hook] no productId on list items, skipping detail enrichment. sample item keys:', Object.keys(list[0] || {}));
+    return firstData;
+  }
+
+  const detailUrl = originalUrl.replace(/\/list(\?.*)?$/, '/goods/detail$1');
+  console.log(`[temu-hook] list: enriching ${prodIds.length} products via ${detailUrl}`);
+
+  const rawMethod = (originalInit.method || 'POST').toUpperCase();
+  const method = (rawMethod === 'GET' || rawMethod === 'HEAD') ? 'POST' : rawMethod;
+
+  const dailyDetails = [];
+  let firstLogged = false;
+  for (let i = 0; i < prodIds.length; i++) {
+    const prodId = prodIds[i];
+    const body = JSON.stringify({ prodId, siteId: 100, timeType: 10 });
+    let detailData = null;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const t0 = Date.now();
+        const res = await _originalFetch(detailUrl, {
+          method, headers: originalInit.headers || {}, body, credentials: 'include',
+        });
+        detailData = await res.json();
+
+        if (!firstLogged) {
+          console.log(`[temu-hook] list detail FIRST sample (prodId=${prodId}, status=${res.status}, ${Date.now() - t0}ms):`, JSON.stringify(detailData).slice(0, 2000));
+          firstLogged = true;
+        } else {
+          console.log(`[temu-hook] list detail ${i + 1}/${prodIds.length}: prodId=${prodId} status=${res.status} ${Date.now() - t0}ms`);
+        }
+
+        if (detailData?.success === false) {
+          const msg = String(detailData?.errorMsg ?? '');
+          if (/frequent|too many|限制|限频/i.test(msg) && attempt < 2) {
+            const backoff = 5000 * (attempt + 1);
+            console.warn(`[temu-hook] detail ${prodId} rate-limited, sleep ${backoff}ms (attempt ${attempt + 1}/3)`);
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+          }
+          console.warn(`[temu-hook] detail ${prodId} success=false:`, msg, detailData?.errorCode);
+        }
+        break;
+      } catch (e) {
+        console.warn(`[temu-hook] detail ${prodId} fetch failed (attempt ${attempt + 1}/3):`, e);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    dailyDetails.push({ prodId, data: detailData });
+
+    if ((i + 1) % 10 === 0) {
+      window.dispatchEvent(new CustomEvent('temu:paginationProgress', {
+        detail: { module: 'list', pageNo: i + 1, gotSoFar: i + 1 },
+      }));
+    }
+    if (i < prodIds.length - 1) await new Promise(r => setTimeout(r, 150));
+  }
+
+  console.log(`[temu-hook] list detail enrichment done: ${dailyDetails.length}/${prodIds.length} fetched`);
+  return { ...firstData, dailyDetails };
 }
 
 // After listOverall pagination completes, actively query daily sales numbers
@@ -551,6 +647,10 @@ window.fetch = async function (input, init = {}) {
         })
           .then(allData => emit('promo', null, url, allData))
           .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, url, firstData); });
+      } else if (match.module === 'list' && _siteType === 'semi_us') {
+        enrichListWithDailyDetails(url, paginationInit, firstData)
+          .then(enriched => emit('list', null, url, enriched))
+          .catch(err => { console.warn('[temu-hook] list detail enrich failed', err); emit('list', null, url, firstData); });
       } else {
         emit(match.module, match.subType, url, firstData);
       }
@@ -629,6 +729,10 @@ window.XMLHttpRequest = function () {
           })
             .then(all => emit('promo', null, _url, all))
             .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, _url, parsed); });
+        } else if (_match.module === 'list' && _siteType === 'semi_us') {
+          enrichListWithDailyDetails(_url, init, parsed)
+            .then(enriched => emit('list', null, _url, enriched))
+            .catch(err => { console.warn('[temu-hook] list detail enrich failed', err); emit('list', null, _url, parsed); });
         } else {
           emit(_match.module, _match.subType, _url, parsed);
         }
