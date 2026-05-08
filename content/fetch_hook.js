@@ -583,18 +583,15 @@ async function triggerListCollection(borrowedInit) {
   _listTriggered = true;
 
   const url = `https://${location.host}/api/flow/analysis/list`;
-  const targetDate = _targetDate;
-  if (!targetDate) {
-    console.warn('[temu-hook] list: no target date in boot config');
-    emit('list', null, url, { result: {} });
-    return;
-  }
 
+  // Match the page's actual payload exactly: NO statDate. list returns
+  // products with recent traffic activity; per-day metrics come from
+  // /goods/detail. Adding statDate caused the API to return total=N but
+  // result.list=[] (empty), as if it filtered by an invalid date context.
   const buildBody = (pageNumber) => ({
     pageSize: 30,
     pageNumber,
     timeDimension: 1,
-    statDate: targetDate,
   });
 
   const headerKeys = Object.keys(borrowedInit.headers || {});
@@ -618,7 +615,12 @@ async function triggerListCollection(borrowedInit) {
     if (!res.ok) {
       console.error(`[temu-hook] list HTTP ${res.status}: body=${JSON.stringify(firstData).slice(0, 800)}`);
     } else {
-      console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, listLen=${firstData?.result?.list?.length ?? 'n/a'}`);
+      const listLen = firstData?.result?.list?.length;
+      console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, listLen=${listLen ?? 'n/a'}`);
+      if (listLen == null || listLen === 0) {
+        const r = firstData?.result;
+        console.warn(`[temu-hook] list result keys=${r && typeof r === 'object' ? Object.keys(r).join(',') : 'n/a'}, body=${JSON.stringify(firstData).slice(0, 1500)}`);
+      }
     }
 
     const init = {
