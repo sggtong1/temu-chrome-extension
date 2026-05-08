@@ -111,6 +111,11 @@ export function transformSemiUsListResponse(rawData, { shopName, region, dates }
   const dateSet = new Set(dates ?? []);
   const rows = [];
 
+  // Pre-compute every column name so every row has an identical key set
+  // (PostgREST PGRST102 rejects mixed-key arrays in bulk upsert).
+  const METRIC_COLS = Object.values(DETAIL_FIELD_MAP_SEMI_US);
+  const CAT_COLS    = Object.values(CAT_MAP);
+
   for (const item of items) {
     const productId = String(item.productId ?? '');
     if (!productId) continue;
@@ -137,6 +142,11 @@ export function transformSemiUsListResponse(rawData, { shopName, region, dates }
         '商品名称': goodsName,
         '商品图片URL': mainImageUrl,
       };
+
+      // Always set every metric/category column — null if missing — so all
+      // rows in the upsert batch share the same keys.
+      for (const col of METRIC_COLS) row[col] = null;
+      for (const col of CAT_COLS) row[col] = null;
 
       for (const [k, col] of Object.entries(DETAIL_FIELD_MAP_SEMI_US)) {
         if (day[k] != null) row[col] = day[k];
