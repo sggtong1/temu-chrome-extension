@@ -484,6 +484,9 @@ async function processModule(module, rawData) {
   const { supabaseUrl, supabaseAnonKey } = _state;
 
   if (module === 'list') {
+    // dashboard_metrics 的唯一约束是 ("日期","店铺名称","区域","商品SPUID");
+    // 不传 on_conflict 时 PostgREST 按 PK 合并失败 → 当 INSERT → 撞唯一约束.
+    const LIST_CONFLICT = '日期,店铺名称,区域,商品SPUID';
     if (_state.siteType === 'semi_us') {
       // Range capture: detail returns all available days; slice rows for every
       // date in the user's requested range. Single tab open covers all dates.
@@ -495,14 +498,14 @@ async function processModule(module, rawData) {
       console.log(`[temu] list (semi_us): built ${rows.length} rows for ${_state.dates.length} dates × ${rawData?.result?.pageItems?.length ?? 0} products`);
       if (rows.length > 0) {
         console.log('[temu] list (semi_us): first row sample:', JSON.stringify(rows[0]).slice(0, 500));
-        const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows);
+        const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows, LIST_CONFLICT);
         if (error) throw new Error(error);
       }
       // Captured the full range in one shot — skip subsequent date iterations
       _state.originalModules = _state.originalModules.filter(m => m !== 'list');
     } else {
       const rows = transformListResponse(rawData, ctx);
-      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows);
+      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows, LIST_CONFLICT);
       if (error) throw new Error(error);
     }
   }
