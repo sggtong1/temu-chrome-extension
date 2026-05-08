@@ -116,15 +116,33 @@ export function transformSemiUsListResponse(rawData, { shopName, region, dates }
   const METRIC_COLS = Object.values(DETAIL_FIELD_MAP_SEMI_US);
   const CAT_COLS    = Object.values(CAT_MAP);
 
+  // Per-product diagnostic so we can see why some products produce 0 rows.
+  const skipped = []; // { productId, goodsName, reason, detailDates }
+
   for (const item of items) {
     const productId = String(item.productId ?? '');
-    if (!productId) continue;
+    if (!productId) {
+      skipped.push({ productId: '(empty)', goodsName: item.goodsName ?? '', reason: 'no productId', detailDates: [] });
+      continue;
+    }
 
     const goodsName    = item.goodsName    ?? item.productName ?? '';
     const goodsId      = String(item.goodsId ?? '');
     const mainImageUrl = item.mainImageUrl ?? '';
 
     const dailyList = detailByProdId[productId] ?? [];
+    const detailDates = dailyList.map(d => d?.statDate).filter(Boolean);
+
+    if (dailyList.length === 0) {
+      skipped.push({ productId, goodsName, reason: 'detail returned no days', detailDates });
+      continue;
+    }
+    const matchedInRange = detailDates.filter(d => dateSet.size === 0 || dateSet.has(d));
+    if (matchedInRange.length === 0) {
+      skipped.push({ productId, goodsName, reason: `no detail day in user range [${[...dateSet].join(',')}]`, detailDates });
+      continue;
+    }
+
     for (const day of dailyList) {
       const statDate = day?.statDate;
       if (!statDate) continue;
@@ -158,6 +176,13 @@ export function transformSemiUsListResponse(rawData, { shopName, region, dates }
       }
 
       rows.push(row);
+    }
+  }
+
+  if (skipped.length > 0) {
+    console.warn(`[temu] transformSemiUsList: ${skipped.length}/${items.length} products produced 0 rows`);
+    for (const s of skipped) {
+      console.warn(`[temu]   skipped prodId=${s.productId} (${s.goodsName.slice(0, 40)}) — ${s.reason} | detail had: [${s.detailDates.join(', ') || 'none'}]`);
     }
   }
 
