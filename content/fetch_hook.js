@@ -74,6 +74,19 @@ if (_hashCfg?.mod === 'promo') {
   }, 12000);
 }
 
+// semi_us list fallback: the flux-analysis SPA refuses to auto-fire
+// /api/flow/analysis/list on cold tab open (even after __tmu strip). Mirror
+// the promo "active trigger" pattern — borrow auth headers from any /api/
+// call, then synthesize the list POST ourselves.
+if (_hashCfg?.mod === 'list' && _hashCfg?.site === 'semi_us') {
+  setTimeout(() => {
+    if (!_listTriggered) {
+      console.warn(`[temu-hook] list: 8s fallback fire | captured ${Object.keys(_capturedHeaders).length} headers: [${Object.keys(_capturedHeaders).join(', ')}]`);
+      triggerListCollection({ headers: { ..._capturedHeaders } });
+    }
+  }, 8000);
+}
+
 window.addEventListener('temu:setConfig', (e) => {
   _activeModule = e.detail.activeModule || null;
   _targetDate = e.detail.targetDate || null;
@@ -418,6 +431,7 @@ function emitUserInfo(data) {
 // borrow its init (auth headers, cookies), then synthesize the ads_report
 // POST ourselves with columns_type=4 and the user's date range.
 let _promoTriggered = false;
+let _listTriggered = false;
 
 // Cumulative header bag: every fetch/XHR on this page contributes its
 // request headers. We use this to assemble a complete auth header set
@@ -560,6 +574,70 @@ function _detectPromoListKey(firstData) {
   return 'list';
 }
 
+// semi_us list active trigger — flux-analysis page does NOT auto-fire
+// /api/flow/analysis/list on cold tab open. We mirror triggerPromoCollection:
+// borrow auth headers from any /api/ call, then synthesize the list POST
+// ourselves. Pagination + detail enrichment are then chained as usual.
+async function triggerListCollection(borrowedInit) {
+  if (_listTriggered) return;
+  _listTriggered = true;
+
+  const url = `https://${location.host}/api/flow/analysis/list`;
+  const targetDate = _targetDate;
+  if (!targetDate) {
+    console.warn('[temu-hook] list: no target date in boot config');
+    emit('list', null, url, { result: {} });
+    return;
+  }
+
+  const buildBody = (pageNumber) => ({
+    pageSize: 30,
+    pageNumber,
+    timeDimension: 1,
+    statDate: targetDate,
+  });
+
+  const headerKeys = Object.keys(borrowedInit.headers || {});
+  console.log(`[temu-hook] list: actively firing /api/flow/analysis/list for ${targetDate} | borrowed ${headerKeys.length} headers: [${headerKeys.join(', ')}]`);
+
+  try {
+    const res = await _originalFetch(url, {
+      method: 'POST',
+      headers: borrowedInit.headers || {},
+      body: JSON.stringify(buildBody(1)),
+      credentials: 'include',
+    });
+    let firstData;
+    try { firstData = await res.json(); }
+    catch (e) {
+      const errText = await res.clone().text().catch(() => '');
+      console.error(`[temu-hook] list HTTP ${res.status}: response not JSON. body=${errText.slice(0, 500)}`);
+      emit('list', null, url, { result: {} });
+      return;
+    }
+    if (!res.ok) {
+      console.error(`[temu-hook] list HTTP ${res.status}: body=${JSON.stringify(firstData).slice(0, 800)}`);
+    } else {
+      console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, listLen=${firstData?.result?.list?.length ?? 'n/a'}`);
+    }
+
+    const init = {
+      method: 'POST',
+      headers: borrowedInit.headers || {},
+      body: JSON.stringify(buildBody(1)),
+      credentials: 'include',
+    };
+    const allData = await fetchAllPages(url, init, firstData, {
+      listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+    });
+    const enriched = await enrichListWithDailyDetails(url, init, allData);
+    emit('list', null, url, enriched);
+  } catch (e) {
+    console.error('[temu-hook] list trigger failed:', e);
+    emit('list', null, url, { result: {} });
+  }
+}
+
 const _originalFetch = window.fetch.bind(window);
 window.fetch = async function (input, init = {}) {
   const url = typeof input === 'string' ? input : input.url;
@@ -580,6 +658,18 @@ window.fetch = async function (input, init = {}) {
     _absorbHeaders(headers);
     if (!_promoTriggered && _hasAuthHeaders()) {
       triggerPromoCollection({ headers: { ..._capturedHeaders } });
+    }
+  }
+
+  // List (semi_us): same active-trigger pattern as promo. Absorb headers from
+  // any /api/ call on this page; once auth headers are present, fire the list
+  // POST ourselves. The 8s fallback at top covers the no-API-fired case.
+  if (_activeModule === 'list' && _siteType === 'semi_us' && _isAdsTemuApi(url)) {
+    let headers = init.headers;
+    if (!headers && typeof input !== 'string' && input.headers) headers = input.headers;
+    _absorbHeaders(headers);
+    if (!_listTriggered && _hasAuthHeaders()) {
+      triggerListCollection({ headers: { ..._capturedHeaders } });
     }
   }
 
@@ -648,9 +738,17 @@ window.fetch = async function (input, init = {}) {
           .then(allData => emit('promo', null, url, allData))
           .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, url, firstData); });
       } else if (match.module === 'list' && _siteType === 'semi_us') {
-        enrichListWithDailyDetails(url, paginationInit, firstData)
-          .then(enriched => emit('list', null, url, enriched))
-          .catch(err => { console.warn('[temu-hook] list detail enrich failed', err); emit('list', null, url, firstData); });
+        if (_listTriggered) {
+          console.log('[temu-hook] list passive capture skipped (already actively triggered)');
+        } else {
+          _listTriggered = true;
+          fetchAllPages(url, paginationInit, firstData, {
+            listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+          })
+            .then(allData => enrichListWithDailyDetails(url, paginationInit, allData))
+            .then(enriched => emit('list', null, url, enriched))
+            .catch(err => { console.warn('[temu-hook] list pipeline failed', err); emit('list', null, url, firstData); });
+        }
       } else {
         emit(match.module, match.subType, url, firstData);
       }
@@ -694,6 +792,11 @@ window.XMLHttpRequest = function () {
     if (_activeModule === 'promo' && !_promoTriggered && _isAdsTemuApi(_url) && _hasAuthHeaders()) {
       triggerPromoCollection({ headers: { ..._capturedHeaders } });
     }
+    // List (semi_us): same pattern — page may not auto-fire list, so we
+    // synthesize once we have any auth-bearing /api/ XHR's headers.
+    if (_activeModule === 'list' && _siteType === 'semi_us' && !_listTriggered && _isAdsTemuApi(_url) && _hasAuthHeaders()) {
+      triggerListCollection({ headers: { ..._capturedHeaders } });
+    }
 
     if (shouldCapture(_match) && body && typeof body === 'string') {
       _body = maybeInjectDate(body, _match.module);
@@ -730,9 +833,17 @@ window.XMLHttpRequest = function () {
             .then(all => emit('promo', null, _url, all))
             .catch(err => { console.warn('[temu-hook] promo pipeline failed', err); emit('promo', null, _url, parsed); });
         } else if (_match.module === 'list' && _siteType === 'semi_us') {
-          enrichListWithDailyDetails(_url, init, parsed)
-            .then(enriched => emit('list', null, _url, enriched))
-            .catch(err => { console.warn('[temu-hook] list detail enrich failed', err); emit('list', null, _url, parsed); });
+          if (_listTriggered) {
+            console.log('[temu-hook] list passive capture skipped (already actively triggered)');
+          } else {
+            _listTriggered = true;
+            fetchAllPages(_url, init, parsed, {
+              listKey: 'list', pageNoKey: 'pageNumber', pageSizeKey: 'pageSize', module: 'list',
+            })
+              .then(all => enrichListWithDailyDetails(_url, init, all))
+              .then(enriched => emit('list', null, _url, enriched))
+              .catch(err => { console.warn('[temu-hook] list pipeline failed', err); emit('list', null, _url, parsed); });
+          }
         } else {
           emit(_match.module, _match.subType, _url, parsed);
         }
