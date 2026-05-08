@@ -619,7 +619,9 @@ async function triggerListCollection(borrowedInit) {
       console.log(`[temu-hook] list page1: status=${res.status}, success=${firstData?.success}, listLen=${listLen ?? 'n/a'}`);
       if (listLen == null || listLen === 0) {
         const r = firstData?.result;
-        console.warn(`[temu-hook] list result keys=${r && typeof r === 'object' ? Object.keys(r).join(',') : 'n/a'}, body=${JSON.stringify(firstData).slice(0, 1500)}`);
+        const keys = r && typeof r === 'object' ? Object.keys(r).join(',') : 'n/a';
+        console.error(`[temu-hook] !!DIAG!! list result keys = ${keys}`);
+        console.error(`[temu-hook] !!DIAG!! list full body (first 3000 chars) = ${JSON.stringify(firstData).slice(0, 3000)}`);
       }
     }
 
