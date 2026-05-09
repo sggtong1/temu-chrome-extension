@@ -558,9 +558,17 @@ async function triggerPromoCollection(borrowedInit) {
 
 // Inspect the first ads_report response to find which result.* field holds
 // the row array (different deployments may use different field names).
+// Sidecar metadata fields (site_info_list, ad_group_info_list, etc.) MUST be
+// excluded — they're static reference data, not ad rows; falling back to them
+// triggers infinite pagination (page_number is ignored, same 90 sites repeat).
+const _PROMO_SIDECAR_KEYS = new Set([
+  'site_info_list', 'ad_group_info_list', 'columns_list',
+  'rpt_columns_width_list', 'goods_roas_type_sum_list',
+  'site_status_info_list', 'site_price_info_list',
+]);
 function _detectPromoListKey(firstData) {
   const r = firstData?.result;
-  if (!r || typeof r !== 'object') return 'list';
+  if (!r || typeof r !== 'object') return null;
   const candidates = ['ads_detail',                // coconut/ads_report (current)
                       'adDetailList', 'list', 'dataList', 'items', 'records',
                       'goods_data_list', 'goods_report_list', 'report_list',
@@ -571,12 +579,12 @@ function _detectPromoListKey(firstData) {
       return k;
     }
   }
-  // Fallback: pick any array-typed key on result
+  // Fallback: pick any array-typed key on result, but skip known sidecars.
   for (const [k, v] of Object.entries(r)) {
-    if (Array.isArray(v)) {
-      console.log(`[temu-hook] promo list key fallback: ${k} (len=${v.length})`);
-      return k;
-    }
+    if (!Array.isArray(v)) continue;
+    if (_PROMO_SIDECAR_KEYS.has(k)) continue;
+    console.log(`[temu-hook] promo list key fallback: ${k} (len=${v.length})`);
+    return k;
   }
   console.warn('[temu-hook] promo: no array list key found on result. result keys:', Object.keys(r));
   return 'list';
