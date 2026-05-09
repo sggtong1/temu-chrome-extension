@@ -485,6 +485,8 @@ async function triggerPromoCollection(borrowedInit) {
 
   // Body crafted to match the goods report panel's payload shape.
   // full_managed: 仅采"投放中"广告 (ad_status=8); 半托保持全量.
+  // source=0 + selected_roas_type=1: 跟页面手动调用一致, 否则 API 返回
+  // summary.X.total.val=0 (像是切到了广告归因视图).
   const buildBody = (pageNo) => ({
     ad_status: _siteType === 'full_managed' ? [8] : [],
     page_number: pageNo,
@@ -494,7 +496,8 @@ async function triggerPromoCollection(borrowedInit) {
     sort_type: 'desc',
     start_time: cstDateBoundaryMs(startDate, false),
     end_time:   cstDateBoundaryMs(endDate,   true),
-    source: 1,
+    source: 0,
+    selected_roas_type: 1,
     need_del_status_ad: true,
     need_calculate_goods_summary: true,
     columns_type: 4,
