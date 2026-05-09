@@ -191,7 +191,7 @@ shadow.innerHTML = `
   .badge-retry   { background: #fff7ed; color: #c2410c; }
 </style>
 
-<div class="bar" id="bar" style="display:none">
+<div class="bar" id="bar" style="display:flex">
   <span>🛒</span>
   <span class="bar-label">Temu 采集</span>
   <span class="bar-sub" id="bar-sub">· 就绪</span>
@@ -199,7 +199,7 @@ shadow.innerHTML = `
   <span class="bar-btn" id="bar-expand">＋</span>
 </div>
 
-<div class="panel" id="panel">
+<div class="panel" id="panel" style="display:none">
   <div class="header" id="drag-header">
     <span class="header-title">🛒 Temu 数据采集</span>
     <button class="header-btn" id="collapse-btn" title="最小化">−</button>
