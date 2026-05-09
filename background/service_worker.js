@@ -572,8 +572,16 @@ async function processModule(module, rawData) {
   }
 
   if (module === 'promo') {
+    // Diagnostic: log raw first ad + transformed first row so we can compare
+    // when metrics come out as 0 (indicates field-name mismatch in transform).
+    const r = rawData?.result;
+    const adList = r?.ads_detail ?? r?.adDetailList ?? r?.list ?? r?.dataList ?? r?.items ?? r?.adReportList ?? [];
+    if (adList.length > 0) {
+      console.log('[temu] promo first ad RAW (first 2000 chars):', JSON.stringify(adList[0]).slice(0, 2000));
+    }
     const rows = transformPromoResponse(rawData, ctx);
     if (rows.length > 0) {
+      console.log('[temu] promo first row TRANSFORMED:', JSON.stringify(rows[0]));
       const { count, error } = await supabaseUpsert(
         supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows,
         '日期,店铺名称,商品id,平台'  // unique constraint, not the bigint id PK
