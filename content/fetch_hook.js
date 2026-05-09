@@ -507,13 +507,15 @@ async function triggerPromoCollection(borrowedInit) {
   });
 
   const headerKeys = Object.keys(borrowedInit.headers || {});
+  const sentBody = buildBody(1);
   console.log(`[temu-hook] promo: actively calling ads_report for ${startDate}..${endDate} | list_id=${listId} | borrowed ${headerKeys.length} headers: [${headerKeys.join(', ')}]`);
+  console.log('[temu-hook] promo SENT BODY:', JSON.stringify(sentBody));
 
   try {
     const res = await _originalFetch(url, {
       method: 'POST',
       headers: borrowedInit.headers || {},
-      body: JSON.stringify(buildBody(1)),
+      body: JSON.stringify(sentBody),
       credentials: 'include',
     });
     let firstData;
