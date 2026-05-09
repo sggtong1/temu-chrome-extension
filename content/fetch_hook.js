@@ -174,6 +174,8 @@ function maybeInjectDate(body, mod) {
       // Restore some sensible defaults if missing
       if (parsed.page_size == null) parsed.page_size = 50;  // bigger pages for fewer round-trips
       if (parsed.page_number == null) parsed.page_number = 1;
+      // full_managed: 仅采"投放中"广告 (ad_status=8). 半托保持现状全量.
+      if (_siteType === 'full_managed') parsed.ad_status = [8];
     }
     const out = JSON.stringify(parsed);
     if ((mod === 'sales' || mod === 'activity' || mod === 'promo') && out !== body) {
@@ -482,8 +484,9 @@ async function triggerPromoCollection(borrowedInit) {
       });
 
   // Body crafted to match the goods report panel's payload shape.
+  // full_managed: 仅采"投放中"广告 (ad_status=8); 半托保持全量.
   const buildBody = (pageNo) => ({
-    ad_status: [],
+    ad_status: _siteType === 'full_managed' ? [8] : [],
     page_number: pageNo,
     page_size: 10,                     // match page default to avoid limit issues
     specific_query_info: '',
