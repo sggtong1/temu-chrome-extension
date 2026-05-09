@@ -572,16 +572,24 @@ async function processModule(module, rawData) {
   }
 
   if (module === 'promo') {
-    // Diagnostic: log raw first ad + transformed first row so we can compare
-    // when metrics come out as 0 (indicates field-name mismatch in transform).
-    const r = rawData?.result;
-    const adList = r?.ads_detail ?? r?.adDetailList ?? r?.list ?? r?.dataList ?? r?.items ?? r?.adReportList ?? [];
-    if (adList.length > 0) {
-      console.log('[temu] promo first ad RAW (first 2000 chars):', JSON.stringify(adList[0]).slice(0, 2000));
-    }
     const rows = transformPromoResponse(rawData, ctx);
     if (rows.length > 0) {
-      console.log('[temu] promo first row TRANSFORMED:', JSON.stringify(rows[0]));
+      // Per-row summary so we can tell whether ALL rows are 0 (real problem)
+      // or just some (normal data distribution). Print 总花费/曝光量/点击量
+      // for each row.
+      console.log(`[temu] promo: ${rows.length} rows transformed. Per-row metric snapshot:`);
+      for (const row of rows) {
+        console.log(`  ad_id=${row.ad_id} 总花费=${row['总花费']} 曝光量=${row['曝光量']} 点击量=${row['点击量']} 子订单量=${row['子订单量']} ROAS=${row.ROAS}`);
+      }
+      const allZero = rows.every(r => r['总花费'] === 0 && r['曝光量'] === 0 && r['点击量'] === 0);
+      if (allZero) {
+        // All rows zero — suspect time-slice issue. Dump raw for first ad.
+        const adList = rawData?.result?.ads_detail ?? [];
+        if (adList[0]) {
+          console.warn('[temu] promo ALL ROWS ZERO — first ad summary.spend RAW:', JSON.stringify(adList[0]?.summary?.spend ?? null));
+          console.warn('[temu] promo top-level used_budget=' + adList[0]?.used_budget + ' roas=' + adList[0]?.roas);
+        }
+      }
       const { count, error } = await supabaseUpsert(
         supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows,
         '日期,店铺名称,商品id,平台'  // unique constraint, not the bigint id PK
