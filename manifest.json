@@ -10,6 +10,7 @@
     "https://agentseller-eu.temu.com/*",
     "https://agentseller.temu.com/*",
     "https://ads.temu.com/*",
+    "https://seller.kuajingmaihuo.com/*",
     "https://*.supabase.co/*"
   ],
   "background": {
@@ -36,6 +37,13 @@
         "https://ads.temu.com/*"
       ],
       "js": ["vendor/xlsx.full.min.js", "content/content_script.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://seller.kuajingmaihuo.com/main/order-manager/shipping-desk*"
+      ],
+      "js": ["content/shipping_desk_inject.js"],
       "run_at": "document_idle"
     }
   ],
