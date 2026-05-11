@@ -34,17 +34,37 @@ const CREATE_DELAY_MS = 300;  // 多 group 间间隔, 防风控
 
 // ── API helper ──────────────────────────────────────────────────────────────
 
+// Captured headers from the MAIN world hook (shipping_desk_hook.js).
+// Updated whenever the page itself fires a /bgSongbird-api/ request; reused
+// in our active calls so server-side anti-content / mallid checks pass.
+const _capturedHeaders = {};
+window.addEventListener('temuShippingDesk:headers', (e) => {
+  const h = e.detail?.headers ?? {};
+  for (const [k, v] of Object.entries(h)) _capturedHeaders[k.toLowerCase()] = v;
+});
+
 async function apiPost(url, payload) {
+  const tail = url.split('/').pop();
+  const headers = { 'content-type': 'application/json', ..._capturedHeaders };
+  // Don't let captured 'content-type' override JSON (it usually is the same).
+  headers['content-type'] = 'application/json';
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     credentials: 'include',
     body: JSON.stringify(payload),
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch {
+    throw new Error(`${tail}: HTTP ${res.status} non-JSON body: ${text.slice(0, 200)}`);
+  }
   if (!data?.success) {
-    const tail = url.split('/').pop();
-    throw new Error(`${tail}: ${data?.errorMsg || 'failed'} (code=${data?.errorCode})`);
+    const code = data?.errorCode ?? 'undefined';
+    const msg  = data?.errorMsg  || 'failed';
+    throw new Error(`${tail}: HTTP ${res.status} ${msg} (code=${code}) body=${text.slice(0, 200)}`);
   }
   return data.result;
 }

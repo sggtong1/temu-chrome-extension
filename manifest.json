@@ -43,6 +43,14 @@
       "matches": [
         "https://seller.kuajingmaihuo.com/main/order-manager/shipping-desk*"
       ],
+      "js": ["content/shipping_desk_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://seller.kuajingmaihuo.com/main/order-manager/shipping-desk*"
+      ],
       "js": ["content/shipping_desk_inject.js"],
       "run_at": "document_idle"
     }
