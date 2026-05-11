@@ -145,30 +145,47 @@ function openModal(innerHTML) {
       .btn-primary   { background: #1e40af; color: white; }
       .btn-primary:hover:not(:disabled) { background: #1e3a8a; }
       .btn-secondary { background: #f1f5f9; color: #475569; }
-      .info    { background: #fef3c7; color: #92400e; padding: 8px 10px; border-radius: 4px; margin-bottom: 10px; font-size: 12px; line-height: 1.5; }
-      .progbar { height: 4px; background: #e2e8f0; border-radius: 2px; margin: 8px 0; overflow: hidden; }
+      .info       { background: #fff7ed; color: #c2410c; padding: 8px 10px; border-radius: 4px; margin-bottom: 12px; font-size: 12px; line-height: 1.5; }
+      .info-blue  { background: #eff6ff; color: #1e40af; padding: 8px 10px; border-radius: 4px; margin: 12px 0 8px; font-size: 12px; line-height: 1.5; }
+      .picker-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+      .picker-label { font-size: 13px; color: #374151; white-space: nowrap; }
+      .picker-row select { flex: 1; padding: 6px 10px; border: 1px solid #e2e8f0; border-radius: 4px; background: #f8fafc; font-size: 12px; }
+      .btn.full { width: 100%; padding: 10px; font-size: 14px; }
+      .progbar { height: 6px; background: #e2e8f0; border-radius: 3px; margin: 8px 0; overflow: hidden; }
       .progbar-fill { height: 100%; background: #1e40af; width: 0%; transition: width .3s; }
-      .console { background: #1e293b; color: #e2e8f0; padding: 10px; border-radius: 4px; height: 260px; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; }
-      .console .ok   { color: #4ade80; }
-      .console .err  { color: #f87171; }
-      .console .warn { color: #fde047; }
+      .console { background: #1e293b; color: #e2e8f0; padding: 10px; border-radius: 4px; height: 240px; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; }
+      .console .ok    { color: #4ade80; }
+      .console .err   { color: #f87171; }
+      .console .warn  { color: #fde047; }
+      .console .muted { color: #94a3b8; }
     </style>
     ${innerHTML}
   `;
   return shadow;
 }
 
-// ── Stage 1: confirm modal ─────────────────────────────────────────────────
+// ── Single combined modal: warehouse picker + 一键执行 + 进度区 ────────────
 
 async function onTriggerClick() {
   const shadow = openModal(`
     <div class="overlay">
-      <div class="modal" style="max-width:380px;">
-        <div class="header">Temu 发货助手 <span class="close" id="close">×</span></div>
-        <div class="body"><div id="content">正在查询备货单数量...</div></div>
+      <div class="modal">
+        <div class="header">一键创建发货单 <span class="close" id="close">×</span></div>
+        <div class="body">
+          <div class="info">提示：点击执行后，程序会逐批获取并执行！此过程不要关闭弹窗或刷新页面！如需中断请刷新网页！</div>
+          <div class="picker-row">
+            <span class="picker-label">选择发货仓库：</span>
+            <select id="addr-select" disabled>
+              <option>加载中...</option>
+            </select>
+          </div>
+          <button class="btn btn-primary full" id="exec" disabled>一键执行</button>
+          <div class="info-blue">官方接口限制，每批次最多执行 50 个商品。执行过程中请勿关闭弹窗或刷新网页。</div>
+          <div class="progbar"><div class="progbar-fill" id="bar"></div></div>
+          <div class="console" id="console"><div class="muted">等待执行...</div></div>
+        </div>
         <div class="footer">
           <button class="btn btn-secondary" id="cancel">关闭</button>
-          <button class="btn btn-primary"   id="confirm" disabled>一键创建发货单</button>
         </div>
       </div>
     </div>
@@ -176,49 +193,74 @@ async function onTriggerClick() {
   shadow.getElementById('close').addEventListener('click', closeModal);
   shadow.getElementById('cancel').addEventListener('click', closeModal);
 
+  const select  = shadow.getElementById('addr-select');
+  const execBtn = shadow.getElementById('exec');
+  const consoleEl = shadow.getElementById('console');
+
+  // 并行拉取: 数量 + 发货人地址列表
+  const [totalRes, addrRes] = await Promise.allSettled([
+    apiPost(API.pageQuery,       { pageNo: 1, pageSize: 1 }),
+    apiPost(API.supplierAddress, {}),
+  ]);
+
   let total = 0;
-  try {
-    const res = await apiPost(API.pageQuery, { pageNo: 1, pageSize: 1 });
-    total = res?.total ?? 0;
-  } catch (e) {
-    shadow.getElementById('content').innerHTML = `<div style="color:#b91c1c;">查询失败: ${e.message}</div>`;
-    return;
+  if (totalRes.status === 'fulfilled') {
+    total = totalRes.value?.total ?? 0;
+  } else {
+    consoleEl.innerHTML = `<div class="err">查询备货单数量失败: ${totalRes.reason?.message ?? totalRes.reason}</div>`;
   }
 
-  const contentEl = shadow.getElementById('content');
-  contentEl.innerHTML = `当前要获取操作的备货单数量: <b>${total}</b> 个`;
-  if (total === 0) {
-    shadow.getElementById('confirm').remove();
-    return;
+  let addresses = [];
+  if (addrRes.status === 'fulfilled') {
+    addresses = addrRes.value?.supplierAddressList ?? [];
+  } else {
+    consoleEl.innerHTML += `<div class="err">取发货人地址失败: ${addrRes.reason?.message ?? addrRes.reason}</div>`;
   }
-  const confirmBtn = shadow.getElementById('confirm');
-  confirmBtn.disabled = false;
-  confirmBtn.addEventListener('click', () => startCreateFlow(total));
+
+  // 填充下拉
+  select.innerHTML = '';
+  if (addresses.length === 0) {
+    const opt = document.createElement('option');
+    opt.textContent = '（无可用发货仓库）';
+    opt.value = '';
+    select.appendChild(opt);
+  } else {
+    for (const a of addresses) {
+      const opt = document.createElement('option');
+      opt.value = String(a.id);
+      opt.textContent = a.addressLabel;
+      if (a.isDefault) opt.selected = true;
+      select.appendChild(opt);
+    }
+    select.disabled = false;
+  }
+
+  // 状态提示行 (首条 console)
+  consoleEl.innerHTML = `<div class="muted">当前要操作的备货单数量: ${total} 个 | 共 ${addresses.length} 个可选仓库</div>`;
+
+  if (total > 0 && addresses.length > 0) {
+    execBtn.disabled = false;
+  }
+
+  execBtn.addEventListener('click', () => {
+    const addrId = parseInt(select.value, 10);
+    if (!addrId) return;
+    // 锁定选择 + 执行按钮, 开始流程
+    select.disabled = true;
+    execBtn.disabled = true;
+    runCreateFlow(total, addrId, shadow);
+  });
 }
 
-// ── Stage 2: execution modal + multi-step flow ─────────────────────────────
+// ── Multi-step API flow (runs inside the same modal) ───────────────────────
 
-async function startCreateFlow(total) {
-  const shadow = openModal(`
-    <div class="overlay">
-      <div class="modal">
-        <div class="header">一键创建发货单 <span class="close" id="close">×</span></div>
-        <div class="body">
-          <div class="info">官方接口限制，每批次最多执行 50 个商品。执行过程中请勿关闭弹窗或刷新网页。</div>
-          <div class="progbar"><div class="progbar-fill" id="bar"></div></div>
-          <div class="console" id="console"></div>
-        </div>
-        <div class="footer">
-          <button class="btn btn-secondary" id="cancel" disabled>关闭</button>
-        </div>
-      </div>
-    </div>
-  `);
-  shadow.getElementById('close').addEventListener('click', closeModal);
+async function runCreateFlow(total, deliveryAddressId, shadow) {
   const cancelBtn = shadow.getElementById('cancel');
-  cancelBtn.addEventListener('click', closeModal);
   const consoleEl = shadow.getElementById('console');
   const barEl     = shadow.getElementById('bar');
+
+  // 清掉 "等待执行..." / 状态提示
+  consoleEl.innerHTML = '';
 
   function log(msg, level = '') {
     const ts = new Date().toLocaleTimeString();
@@ -230,22 +272,7 @@ async function startCreateFlow(total) {
   }
   function setProgress(pct) { barEl.style.width = `${pct}%`; }
 
-  log('开始执行...');
-
-  // Step 1: 发货人地址
-  let deliveryAddressId = null;
-  try {
-    const supRes = await apiPost(API.supplierAddress, {});
-    const list = supRes?.supplierAddressList ?? [];
-    const def = list.find(a => a.isDefault) ?? list[0];
-    if (!def) throw new Error('未找到发货人地址');
-    deliveryAddressId = def.id;
-    log(`✅ 发货人地址: ${def.addressLabel} (id=${def.id})`, 'ok');
-  } catch (e) {
-    log(`❌ 取发货人地址失败: ${e.message}`, 'err');
-    cancelBtn.disabled = false;
-    return;
-  }
+  log(`开始执行... 发货人地址 id=${deliveryAddressId}`);
   setProgress(5);
 
   // Step 2: 分页拉取全部备货单
