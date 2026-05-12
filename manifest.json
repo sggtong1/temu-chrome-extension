@@ -11,7 +11,7 @@
     "https://agentseller.temu.com/*",
     "https://ads.temu.com/*",
     "https://seller.kuajingmaihuo.com/*",
-    "https://*.supabase.co/*"
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background/service_worker.js",
