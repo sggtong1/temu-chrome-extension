@@ -2,7 +2,7 @@
 // mini-postgres). Replaces the previous Supabase-based code; the API surface
 // is identical because Supabase is itself a PostgREST wrapper.
 //
-// Default URL: http://localhost:3002 (the PostgREST container started in
+// Default URL: http://localhost:3003 (the PostgREST container started in
 // docker-compose / scripts/start-api.sh). User can override via options page.
 //
 // Auth: in local dev we run PostgREST with PGRST_DB_ANON_ROLE=admin (no JWT

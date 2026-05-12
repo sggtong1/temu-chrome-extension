@@ -13,12 +13,12 @@
 #     (verify: `docker ps | grep mini-postgres`)
 #
 # After this script finishes:
-#   - LAN clients access via http://<server-lan-ip-or-mDNS>:3002
-#     e.g. http://yyjrs-Mac-mini.local:3002 or http://192.168.1.6:3002
-#   - Localhost on this same machine still works at http://localhost:3002
+#   - LAN clients access via http://<server-lan-ip-or-mDNS>:3003
+#     e.g. http://yyjrs-Mac-mini.local:3003 or http://192.168.1.6:3003
+#   - Localhost on this same machine still works at http://localhost:3003
 #
 # Security note: PGRST_DB_ANON_ROLE=admin means ANYONE who can reach port
-# 3002 has full read/write/delete on every table. With LAN binding (default)
+# 3003 has full read/write/delete on every table. With LAN binding (default)
 # that's "anyone on your home/office WiFi". OK for trusted small teams.
 # If your WiFi has untrusted devices, switch to BIND=127.0.0.1 and use
 # Tailscale, or add JWT auth.
@@ -26,7 +26,10 @@
 set -euo pipefail
 
 CONTAINER=temu-postgrest
-HOST_PORT=3002
+# 3003 instead of 3002: 3002 is already taken by a separate temu-dashboard
+# CRA dev server on this mini, which would silently steal Tailscale-routed
+# traffic and serve its HTML instead of PostgREST's JSON.
+HOST_PORT=3003
 BIND="${BIND:-0.0.0.0}"   # default: LAN-reachable (override with BIND=127.0.0.1)
 PG_USER=admin
 PG_PASS_RAW='sGfT+sjmGBgAaydGCDYobwbyPRDRHCalYeV0RiWpga4='

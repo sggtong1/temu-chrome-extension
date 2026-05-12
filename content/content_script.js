@@ -575,7 +575,7 @@ function exportExcel(startDate, endDate, shopName) {
 
       if (!resp) { showBanner('导出失败：服务未响应'); return; }
       if (resp.error === 'no-api') {
-        showBanner('未配置 API URL，请前往选项页设置 (默认 http://localhost:3002)');
+        showBanner('未配置 API URL，请前往选项页设置 (默认 http://localhost:3003)');
         return;
       }
       if (resp.error) { showBanner(`导出失败: ${resp.error}`); return; }
@@ -717,7 +717,7 @@ shadow.getElementById('bar-clear').addEventListener('click', (e) => {
 
 function updatePanelStatus(msg) {
   if (msg.status === 'error-no-api') {
-    showBanner('未配置 API URL，请前往插件选项页填写（默认 http://localhost:3002）');
+    showBanner('未配置 API URL，请前往插件选项页填写（默认 http://localhost:3003）');
     shadow.getElementById('start-btn').style.display = '';
     shadow.getElementById('start-btn').disabled = false;
     shadow.getElementById('progress-wrap').style.display = 'none';
