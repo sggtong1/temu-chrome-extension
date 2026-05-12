@@ -19,15 +19,17 @@
 </head>
 <body>
 <h1>🛒 Temu 数据采集 — 设置</h1>
-<label>Supabase URL</label>
-<input id="url" type="url" placeholder="https://xxxx.supabase.co">
-<label>Supabase Anon Key</label>
-<input id="key" type="password" placeholder="eyJ...">
+<label>本地数据 API URL (PostgREST in front of mini-postgres)</label>
+<input id="url" type="url" placeholder="http://localhost:3002" value="http://localhost:3002">
 <div class="row">
   <button id="save">保存</button>
   <button id="test">测试连接</button>
 </div>
 <div id="status"></div>
+<p style="margin-top:24px;color:#64748b;font-size:12px;line-height:1.6;">
+  PostgREST 没启动？在仓库根目录运行 <code>bash scripts/start-api.sh</code>。
+  本地开发模式无需 anon key。
+</p>
 <script src="options.js"></script>
 </body>
 </html>

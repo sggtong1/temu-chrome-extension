@@ -1,4 +1,4 @@
-import { getShopByMallId, getSkuCost, supabaseUpsert } from './supabase.js';
+import { getSkuCost, dbUpsert } from './db.js';
 import { transformListResponse, transformSemiUsListResponse } from './transform/list_transform.js';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
@@ -92,8 +92,7 @@ let _state = {
   shopName: '',
   siteType: 'semi_us',
   captured: {},
-  supabaseUrl: null,
-  supabaseAnonKey: null,
+  apiUrl: null,
 };
 
 let _captureTimer = null;
@@ -157,8 +156,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function handleExportReport({ startDate, endDate, shopName }) {
-  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
-  if (!supabaseUrl || !supabaseAnonKey) return { error: 'no-supabase' };
+  const { apiUrl } = await chrome.storage.local.get(['apiUrl']);
+  if (!apiUrl) return { error: 'no-api' };
   if (!startDate || !endDate || !shopName) return { error: 'invalid-params' };
 
   // Build query manually (Chinese column names need URL-encoding both as keys and values)
@@ -172,10 +171,8 @@ async function handleExportReport({ startDate, endDate, shopName }) {
 
   console.log(`[temu] EXPORT_REPORT: ${shopName} ${startDate}..${endDate}`);
   try {
-    const resp = await fetch(`${supabaseUrl}/rest/v1/sku_daily_with_activity?${qs}`, {
+    const resp = await fetch(`${apiUrl}/sku_daily_with_activity?${qs}`, {
       headers: {
-        apikey: supabaseAnonKey,
-        Authorization: `Bearer ${supabaseAnonKey}`,
         // PostgREST default limit is 1000; raise it via Range header
         Range: '0-49999',
         'Range-Unit': 'items',
@@ -201,18 +198,12 @@ chrome.action.onClicked.addListener((tab) => {
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 async function handleGetShopInfo(mallId) {
-  // Fast path: userInfo cache (populated on page load, no network request)
+  // Only source now: userInfo cache (populated on page load, no network).
+  // mini-postgres has shop_master schema which doesn't map to (mall_id,
+  // site_type); userInfo intercept is sufficient for the resolve chain.
   const cached = shopFromCache(mallId);
   if (cached) return { shop_name: cached.mallName, site_type: cached.siteType };
-
-  // Fallback: Supabase shops table
-  const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
-  if (!supabaseUrl || !supabaseAnonKey) return null;
-  try {
-    return await getShopByMallId(supabaseUrl, supabaseAnonKey, mallId);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 async function handleStartCollection(msg, tabId) {
@@ -222,31 +213,19 @@ async function handleStartCollection(msg, tabId) {
     return;
   }
   try {
-    const { supabaseUrl, supabaseAnonKey } = await chrome.storage.local.get(['supabaseUrl', 'supabaseAnonKey']);
-    if (!supabaseUrl || !supabaseAnonKey) {
-      console.warn('[temu] missing Supabase config — aborting');
+    const { apiUrl } = await chrome.storage.local.get(['apiUrl']);
+    if (!apiUrl) {
+      console.warn('[temu] missing API URL — aborting');
       try {
-        await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error-no-supabase' });
+        await chrome.tabs.sendMessage(tabId, { type: 'UPDATE_PANEL_STATUS', module: null, status: 'error-no-api' });
       } catch {}
       return;
     }
 
-    // Resolve siteType: msg from panel > userInfo cache > Supabase shops table > 'semi_us'
+    // Resolve siteType: msg from panel > userInfo cache > 'semi_us' default
     const cached = shopFromCache(msg.mallId);
     let shopName = cached?.mallName;
-    let siteType = msg.siteType || cached?.siteType;
-
-    if (!siteType) {
-      console.log('[temu] siteType not in msg/cache, querying Supabase shops table');
-      try {
-        const shop = await getShopByMallId(supabaseUrl, supabaseAnonKey, msg.mallId);
-        shopName = shopName ?? shop?.shop_name;
-        siteType = shop?.site_type ?? 'semi_us';
-      } catch (e) {
-        console.warn('[temu] getShopByMallId failed, defaulting to semi_us:', e);
-        siteType = 'semi_us';
-      }
-    }
+    let siteType = msg.siteType || cached?.siteType || 'semi_us';
     console.log('[temu] resolved siteType=', siteType, 'shopName=', shopName);
 
     const dates = generateDateRange(msg.startDate ?? msg.date, msg.endDate ?? msg.startDate ?? msg.date);
@@ -265,8 +244,7 @@ async function handleStartCollection(msg, tabId) {
       shopName: shopName ?? `mall${msg.mallId}`,
       siteType,
       captured: {},
-      supabaseUrl,
-      supabaseAnonKey,
+      apiUrl,
     };
 
     console.log('[temu] state initialized, calling navigateToNextModule');
@@ -481,7 +459,7 @@ async function handlePageError() {
 
 async function processModule(module, rawData) {
   const ctx = { shopName: _state.shopName, region: _state.region, date: _state.date, siteType: _state.siteType };
-  const { supabaseUrl, supabaseAnonKey } = _state;
+  const { apiUrl } = _state;
 
   if (module === 'list') {
     // dashboard_metrics 的唯一约束是 ("日期","店铺名称","区域","商品SPUID");
@@ -498,14 +476,14 @@ async function processModule(module, rawData) {
       console.log(`[temu] list (semi_us): built ${rows.length} rows for ${_state.dates.length} dates × ${rawData?.result?.pageItems?.length ?? 0} products`);
       if (rows.length > 0) {
         console.log('[temu] list (semi_us): first row sample:', JSON.stringify(rows[0]).slice(0, 500));
-        const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows, LIST_CONFLICT);
+        const { error } = await dbUpsert(apiUrl, 'dashboard_metrics', rows, LIST_CONFLICT);
         if (error) throw new Error(error);
       }
       // Captured the full range in one shot — skip subsequent date iterations
       _state.originalModules = _state.originalModules.filter(m => m !== 'list');
     } else {
       const rows = transformListResponse(rawData, ctx);
-      const { error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'dashboard_metrics', rows, LIST_CONFLICT);
+      const { error } = await dbUpsert(apiUrl, 'dashboard_metrics', rows, LIST_CONFLICT);
       if (error) throw new Error(error);
     }
   }
@@ -519,7 +497,7 @@ async function processModule(module, rawData) {
       const dateCtx = { ...ctx, date };
       const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData, dateCtx);
       const extCodes = [...new Set(Object.values(skuPrices).map(p => p.extCode).filter(Boolean))];
-      const skuCostMap = await getSkuCost(supabaseUrl, supabaseAnonKey, extCodes, date, _state.siteType);
+      const skuCostMap = await getSkuCost(apiUrl, extCodes, date, _state.siteType);
       const rows = buildSkuRows(dateCtx, { skuSales, skuPrices, skuSpuMap }, {}, skuCostMap);
       allRows.push(...rows);
       totalSkus = Math.max(totalSkus, Object.keys(skuSales).length);
@@ -527,7 +505,7 @@ async function processModule(module, rawData) {
     console.log(`[temu] sales (full_managed): built ${allRows.length} rows for ${_state.dates.length} dates × ${totalSkus} SKUs`);
     if (allRows.length > 0) {
       console.log('[temu] sales: first row sample:', JSON.stringify(allRows[0]).slice(0, 500));
-      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', allRows);
+      const { count, error } = await dbUpsert(apiUrl, 'sku_daily_metrics', allRows);
       if (error) { console.error('[temu] sales upsert error:', error); throw new Error(error); }
       console.log(`[temu] sales: upsert OK, count=${count}`);
     }
@@ -537,13 +515,13 @@ async function processModule(module, rawData) {
     // semi_us: per-date capture (existing behavior)
     const { skuSales, skuPrices, skuSpuMap } = parseSalesResponse(rawData, ctx);
     const extCodes = [...new Set(Object.values(skuPrices).map(p => p.extCode).filter(Boolean))];
-    const skuCostMap = await getSkuCost(supabaseUrl, supabaseAnonKey, extCodes, _state.date, _state.siteType);
+    const skuCostMap = await getSkuCost(apiUrl, extCodes, _state.date, _state.siteType);
     const ordersRaw = _state.captured['orders'];
     const ordersShipping = ordersRaw ? parseOrdersResponse(ordersRaw) : {};
     const rows = buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShipping, skuCostMap);
     console.log(`[temu] sales (semi_us): built ${rows.length} rows for ${Object.keys(skuSales).length} SKUs`);
     if (rows.length > 0) {
-      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_daily_metrics', rows);
+      const { count, error } = await dbUpsert(apiUrl, 'sku_daily_metrics', rows);
       if (error) { console.error('[temu] sales upsert error:', error); throw new Error(error); }
       console.log(`[temu] sales: upsert OK, count=${count}`);
     }
@@ -561,7 +539,7 @@ async function processModule(module, rawData) {
       endDate: _state.dates[_state.dates.length - 1],
     });
     if (rows.length > 0) {
-      const { count, error } = await supabaseUpsert(supabaseUrl, supabaseAnonKey, 'sku_activity_history', rows);
+      const { count, error } = await dbUpsert(apiUrl, 'sku_activity_history', rows);
       if (error) { console.error('[temu] activity upsert error:', error); throw new Error(error); }
       console.log(`[temu] activity: upsert OK, count=${count}`);
     } else {
@@ -590,8 +568,8 @@ async function processModule(module, rawData) {
           console.warn('[temu] promo top-level used_budget=' + adList[0]?.used_budget + ' roas=' + adList[0]?.roas);
         }
       }
-      const { count, error } = await supabaseUpsert(
-        supabaseUrl, supabaseAnonKey, 'ad_spend_daily', rows,
+      const { count, error } = await dbUpsert(
+        apiUrl, 'ad_spend_daily', rows,
         '日期,店铺名称,商品id,平台'  // unique constraint, not the bigint id PK
       );
       if (error) { console.error('[temu] promo upsert error:', error); throw new Error(error); }

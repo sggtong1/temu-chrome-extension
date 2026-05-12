@@ -574,8 +574,8 @@ function exportExcel(startDate, endDate, shopName) {
       exportBtn.textContent = originalLabel;
 
       if (!resp) { showBanner('导出失败：服务未响应'); return; }
-      if (resp.error === 'no-supabase') {
-        showBanner('未配置 Supabase，请前往选项页设置');
+      if (resp.error === 'no-api') {
+        showBanner('未配置 API URL，请前往选项页设置 (默认 http://localhost:3002)');
         return;
       }
       if (resp.error) { showBanner(`导出失败: ${resp.error}`); return; }
@@ -716,8 +716,8 @@ shadow.getElementById('bar-clear').addEventListener('click', (e) => {
 // ── Status updates ────────────────────────────────────────────────────────────
 
 function updatePanelStatus(msg) {
-  if (msg.status === 'error-no-supabase') {
-    showBanner('未配置 Supabase，请前往插件选项页填写 URL 和 Anon Key');
+  if (msg.status === 'error-no-api') {
+    showBanner('未配置 API URL，请前往插件选项页填写（默认 http://localhost:3002）');
     shadow.getElementById('start-btn').style.display = '';
     shadow.getElementById('start-btn').disabled = false;
     shadow.getElementById('progress-wrap').style.display = 'none';
