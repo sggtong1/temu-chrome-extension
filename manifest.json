@@ -3,7 +3,7 @@
   "name": "Temu 数据采集",
   "version": "1.0.0",
   "description": "每日一键采集 Temu 卖家数据并同步到 Supabase",
-  "permissions": ["storage", "tabs"],
+  "permissions": ["storage", "tabs", "cookies", "alarms", "scripting"],
   "host_permissions": [
     "https://*.temu.com/*",
     "https://agentseller-us.temu.com/*",
@@ -11,7 +11,8 @@
     "https://agentseller.temu.com/*",
     "https://ads.temu.com/*",
     "https://seller.kuajingmaihuo.com/*",
-    "http://*/*"
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background/service_worker.js",
@@ -57,7 +58,8 @@
   ],
   "action": {
     "default_title": "Temu 数据采集",
-    "default_icon": { "48": "icons/icon-48.png" }
+    "default_icon": { "48": "icons/icon-48.png" },
+    "default_popup": "popup/popup.html"
   },
   "options_ui": {
     "page": "options/options.html",
