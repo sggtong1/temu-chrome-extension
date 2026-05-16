@@ -198,6 +198,161 @@ async function dispatch(task, signal) {
   }
 }
 
+// ── 通用: 后台开 hidden tab → executeScript fetch + 分页 → 关 tab ──
+// spec: { url, method, buildBody(payload), listPath, totalPath (可为 null), transform }
+// 返回 { rawItems: [], transformed: [] }
+// 失败抛错(message 含 phase 便于排错);任何分支都保证关 tab。
+async function dispatchViaHiddenTab(spec, payload, signal) {
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const FETCH_TIMEOUT_MS = 5 * 60_000;
+  const NEUTRAL_URL = 'https://agentseller.temu.com/';
+
+  let tabId = null;
+  let onUpdatedListener = null;
+  const cleanup = async () => {
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+    if (tabId != null) {
+      try { await chrome.tabs.remove(tabId); } catch {}
+      tabId = null;
+    }
+  };
+  const checkAbort = () => {
+    if (signal?.aborted) {
+      throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+    }
+  };
+
+  try {
+    // 1) create hidden tab
+    checkAbort();
+    const tab = await chrome.tabs.create({ url: NEUTRAL_URL, active: false, pinned: false });
+    tabId = tab.id;
+
+    // 2) wait for tab to finish loading (tabs.onUpdated complete; poll fallback)
+    await new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      onUpdatedListener = (updatedTabId, changeInfo) => {
+        if (updatedTabId !== tabId) return;
+        if (changeInfo.status === 'complete') resolve();
+      };
+      chrome.tabs.onUpdated.addListener(onUpdatedListener);
+      const poll = setInterval(async () => {
+        try {
+          const t = await chrome.tabs.get(tabId);
+          if (t?.status === 'complete') { clearInterval(poll); resolve(); return; }
+        } catch (e) { clearInterval(poll); reject(e); return; }
+        if (Date.now() - startedAt > TAB_LOAD_TIMEOUT_MS) {
+          clearInterval(poll);
+          reject(Object.assign(new Error('TAB_LOAD_TIMEOUT'), { code: 'TAB_LOAD_TIMEOUT' }));
+        }
+      }, 500);
+    });
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+
+    // 3) executeScript: run fetch + pagination in MAIN world same-origin
+    checkAbort();
+    const fetchSpec = {
+      url: spec.url,
+      method: spec.method,
+      body: spec.buildBody(payload),
+      listPath: spec.listPath,
+      totalPath: spec.totalPath ?? null,  // null 走 items-count 启发式
+      pageSize: 50,
+      maxPages: 200,
+      timeoutMs: FETCH_TIMEOUT_MS,
+    };
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runFetchInTab,
+      args: [fetchSpec],
+    });
+    if (!result || result.ok !== true) {
+      throw Object.assign(
+        new Error(`TEMU_FETCH_FAILED: ${result?.error ?? 'unknown'} (phase=${result?.phase ?? 'n/a'})`),
+        { code: 'TEMU_FETCH_FAILED', detail: result },
+      );
+    }
+
+    // 4) transform raw → task.result.rows[]
+    checkAbort();
+    let transformed;
+    try {
+      transformed = spec.transform(result.items, payload);
+    } catch (e) {
+      throw Object.assign(new Error(`TRANSFORM_FAILED: ${e.message}`), { code: 'TRANSFORM_FAILED' });
+    }
+
+    return { rawItems: result.items, transformed };
+  } finally {
+    await cleanup();
+  }
+}
+
+// 这个函数会被 chrome.scripting.executeScript 序列化注入到 tab MAIN world,
+// 不能引用外部闭包变量,所有依赖通过 args 传入。
+function runFetchInTab(fetchSpec) {
+  return (async () => {
+    try {
+      const collected = [];
+      let pageNo = 1;
+      const getPath = (obj, path) => {
+        if (!path) return undefined;
+        return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+      };
+
+      while (pageNo <= fetchSpec.maxPages) {
+        const body = { ...fetchSpec.body, pageNo, pageSize: fetchSpec.pageSize };
+        const resp = await fetch(fetchSpec.url, {
+          method: fetchSpec.method,
+          credentials: 'include',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          return { ok: false, phase: 'http', error: `HTTP ${resp.status}: ${txt.slice(0, 300)}` };
+        }
+        let data;
+        try { data = await resp.json(); }
+        catch (e) { return { ok: false, phase: 'parse', error: e.message }; }
+
+        const list = getPath(data, fetchSpec.listPath);
+        if (!Array.isArray(list)) {
+          return {
+            ok: false, phase: 'shape',
+            error: `listPath '${fetchSpec.listPath}' not array; data keys: ${Object.keys(data || {}).join(',')}`,
+          };
+        }
+        collected.push(...list);
+
+        // 分页结束判定:
+        //   a) list 空 → 已经超末页
+        //   b) totalPath 提供且我们到达 lastPage
+        //   c) totalPath 为 null,用 items.length < pageSize 启发式 (典型 server-side pagination 末页规则)
+        if (list.length === 0) break;
+        if (fetchSpec.totalPath) {
+          const total = Number(getPath(data, fetchSpec.totalPath) ?? list.length);
+          const lastPage = Math.ceil(total / fetchSpec.pageSize) || 1;
+          if (pageNo >= lastPage) break;
+        } else if (list.length < fetchSpec.pageSize) {
+          break;
+        }
+        pageNo++;
+      }
+      return { ok: true, items: collected, pages: pageNo };
+    } catch (e) {
+      return { ok: false, phase: 'unknown', error: String(e?.message ?? e) };
+    }
+  })();
+}
+
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
