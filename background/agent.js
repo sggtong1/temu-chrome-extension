@@ -167,16 +167,19 @@ function dateToEpochMs(dateStr, endOfDay) {
 }
 
 // ── kind → 实际执行的派发表 ───────────────────────────────────────
-// 现在每个 kind 都是 stub（模拟 2-5s 工作然后成功）。
-// 下一步把每个 kind 接到 service_worker 现有的 transform / collection 流程上。
+// scrape:marketing-activity 走实际 dispatch，其他 6 个 scrape:* 暂时 stub
+// submit:* 留到第三阶段
 async function dispatch(task, signal) {
   switch (task.kind) {
+    case 'scrape:marketing-activity':
+      return dispatchMarketingActivity(task, signal);
+
+    // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:activity-data':
     case 'scrape:settlement':
     case 'scrape:flux-analysis':
     case 'scrape:sales-30d':
     case 'scrape:declared-price':
-    case 'scrape:marketing-activity':
     case 'scrape:promo': {
       // TODO[wire]: 接到现有 background/service_worker.js 里的 handleStartCollection
       // 暂时返回 stub 结果，让端到端环路先通
@@ -196,6 +199,29 @@ async function dispatch(task, signal) {
     default:
       throw Object.assign(new Error(`未知 kind: ${task.kind}`), { code: 'UNKNOWN_KIND' });
   }
+}
+
+// ── scrape:marketing-activity 专用 wrapper ───────────────────────
+// 验证 payload + 走通用 hidden-tab 流水线
+async function dispatchMarketingActivity(task, signal) {
+  const payload = task.payload ?? {};
+  const required = ['mallId', 'startDate', 'endDate'];
+  for (const k of required) {
+    if (payload[k] == null || payload[k] === '') {
+      throw Object.assign(
+        new Error(`payload.${k} missing for scrape:marketing-activity (got ${JSON.stringify(payload)})`),
+        { code: 'BAD_PAYLOAD' },
+      );
+    }
+  }
+
+  const spec = KIND_TO_FETCH_SPEC['scrape:marketing-activity'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    completedAt: new Date().toISOString(),
+  };
 }
 
 // ── 通用: 后台开 hidden tab → executeScript fetch + 分页 → 关 tab ──
