@@ -281,13 +281,90 @@ async function dispatchActivityProducts(task, signal) {
   };
 }
 
-// ── 通用: 后台开 hidden tab → executeScript fetch + 分页 → 关 tab ──
-// spec: { pageUrl, apiUrlPattern, method, buildBody(payload, pageNo), listPath, totalPath, transform }
+// ── Session cache:每个 mallId 一份 captured headers ───────────────────
+// MV3 SW 在两次 task 之间(空闲 >30s)会被 chrome 终止,module-level Map 丢失。
+// 用 chrome.storage.session(in-memory,跨 SW 重启 OK,浏览器关进程才清)
+// + memory Map 双层(同次 SW 内不再异步往返)。
+const sessionCacheMem = new Map();
+const SESSION_TTL_MS = 90_000;
+const SESSION_KEY = (mallId) => `agent:session:${mallId}`;
+
+async function getCachedSession(mallId) {
+  // 1) memory L1
+  const memHit = sessionCacheMem.get(mallId);
+  if (memHit && memHit.expiresAt > Date.now()) return memHit;
+  if (memHit) sessionCacheMem.delete(mallId);
+
+  // 2) chrome.storage.session L2(persists across SW restart)
+  try {
+    const key = SESSION_KEY(mallId);
+    const stored = await chrome.storage.session.get(key);
+    const c = stored[key];
+    if (c && c.expiresAt > Date.now()) {
+      sessionCacheMem.set(mallId, c);  // backfill L1
+      return c;
+    }
+    if (c) {
+      // stale — clean up
+      await chrome.storage.session.remove(key).catch(() => {});
+    }
+  } catch (e) {
+    console.warn('[agent] storage.session get failed:', e?.message);
+  }
+  return null;
+}
+
+async function setCachedSession(mallId, headers, origin) {
+  const entry = { headers, origin, expiresAt: Date.now() + SESSION_TTL_MS };
+  sessionCacheMem.set(mallId, entry);
+  try {
+    await chrome.storage.session.set({ [SESSION_KEY(mallId)]: entry });
+  } catch (e) {
+    console.warn('[agent] storage.session set failed:', e?.message);
+  }
+}
+
+// ── 通用: 调度入口 — 先看 sessionCache,有就 SW fetch,没就开 tab capture 再缓存 ──
+// spec: { pageUrl, apiUrlPattern, method, buildBody(payload), listPath, totalPath, transform,
+//         paginationMode, pageSize, cursorOutPath, hasMorePath, cursorInKey }
 // 返回 { rawItems: [], transformed: [] }
-// 失败抛错(message 含 phase 便于排错);任何分支都保证关 tab。
 async function dispatchViaHiddenTab(spec, payload, signal) {
+  const checkAbort = () => {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+  };
+
+  const mallId = payload.mallId || 'default';
+  let session = await getCachedSession(mallId);
+
+  if (!session) {
+    console.log(`[agent ${AGENT_BUILD_ID}] session MISS mall=${mallId} — capturing via tab`);
+    checkAbort();
+    session = await captureSessionViaTab(spec, payload, signal);
+    await setCachedSession(mallId, session.headers, session.origin);
+  } else {
+    console.log(`[agent ${AGENT_BUILD_ID}] session HIT mall=${mallId} — skipping tab(SW fetch)`);
+  }
+
+  // SW 上下文分页 fetch — host_permissions + credentials:include → cookies 自动带
+  checkAbort();
+  const targetUrl = `${session.origin}${spec.apiUrlPattern}`;
+  const rawItems = await paginatedFetchInSW(spec, payload, targetUrl, session.headers, signal);
+
+  // transform
+  checkAbort();
+  let transformed;
+  try {
+    transformed = spec.transform(rawItems, payload);
+  } catch (e) {
+    throw Object.assign(new Error(`TRANSFORM_FAILED: ${e.message}`), { code: 'TRANSFORM_FAILED' });
+  }
+  return { rawItems, transformed };
+}
+
+// ── 第一次:开 tab → 等 page 自然发请求 → Request Proxy 捕获 headers → 关 tab ──
+// 返回 { headers, origin }
+async function captureSessionViaTab(spec, payload, signal) {
   const TAB_LOAD_TIMEOUT_MS = 30_000;
-  const FETCH_TIMEOUT_MS = 5 * 60_000;
   const CAPTURE_TIMEOUT_MS = 30_000;
 
   let tabId = null;
@@ -302,28 +379,17 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       tabId = null;
     }
   };
-  const checkAbort = () => {
-    if (signal?.aborted) {
-      throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
-    }
-  };
 
   try {
-    // 1) 在前台开 tab(active:true)—— Chrome 对后台 tab 有 setTimeout 1Hz 节流,
-    //    我们的 capture-poll 循环会被卡到分钟级。前台 tab 没节流,~10s 完成。
-    //    用户会看到一个 Temu tab 短暂闪过然后自动关闭,可接受。
-    //    pageUrl 可以是字符串或 (payload) => string 的函数(activity-products 需要带 payload 参数算)。
-    checkAbort();
     const resolvedPageUrl = typeof spec.pageUrl === 'function' ? spec.pageUrl(payload) : spec.pageUrl;
     const tab = await chrome.tabs.create({ url: resolvedPageUrl, active: true, pinned: false });
     tabId = tab.id;
 
-    // 2) wait for tab to finish loading (tabs.onUpdated complete; poll fallback)
+    // 等 tab 加载完
     await new Promise((resolve, reject) => {
       const startedAt = Date.now();
-      onUpdatedListener = (updatedTabId, changeInfo) => {
-        if (updatedTabId !== tabId) return;
-        if (changeInfo.status === 'complete') resolve();
+      onUpdatedListener = (uTabId, changeInfo) => {
+        if (uTabId === tabId && changeInfo.status === 'complete') resolve();
       };
       chrome.tabs.onUpdated.addListener(onUpdatedListener);
       const poll = setInterval(async () => {
@@ -342,62 +408,174 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       onUpdatedListener = null;
     }
 
-    // 3) executeScript: capture page's outgoing request → replay with our pagination
-    checkAbort();
-    const fetchSpec = {
-      apiUrlPattern: spec.apiUrlPattern,
-      method: spec.method,
-      bodyTemplate: spec.buildBody(payload),
-      listPath: spec.listPath,
-      totalPath: spec.totalPath ?? null,
-      // pagination
-      paginationMode: spec.paginationMode ?? 'pageNo',
-      pageSize: spec.pageSize ?? 50,
-      // scroll-mode 字段(pageNo-mode 时这些被忽略)
-      cursorOutPath: spec.cursorOutPath ?? null,
-      hasMorePath: spec.hasMorePath ?? null,
-      cursorInKey: spec.cursorInKey ?? 'scrollContext',
-      maxPages: 200,
-      timeoutMs: FETCH_TIMEOUT_MS,
-      captureTimeoutMs: CAPTURE_TIMEOUT_MS,
-    };
+    // executeScript:只捕 headers,不 fetch(fetch 移到 SW 上下文)
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: runFetchInTab,
-      args: [fetchSpec],
+      func: captureHeadersInTab,
+      args: [{
+        apiUrlPattern: spec.apiUrlPattern,
+        captureTimeoutMs: CAPTURE_TIMEOUT_MS,
+      }],
     });
     if (!result || result.ok !== true) {
       throw Object.assign(
-        new Error(`TEMU_FETCH_FAILED: ${result?.error ?? 'unknown'} (phase=${result?.phase ?? 'n/a'})`),
-        { code: 'TEMU_FETCH_FAILED', detail: result },
+        new Error(`CAPTURE_FAILED: ${result?.error ?? 'unknown'} (phase=${result?.phase ?? 'n/a'})`),
+        { code: 'CAPTURE_FAILED', detail: result },
       );
     }
-
-    // 4) transform raw → task.result.rows[]
-    checkAbort();
-    let transformed;
-    try {
-      transformed = spec.transform(result.items, payload);
-    } catch (e) {
-      throw Object.assign(new Error(`TRANSFORM_FAILED: ${e.message}`), { code: 'TRANSFORM_FAILED' });
-    }
-
-    return { rawItems: result.items, transformed };
+    return { headers: result.headers, origin: result.origin };
   } finally {
     await cleanup();
   }
 }
 
+// SW 上下文分页 fetch — 用 captured headers 直接 fetch,host_permissions 保证 cookies 带上
+async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
+  const checkAbort = () => {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+  };
+  const headers = { ...capturedHeaders, 'content-type': 'application/json' };
+  const bodyTemplate = spec.buildBody(payload);
+  const mode = spec.paginationMode ?? 'pageNo';
+  const pageSize = spec.pageSize ?? 50;
+  const maxPages = 200;
+  const collected = [];
+  const getPath = (obj, path) => {
+    if (!path) return undefined;
+    return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+  };
+
+  let pageNo = 1;
+  let cursor = null;
+  let iter = 0;
+
+  while (iter < maxPages) {
+    checkAbort();
+    let body;
+    if (mode === 'scroll') {
+      body = { ...bodyTemplate };
+      if (cursor) body[spec.cursorInKey ?? 'scrollContext'] = cursor;
+    } else {
+      body = { ...bodyTemplate, pageNo, pageSize };
+    }
+
+    const resp = await fetch(url, {
+      method: spec.method,
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw Object.assign(
+        new Error(`TEMU_FETCH_FAILED: HTTP ${resp.status}: ${txt.slice(0, 300)}`),
+        { code: 'TEMU_FETCH_FAILED' },
+      );
+    }
+    let data;
+    try { data = await resp.json(); }
+    catch (e) { throw Object.assign(new Error(`PARSE_FAILED: ${e.message}`), { code: 'PARSE_FAILED' }); }
+
+    const list = getPath(data, spec.listPath);
+    if (!Array.isArray(list)) {
+      throw Object.assign(
+        new Error(`SHAPE_BAD: listPath '${spec.listPath}' not array; keys: ${Object.keys(data || {}).join(',')}`),
+        { code: 'SHAPE_BAD' },
+      );
+    }
+    collected.push(...list);
+
+    if (mode === 'scroll') {
+      if (!getPath(data, spec.hasMorePath)) break;
+      cursor = getPath(data, spec.cursorOutPath);
+      if (!cursor) break;
+    } else {
+      if (list.length === 0) break;
+      if (spec.totalPath) {
+        const total = Number(getPath(data, spec.totalPath) ?? list.length);
+        const lastPage = Math.ceil(total / pageSize) || 1;
+        if (pageNo >= lastPage) break;
+      } else if (list.length < pageSize) {
+        break;
+      }
+      pageNo++;
+    }
+    iter++;
+  }
+  return collected;
+}
+
 // 这个函数会被 chrome.scripting.executeScript 序列化注入到 tab MAIN world,
 // 不能引用外部闭包变量,所有依赖通过 args 传入。
 //
+// 职责: ONLY capture headers — 不再分页 fetch(那个移到 SW 端 paginatedFetchInSW)。
+//
 // 流程:
-//   1. Patch Request 构造器 — page 后续发起的所有 fetch 都会经过这个 proxy,
-//      命中 apiUrlPattern 时抓 URL+headers(含 anti-content / mallid / content-type)
-//   2. 等 page 自己发请求把 captured 填充(初始挂载 fetch / SPA 路由切换 / 手动 click)
-//      —— 2s 内没捕获就尝试 click 一个 nav tab 强制触发刷新
-//   3. 用 captured.headers 做我们自己的分页 fetch,bodyTemplate 覆盖 pageNo
+//   1. Patch Request 构造器 — page 后续发起的所有 fetch 都会经过这个 proxy
+//   2. 命中 apiUrlPattern 时抓 URL+headers(含 anti-content / mallid / content-type)
+//   3. 2s 内没捕获就尝试 click 一个 nav tab 强制触发刷新
+//   4. 拿到 captured 后立即返回(SW 端会关 tab)
+function captureHeadersInTab(spec) {
+  return (async () => {
+    try {
+      const captured = { resolved: false, url: null, headers: null, refreshTry: 0 };
+      const ReqOrig = window.Request;
+      window.Request = new Proxy(ReqOrig, {
+        construct(target, args) {
+          const inst = new target(...args);
+          try {
+            if (!captured.resolved && typeof inst.url === 'string' && inst.url.includes(spec.apiUrlPattern)) {
+              const h = {};
+              inst.headers.forEach((v, k) => { h[k] = v; });
+              captured.url = inst.url;
+              captured.headers = h;
+              captured.resolved = true;
+            }
+          } catch {}
+          return inst;
+        }
+      });
+
+      const startedAt = Date.now();
+      while (!captured.resolved) {
+        if (Date.now() - startedAt > spec.captureTimeoutMs) {
+          return {
+            ok: false,
+            phase: 'capture-timeout',
+            error: `page never called ${spec.apiUrlPattern} within ${spec.captureTimeoutMs}ms`,
+          };
+        }
+        // 2s 还没捕获就 click 个 nav tab 强制 SPA 重渲染
+        if (Date.now() - startedAt > 2000 && captured.refreshTry === 0) {
+          captured.refreshTry++;
+          try {
+            const candidates = Array.from(document.querySelectorAll('a, [role="tab"], button'));
+            const target = candidates.find(el => {
+              const t = (el.textContent || '').trim();
+              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品';
+            });
+            if (target) target.click();
+          } catch {}
+        }
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      // 解析 origin —— SW 后续会用 origin + 不同 apiUrlPattern 拼新 URL 复用 headers
+      let origin;
+      try {
+        origin = new URL(captured.url).origin;
+      } catch {
+        origin = 'https://agentseller.temu.com';  // fallback
+      }
+      return { ok: true, origin, headers: captured.headers, capturedUrl: captured.url };
+    } catch (e) {
+      return { ok: false, phase: 'unknown', error: String(e?.message ?? e) };
+    }
+  })();
+}
+
+// 旧版 runFetchInTab 已不再使用(SW 端接管分页 fetch),保留 stub 兼容性避免外部 import 报错
 function runFetchInTab(fetchSpec) {
   return (async () => {
     try {
