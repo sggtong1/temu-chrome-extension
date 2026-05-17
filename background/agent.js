@@ -17,6 +17,7 @@
 // ────────────────────────────────────────────────────────────────────
 
 import { transformAvailableActivities, transformActivityProducts } from './transform/activity_transform.js';
+import { transformSales30dResponse } from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -187,7 +188,19 @@ const KIND_TO_FETCH_SPEC = {
     listPath: 'result.matchList',
     transform: (rawItems) => transformActivityProducts(rawItems),
   },
-  // 其他 5 个 scrape:* kind 由后续 plan 添加
+  // scrape:sales-30d — 近 30 天销量 + 库存(全托管 SKU 级 snapshot)
+  'scrape:sales-30d': {
+    pageUrl: 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
+    apiUrlPattern: '/mms/venom/api/supplier/sales/management/listOverall',
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    buildBody: (_payload) => ({ isLack: 0 }),     // runFetchInTab 注入 pageNo+pageSize
+    listPath: 'result.subOrderList',
+    totalPath: 'result.total',
+    transform: (rawItems) => transformSales30dResponse(rawItems),
+  },
+  // 其他 4 个 scrape:* kind 由后续 plan 添加
 };
 
 // ── kind → 实际执行的派发表 ───────────────────────────────────────
@@ -204,11 +217,14 @@ async function dispatch(task, signal) {
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityProducts (REAL path)`);
       return dispatchActivityProducts(task, signal);
 
+    case 'scrape:sales-30d':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchSales30d (REAL path)`);
+      return dispatchSales30d(task, signal);
+
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:activity-data':
     case 'scrape:settlement':
     case 'scrape:flux-analysis':
-    case 'scrape:sales-30d':
     case 'scrape:declared-price':
     case 'scrape:promo': {
       console.log(`[agent ${AGENT_BUILD_ID}] → 走 stub branch`);
@@ -276,6 +292,27 @@ async function dispatchActivityProducts(task, signal) {
     rows: transformed,
     rawCount: rawItems.length,
     activityId: payload.activityId,  // 透传给 ingester,免去二次 lookup
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:sales-30d 专用 wrapper ────────────────────────────────
+// 任务语义:全托管 SKU 级近 30 天销量 + 库存 snapshot。落到 ShopSkuSnapshot。
+// payload: { mallId } — 其他都不必要(API 内部按 mallid header 隔离店铺)
+async function dispatchSales30d(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:sales-30d (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };

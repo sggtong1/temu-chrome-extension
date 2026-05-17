@@ -209,3 +209,59 @@ export function buildSkuRows(ctx, { skuSales, skuPrices, skuSpuMap }, ordersShip
   }
   return rows;
 }
+
+/**
+ * Maps /mms/venom/api/supplier/sales/management/listOverall response →
+ * rows aligned with duoshou-erp ShopSkuSnapshot table.
+ *
+ * Input rawItems = result.subOrderList[] — each item is a SPU with parent
+ * fields (productId/productName/productSkcId) and skuQuantityDetailList[].
+ * Output: one row per SKU (productSkuId).
+ */
+export function transformSales30dResponse(rawItems) {
+  const rows = [];
+  for (const item of rawItems) {
+    const productName = item?.productName ?? null;
+    const productSkcId = item?.productSkcId != null ? String(item.productSkcId) : null;
+    const productId    = item?.productId    != null ? String(item.productId)    : null;
+    const skus = Array.isArray(item?.skuQuantityDetailList) ? item.skuQuantityDetailList : [];
+
+    for (const sku of skus) {
+      if (sku?.productSkuId == null) continue;
+      const inv = sku.inventoryNumInfo ?? {};
+      rows.push({
+        platformSkuId: String(sku.productSkuId),
+        productName,
+        className: sku.className ?? null,
+        skuExtCode: sku.skuExtCode ?? null,
+
+        todaySaleVolume: sku.todaySaleVolume ?? 0,
+        sales7dVolume:   sku.lastSevenDaysSaleVolume ?? 0,
+        sales30dVolume:  sku.lastThirtyDaysSaleVolume ?? 0,
+        totalSaleVolume: sku.totalSaleVolume ?? 0,
+
+        warehouseQty:    inv.warehouseInventoryNum ?? 0,
+        waitReceiveQty:  inv.waitReceiveNum ?? 0,
+        waitOnShelfQty:  inv.waitOnShelfNum ?? 0,
+        waitDeliveryQty: inv.waitDeliveryInventoryNum ?? 0,
+
+        // 平均日销 = 30d 销量 / 30(快算)
+        avgDailySales: (sku.lastThirtyDaysSaleVolume ?? 0) / 30,
+        // 可售天数(Temu 已算好)
+        daysRemaining: sku.availableSaleDays ?? null,
+
+        // supplierPrice 是分(CNY × 100)
+        supplierPriceCents: typeof sku.supplierPrice === 'number' ? sku.supplierPrice : null,
+
+        // 留 平台原对象用于后续扩展(如 purchase label / safe-inventory days)
+        platformPayload: {
+          sku,
+          parent: { productId, productSkcId, productName },
+        },
+      });
+    }
+  }
+  console.log(`[temu] transformSales30dResponse: ${rawItems.length} SPUs → ${rows.length} SKU rows`);
+  return rows;
+}
+
