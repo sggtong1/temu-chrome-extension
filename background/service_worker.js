@@ -3,6 +3,12 @@ import { transformListResponse, transformSemiUsListResponse } from './transform/
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
 import { transformActivityResponse } from './transform/activity_transform.js';
+import { startAgent, attachMessageHandlers as attachAgentHandlers } from './agent.js';
+
+// 启动派单中枢（chrome.alarms 周期长轮询 ERP /api/agent/tasks）
+// 注意：放在文件顶部，避免被后面的 onMessage 监听器抢先注册路由
+startAgent();
+attachAgentHandlers();
 
 // ── Dev-mode auto-reload ────────────────────────────────────────────────────
 // Polls dev-reload.json (written by dev-watch.mjs) and reloads the extension
@@ -153,7 +159,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleExportReport(msg).then(sendResponse);
     return true;
   }
+  if (msg.type === 'AGENT_CHECK_COOKIES') {
+    handleCheckCookies().then(sendResponse);
+    return true;
+  }
 });
+
+// ── Cookie 健康检查 ─────────────────────────────────────────────────────────
+// 检测 Temu 各子域是否已登录（cookie 存在 + 未过期 + 包含已知 session 字段）
+// 用于 popup / floating panel 的 "在线情况" 显示。
+const TEMU_DOMAINS = [
+  { key: 'global', label: '全球', url: 'https://agentseller.temu.com',     gateway: 'agentseller.temu.com' },
+  { key: 'us',     label: '美区', url: 'https://agentseller-us.temu.com',  gateway: 'agentseller-us.temu.com' },
+  { key: 'eu',     label: '欧区', url: 'https://agentseller-eu.temu.com',  gateway: 'agentseller-eu.temu.com' },
+  { key: 'kjmh',   label: '跨境卖家', url: 'https://seller.kuajingmaihuo.com', gateway: 'seller.kuajingmaihuo.com' },
+];
+
+// Temu 登录态常见 cookie key（不同子域略不同，做 OR 判断）
+const SESSION_COOKIE_HINTS = [
+  'mallid', 'mallid_cookies', 'mallId',
+  'sessionUid', 'sessionUid_cookies',
+  'user_uin', 'userUin',
+  'is_logined', 'login_state',
+  'PASS_ID',
+];
+
+async function handleCheckCookies() {
+  const out = [];
+  for (const d of TEMU_DOMAINS) {
+    try {
+      const cookies = await chrome.cookies.getAll({ url: d.url });
+      const total = cookies.length;
+      const hasSession = cookies.some((c) =>
+        SESSION_COOKIE_HINTS.some((k) => c.name.toLowerCase() === k.toLowerCase())
+      );
+      // 取最新的过期时间作为"最近登录"提示
+      const latest = cookies
+        .filter((c) => c.expirationDate)
+        .map((c) => c.expirationDate)
+        .sort((a, b) => b - a)[0];
+      const expiresAt = latest ? new Date(latest * 1000).toISOString() : null;
+      out.push({
+        key: d.key,
+        label: d.label,
+        gateway: d.gateway,
+        url: d.url,
+        cookieCount: total,
+        hasSession,
+        // 状态：ok = 有 session / partial = 有 cookie 没 session / off = 没 cookie
+        status: hasSession ? 'ok' : total > 0 ? 'partial' : 'off',
+        expiresAt,
+      });
+    } catch (e) {
+      out.push({
+        key: d.key,
+        label: d.label,
+        gateway: d.gateway,
+        url: d.url,
+        cookieCount: 0,
+        hasSession: false,
+        status: 'error',
+        error: e?.message ?? String(e),
+      });
+    }
+  }
+  return { domains: out, checkedAt: new Date().toISOString() };
+}
 
 async function handleExportReport({ startDate, endDate, shopName }) {
   const { apiUrl } = await chrome.storage.local.get(['apiUrl']);

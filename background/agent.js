@@ -16,13 +16,28 @@
 //   selectedShopIds     限定派单到这些店铺（null = 不限）
 // ────────────────────────────────────────────────────────────────────
 
-import { transformActivityResponse } from './transform/activity_transform.js';
+import { transformAvailableActivities } from './transform/activity_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
 const CLAIM_LIMIT      = 3;       // 每次最多领 3 个
 const LEASE_SECONDS    = 300;     // 5min 租约
 const ALARM_NAME       = 'agent-poll';
+
+// Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
+// It is written into logs and successful task results, so we can prove which
+// evaluated module, not just which fetched source file, handled a task.
+const AGENT_BUILD_ID   = 'agent-real-marketing-20260517a';
+const AGENT_IMPORT_URL = import.meta.url;
+
+function agentDiag() {
+  return {
+    buildId: AGENT_BUILD_ID,
+    importUrl: AGENT_IMPORT_URL,
+    extensionId: chrome.runtime?.id ?? null,
+    manifestVersion: chrome.runtime?.getManifest?.().version ?? null,
+  };
+}
 
 // 正在执行的 task: taskId → { heartbeatTimer, abort }
 const _running = new Map();
@@ -115,7 +130,7 @@ async function executeTask(task, pluginInstanceId) {
     await reportResult(task.id, pluginInstanceId, {
       status: 'failed',
       errorCode: e.code || 'UNKNOWN',
-      errorMessage: String(e.message || e).slice(0, 1500),
+      errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
     });
     console.error(`[agent] ✗ ${task.id.slice(0, 8)}:`, e.message);
   } finally {
@@ -125,53 +140,42 @@ async function executeTask(task, pluginInstanceId) {
 }
 
 // ── 每个 scrape:* kind 对应的 fetch + transform 配置 ─────────────
-// 由 dispatchViaHiddenTab 在 hidden Temu tab 里 same-origin 发请求,
-// 拿到 raw Temu rows → 用 transform 转成 SKU × 日期 的 task.result.rows[].
+// dispatchViaHiddenTab 在 page same-origin 上下文跑:
+//   1. 打开 pageUrl  → page 自然发起对 apiUrlPattern 的请求
+//   2. Request 构造器 proxy 捕获那个请求的 headers(含 anti-content + mallid + content-type)
+//   3. 用同一组 headers 自己分页发 fetch,buildBody(payload, pageNo) 控制每页 body
+// raw rows → transform → task.result.rows[](Activity 主表 schema)
 const KIND_TO_FETCH_SPEC = {
   'scrape:marketing-activity': {
-    url: 'https://agentseller.temu.com/api/kiana/gamblers/marketing/enroll/list',
+    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity',
+    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
     method: 'POST',
-    // buildBody 接收 task.payload,返回要 JSON.stringify 的 request body。
-    // dispatch 在分页时会 override pageNo + pageSize。
-    buildBody: (payload) => ({
-      pageNo: 1,
-      pageSize: 50,
-      sessionStartTimeFrom: dateToEpochMs(payload.startDate, /* endOfDay */ false),
-      sessionEndTimeTo:     dateToEpochMs(payload.endDate,   /* endOfDay */ true),
-      sessionStatus: 2,
-    }),
-    // 响应里取 list 数组的 path; total 无显式字段,runFetchInTab 用 items.length < pageSize 判断
-    listPath: 'list',
-    totalPath: null,
-    // raw rows → task.result.rows[] 的 transform
-    // transformActivityResponse 期待 rawData.result.list (inspected from activity_transform.js:65)
+    // body 极简 — Temu 服务端不需要日期筛选,返回全部可报名活动
+    buildBody: (_payload, pageNo) => ({ pageNo, pageSize: 50 }),
+    listPath: 'result.activityList',
+    totalPath: 'result.total',
+    // raw activityList → Activity 主表行(把 thematicList 展平,每个 thematic 一行)
     transform: (rawItems, payload) =>
-      transformActivityResponse(
-        { result: { list: rawItems } },
+      transformAvailableActivities(
+        { result: { activityList: rawItems } },
         {
           shopName: payload.shopName ?? `mall${payload.mallId}`,
-          startDate: payload.startDate,
-          endDate: payload.endDate,
+          mallId: payload.mallId,
+          region: payload.region,
         },
       ),
   },
   // 其他 6 个 scrape:* kind 由后续 plan 添加
 };
 
-// helper: 'YYYY-MM-DD' → epoch ms (local timezone 起算; Temu API 使用 PT 但全球 cookie 共享, 容差 ok)
-function dateToEpochMs(dateStr, endOfDay) {
-  const [y, m, d] = dateStr.split('-').map(Number);
-  return endOfDay
-    ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
-    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
-}
-
 // ── kind → 实际执行的派发表 ───────────────────────────────────────
 // scrape:marketing-activity 走实际 dispatch，其他 6 个 scrape:* 暂时 stub
 // submit:* 留到第三阶段
 async function dispatch(task, signal) {
+  console.log(`[agent ${AGENT_BUILD_ID}] dispatch(kind=${task.kind}) url=${AGENT_IMPORT_URL}`);
   switch (task.kind) {
     case 'scrape:marketing-activity':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchMarketingActivity (REAL path)`);
       return dispatchMarketingActivity(task, signal);
 
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
@@ -181,6 +185,7 @@ async function dispatch(task, signal) {
     case 'scrape:sales-30d':
     case 'scrape:declared-price':
     case 'scrape:promo': {
+      console.log(`[agent ${AGENT_BUILD_ID}] → 走 stub branch`);
       // TODO[wire]: 接到现有 background/service_worker.js 里的 handleStartCollection
       // 暂时返回 stub 结果，让端到端环路先通
       await sleep(2000 + Math.random() * 3000, signal);
@@ -190,6 +195,7 @@ async function dispatch(task, signal) {
         shopId: task.shop_id,
         payload: task.payload,
         completedAt: new Date().toISOString(),
+        agent: agentDiag(),
       };
     }
     case 'submit:activity-enroll':
@@ -202,17 +208,15 @@ async function dispatch(task, signal) {
 }
 
 // ── scrape:marketing-activity 专用 wrapper ───────────────────────
-// 验证 payload + 走通用 hidden-tab 流水线
+// 任务语义:抓"可报名活动列表"(Activity 主表),不是已报名记录。
+// 只要 mallId 即可定位 hidden tab 用哪个店登录态;region 仅作 transform 的元信息透传。
 async function dispatchMarketingActivity(task, signal) {
   const payload = task.payload ?? {};
-  const required = ['mallId', 'startDate', 'endDate'];
-  for (const k of required) {
-    if (payload[k] == null || payload[k] === '') {
-      throw Object.assign(
-        new Error(`payload.${k} missing for scrape:marketing-activity (got ${JSON.stringify(payload)})`),
-        { code: 'BAD_PAYLOAD' },
-      );
-    }
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:marketing-activity (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
   }
 
   const spec = KIND_TO_FETCH_SPEC['scrape:marketing-activity'];
@@ -221,17 +225,18 @@ async function dispatchMarketingActivity(task, signal) {
     rows: transformed,
     rawCount: rawItems.length,
     completedAt: new Date().toISOString(),
+    agent: agentDiag(),
   };
 }
 
 // ── 通用: 后台开 hidden tab → executeScript fetch + 分页 → 关 tab ──
-// spec: { url, method, buildBody(payload), listPath, totalPath (可为 null), transform }
+// spec: { pageUrl, apiUrlPattern, method, buildBody(payload, pageNo), listPath, totalPath, transform }
 // 返回 { rawItems: [], transformed: [] }
 // 失败抛错(message 含 phase 便于排错);任何分支都保证关 tab。
 async function dispatchViaHiddenTab(spec, payload, signal) {
   const TAB_LOAD_TIMEOUT_MS = 30_000;
   const FETCH_TIMEOUT_MS = 5 * 60_000;
-  const NEUTRAL_URL = 'https://agentseller.temu.com/';
+  const CAPTURE_TIMEOUT_MS = 30_000;
 
   let tabId = null;
   let onUpdatedListener = null;
@@ -252,9 +257,11 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
   };
 
   try {
-    // 1) create hidden tab
+    // 1) 在前台开 tab(active:true)—— Chrome 对后台 tab 有 setTimeout 1Hz 节流,
+    //    我们的 capture-poll 循环会被卡到分钟级。前台 tab 没节流,~10s 完成。
+    //    用户会看到一个 Temu tab 短暂闪过然后自动关闭,可接受。
     checkAbort();
-    const tab = await chrome.tabs.create({ url: NEUTRAL_URL, active: false, pinned: false });
+    const tab = await chrome.tabs.create({ url: spec.pageUrl, active: true, pinned: false });
     tabId = tab.id;
 
     // 2) wait for tab to finish loading (tabs.onUpdated complete; poll fallback)
@@ -281,17 +288,18 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       onUpdatedListener = null;
     }
 
-    // 3) executeScript: run fetch + pagination in MAIN world same-origin
+    // 3) executeScript: capture page's outgoing request → replay with our pagination
     checkAbort();
     const fetchSpec = {
-      url: spec.url,
+      apiUrlPattern: spec.apiUrlPattern,
       method: spec.method,
-      body: spec.buildBody(payload),
+      bodyTemplate: spec.buildBody(payload, 1),  // 第一页 body 作为模板;runFetchInTab 每页覆盖 pageNo
       listPath: spec.listPath,
-      totalPath: spec.totalPath ?? null,  // null 走 items-count 启发式
+      totalPath: spec.totalPath ?? null,
       pageSize: 50,
       maxPages: 200,
       timeoutMs: FETCH_TIMEOUT_MS,
+      captureTimeoutMs: CAPTURE_TIMEOUT_MS,
     };
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -323,9 +331,62 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
 
 // 这个函数会被 chrome.scripting.executeScript 序列化注入到 tab MAIN world,
 // 不能引用外部闭包变量,所有依赖通过 args 传入。
+//
+// 流程:
+//   1. Patch Request 构造器 — page 后续发起的所有 fetch 都会经过这个 proxy,
+//      命中 apiUrlPattern 时抓 URL+headers(含 anti-content / mallid / content-type)
+//   2. 等 page 自己发请求把 captured 填充(初始挂载 fetch / SPA 路由切换 / 手动 click)
+//      —— 2s 内没捕获就尝试 click 一个 nav tab 强制触发刷新
+//   3. 用 captured.headers 做我们自己的分页 fetch,bodyTemplate 覆盖 pageNo
 function runFetchInTab(fetchSpec) {
   return (async () => {
     try {
+      const captured = { resolved: false, url: null, headers: null, refreshTry: 0 };
+      const ReqOrig = window.Request;
+      window.Request = new Proxy(ReqOrig, {
+        construct(target, args) {
+          const inst = new target(...args);
+          try {
+            if (!captured.resolved && typeof inst.url === 'string' && inst.url.includes(fetchSpec.apiUrlPattern)) {
+              const h = {};
+              inst.headers.forEach((v, k) => { h[k] = v; });
+              captured.url = inst.url;
+              captured.headers = h;
+              captured.resolved = true;
+            }
+          } catch {}
+          return inst;
+        }
+      });
+
+      // 等捕获,带主动触发 fallback
+      const startedAt = Date.now();
+      while (!captured.resolved) {
+        if (Date.now() - startedAt > fetchSpec.captureTimeoutMs) {
+          return {
+            ok: false,
+            phase: 'capture-timeout',
+            error: `page never called ${fetchSpec.apiUrlPattern} within ${fetchSpec.captureTimeoutMs}ms`,
+          };
+        }
+        // 2s 还没捕获:可能是 inject 晚于 page 首次 fetch,主动 click 一个 nav tab 强制 SPA 重渲染
+        if (Date.now() - startedAt > 2000 && captured.refreshTry === 0) {
+          captured.refreshTry++;
+          try {
+            const candidates = Array.from(document.querySelectorAll('a, [role="tab"], button'));
+            const target = candidates.find(el => {
+              const t = (el.textContent || '').trim();
+              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品';
+            });
+            if (target) target.click();
+          } catch {}
+        }
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      // 用借来的 headers 自己分页
+      const headers = { ...captured.headers, 'content-type': 'application/json' };
+      const url = captured.url;
       const collected = [];
       let pageNo = 1;
       const getPath = (obj, path) => {
@@ -334,11 +395,11 @@ function runFetchInTab(fetchSpec) {
       };
 
       while (pageNo <= fetchSpec.maxPages) {
-        const body = { ...fetchSpec.body, pageNo, pageSize: fetchSpec.pageSize };
-        const resp = await fetch(fetchSpec.url, {
+        const body = { ...fetchSpec.bodyTemplate, pageNo, pageSize: fetchSpec.pageSize };
+        const resp = await fetch(url, {
           method: fetchSpec.method,
           credentials: 'include',
-          headers: { 'content-type': 'application/json' },
+          headers,
           body: JSON.stringify(body),
         });
         if (!resp.ok) {
@@ -353,15 +414,12 @@ function runFetchInTab(fetchSpec) {
         if (!Array.isArray(list)) {
           return {
             ok: false, phase: 'shape',
-            error: `listPath '${fetchSpec.listPath}' not array; data keys: ${Object.keys(data || {}).join(',')}`,
+            error: `listPath '${fetchSpec.listPath}' not array; keys: ${Object.keys(data || {}).join(',')}`,
           };
         }
         collected.push(...list);
 
-        // 分页结束判定:
-        //   a) list 空 → 已经超末页
-        //   b) totalPath 提供且我们到达 lastPage
-        //   c) totalPath 为 null,用 items.length < pageSize 启发式 (典型 server-side pagination 末页规则)
+        // 分页结束判定
         if (list.length === 0) break;
         if (fetchSpec.totalPath) {
           const total = Number(getPath(data, fetchSpec.totalPath) ?? list.length);
@@ -412,7 +470,9 @@ async function sendHeartbeat(taskId, pluginInstanceId) {
 
 // ── 启动 ─────────────────────────────────────────────────────────
 export function startAgent() {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_PERIOD_MIN });
+  Promise.resolve(chrome.alarms.clear(ALARM_NAME))
+    .catch(() => {})
+    .finally(() => chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_PERIOD_MIN }));
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ALARM_NAME) {
       pollOnce().catch((e) => console.error('[agent] poll err:', e));
@@ -420,12 +480,30 @@ export function startAgent() {
   });
   // Service worker 唤醒后立刻拉一次（不必等下个 alarm 周期）
   pollOnce().catch(() => {});
-  console.log(`[agent] 已启动，每 ${POLL_PERIOD_MIN * 60}s 拉一次任务`);
+  console.log(`[agent ${AGENT_BUILD_ID}] 已启动，每 ${POLL_PERIOD_MIN * 60}s 拉一次任务 url=${AGENT_IMPORT_URL}`);
 }
 
 // 让 popup 通过 message 强制立刻拉一次
 export function attachMessageHandlers() {
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.type === 'AGENT_DIAG') {
+      Promise.all([
+        chrome.alarms.getAll().catch(() => []),
+        chrome.storage.local.get(['apiUrl', 'pluginInstanceId', 'selectedShopIds']).catch(() => ({})),
+      ]).then(([alarms, cfg]) => {
+        sendResponse({
+          ok: true,
+          ...agentDiag(),
+          alarms,
+          config: {
+            apiUrl: cfg.apiUrl ?? null,
+            pluginInstanceId: cfg.pluginInstanceId ? `${String(cfg.pluginInstanceId).slice(0, 8)}...` : null,
+            selectedShopIds: cfg.selectedShopIds ?? null,
+          },
+        });
+      }).catch((e) => sendResponse({ ok: false, error: e.message, ...agentDiag() }));
+      return true;
+    }
     if (msg.type === 'AGENT_PULL_NOW') {
       pollOnce().then(() => sendResponse({ ok: true })).catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;

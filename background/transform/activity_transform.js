@@ -127,3 +127,69 @@ export function transformActivityResponse(rawData, { shopName, startDate, endDat
   console.log(`[temu] activity_transform: ${activities.length} activities → ${rows.length} rows`);
   return rows;
 }
+
+/**
+ * Maps raw enroll/activity/list response → Activity 主表行(duoshou-erp ActivityTable).
+ * API: /api/kiana/gamblers/marketing/enroll/activity/list
+ *
+ * Temu 返回两级嵌套:
+ *   Level 1: 顶层 activity 大类(由 activityType 数字枚举标识,只有 ~10 种,
+ *           如 27=清仓甩卖 / 1=限时秒杀 / 5=官方大促)。
+ *   Level 2: thematicList[] = 具体可报名场次(activityThematicId 16位数字 unique)。
+ *           带具体的 startTime/endTime/enrollStartAt/enrollDeadLine/discount/stock 门槛等。
+ *
+ * 展开规则:
+ *   - thematicList 非空:展平,每个 thematic 一行 → platformActivityId = String(thematic.activityThematicId)
+ *   - thematicList 为空(如"清仓甩卖"自己就是顶层): 顶层做一行 → platformActivityId = `type-${activityType}`
+ *
+ * 输出字段对应 duoshou-erp `Activity` 表(apps/api/prisma/schema.prisma model Activity)。
+ */
+export function transformAvailableActivities(rawData, { shopName, mallId, region }) {
+  const activities = rawData?.result?.activityList ?? [];
+  const rows = [];
+  const msToIso = (ms) => (ms ? new Date(ms).toISOString() : null);
+
+  for (const act of activities) {
+    const parentName = act.activityName ?? null;
+    const parentType = act.activityType;  // numeric enum
+
+    const thematics = Array.isArray(act.thematicList) ? act.thematicList : [];
+
+    if (thematics.length > 0) {
+      for (const t of thematics) {
+        const tid = t.activityThematicId;
+        if (tid == null) continue;
+        rows.push({
+          platformActivityId: String(tid),
+          title: t.activityThematicName ?? parentName,
+          activityType: parentName,
+          startAt: msToIso(t.startTime ?? t.sessionStartTime),
+          endAt:   msToIso(t.endTime   ?? t.sessionEndTime),
+          enrollStartAt: msToIso(t.enrollStartAt ?? t.enrollStartTime),
+          enrollEndAt:   msToIso(t.enrollDeadLine ?? t.enrollEndTime),
+          shopName,
+          mallId,
+          region,
+          platformPayload: t,
+        });
+      }
+    } else {
+      rows.push({
+        platformActivityId: `type-${parentType}`,
+        title: parentName,
+        activityType: parentName,
+        startAt: msToIso(act.sessionStartTime),
+        endAt:   msToIso(act.sessionEndTime),
+        enrollStartAt: msToIso(act.autoAssignStartTime),
+        enrollEndAt:   msToIso(act.autoAssignEndTime),
+        shopName,
+        mallId,
+        region,
+        platformPayload: act,
+      });
+    }
+  }
+
+  console.log(`[temu] transformAvailableActivities: ${activities.length} top-level → ${rows.length} rows`);
+  return rows;
+}
