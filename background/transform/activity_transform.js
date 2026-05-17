@@ -193,3 +193,31 @@ export function transformAvailableActivities(rawData, { shopName, mallId, region
   console.log(`[temu] transformAvailableActivities: ${activities.length} top-level → ${rows.length} rows`);
   return rows;
 }
+
+/**
+ * Maps raw /enroll/scroll/match response → ActivityProduct table rows.
+ *
+ * One row = one Temu SPU (productId). skcList/skuList full tree stays as JSON
+ * (v1 — see prisma model ActivityProduct comment for v2 SKU-flat alternative).
+ */
+export function transformActivityProducts(rawItems) {
+  const rows = [];
+  for (const item of rawItems) {
+    const pid = item?.productId;
+    if (pid == null) continue;
+    rows.push({
+      platformProductId: String(pid),
+      productName: item.productName ?? null,
+      pictureUrl: item.pictureUrl ?? null,
+      currency: item.currency ?? null,
+      targetActivityStock: item.targetActivityStock ?? item.suggestActivityStock ?? null,
+      sites: Array.isArray(item.sites)
+        ? item.sites.map((s) => ({ siteId: s.siteId, siteName: s.siteName }))
+        : [],
+      skcList: Array.isArray(item.skcList) ? item.skcList : [],
+      platformPayload: item,
+    });
+  }
+  console.log(`[temu] transformActivityProducts: ${rawItems.length} matchList → ${rows.length} rows`);
+  return rows;
+}

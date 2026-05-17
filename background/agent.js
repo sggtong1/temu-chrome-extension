@@ -16,7 +16,7 @@
 //   selectedShopIds     限定派单到这些店铺（null = 不限）
 // ────────────────────────────────────────────────────────────────────
 
-import { transformAvailableActivities } from './transform/activity_transform.js';
+import { transformAvailableActivities, transformActivityProducts } from './transform/activity_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -150,11 +150,12 @@ const KIND_TO_FETCH_SPEC = {
     pageUrl: 'https://agentseller.temu.com/activity/marketing-activity',
     apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
     method: 'POST',
-    // body 极简 — Temu 服务端不需要日期筛选,返回全部可报名活动
-    buildBody: (_payload, pageNo) => ({ pageNo, pageSize: 50 }),
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    // buildBody 返 base body — runFetchInTab 在 pageNo 模式下注入 pageNo+pageSize
+    buildBody: (_payload) => ({}),
     listPath: 'result.activityList',
     totalPath: 'result.total',
-    // raw activityList → Activity 主表行(把 thematicList 展平,每个 thematic 一行)
     transform: (rawItems, payload) =>
       transformAvailableActivities(
         { result: { activityList: rawItems } },
@@ -165,18 +166,43 @@ const KIND_TO_FETCH_SPEC = {
         },
       ),
   },
-  // 其他 6 个 scrape:* kind 由后续 plan 添加
+  // scrape:activity-products — 抓"某活动可报商品 SKU 列表"
+  // payload: { mallId, activityType, activityThematicId, activityId(duoshou uuid) }
+  'scrape:activity-products': {
+    // pageUrl 由 payload 算 — type 和 thematicId 每个 task 不同
+    pageUrl: (payload) =>
+      `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${payload.activityType}&thematicId=${payload.activityThematicId}`,
+    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/scroll/match',
+    method: 'POST',
+    paginationMode: 'scroll',
+    cursorOutPath: 'result.searchScrollContext',
+    hasMorePath: 'result.hasMore',
+    cursorInKey: 'scrollContext',
+    buildBody: (payload) => ({
+      activityType: payload.activityType,
+      activityThematicId: payload.activityThematicId,
+      rowCount: 50,
+      filterUnsalableWarning: false,
+    }),
+    listPath: 'result.matchList',
+    transform: (rawItems) => transformActivityProducts(rawItems),
+  },
+  // 其他 5 个 scrape:* kind 由后续 plan 添加
 };
 
 // ── kind → 实际执行的派发表 ───────────────────────────────────────
-// scrape:marketing-activity 走实际 dispatch，其他 6 个 scrape:* 暂时 stub
-// submit:* 留到第三阶段
+// scrape:marketing-activity + scrape:activity-products 走实际 dispatch,
+// 其他 5 个 scrape:* 暂时 stub。submit:* 留到第三阶段。
 async function dispatch(task, signal) {
   console.log(`[agent ${AGENT_BUILD_ID}] dispatch(kind=${task.kind}) url=${AGENT_IMPORT_URL}`);
   switch (task.kind) {
     case 'scrape:marketing-activity':
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchMarketingActivity (REAL path)`);
       return dispatchMarketingActivity(task, signal);
+
+    case 'scrape:activity-products':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityProducts (REAL path)`);
+      return dispatchActivityProducts(task, signal);
 
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:activity-data':
@@ -229,6 +255,32 @@ async function dispatchMarketingActivity(task, signal) {
   };
 }
 
+// ── scrape:activity-products 专用 wrapper ────────────────────────
+// 任务语义:抓某活动可报商品 SKU 列表(行展开后台 lazy 抓)。
+// payload 必须有:mallId, activityType, activityThematicId, activityId(duoshou uuid 用于 ingester)
+async function dispatchActivityProducts(task, signal) {
+  const payload = task.payload ?? {};
+  const required = ['mallId', 'activityType', 'activityThematicId', 'activityId'];
+  for (const k of required) {
+    if (payload[k] == null || payload[k] === '') {
+      throw Object.assign(
+        new Error(`payload.${k} missing for scrape:activity-products (got ${JSON.stringify(payload)})`),
+        { code: 'BAD_PAYLOAD' },
+      );
+    }
+  }
+
+  const spec = KIND_TO_FETCH_SPEC['scrape:activity-products'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    activityId: payload.activityId,  // 透传给 ingester,免去二次 lookup
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
 // ── 通用: 后台开 hidden tab → executeScript fetch + 分页 → 关 tab ──
 // spec: { pageUrl, apiUrlPattern, method, buildBody(payload, pageNo), listPath, totalPath, transform }
 // 返回 { rawItems: [], transformed: [] }
@@ -260,8 +312,10 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     // 1) 在前台开 tab(active:true)—— Chrome 对后台 tab 有 setTimeout 1Hz 节流,
     //    我们的 capture-poll 循环会被卡到分钟级。前台 tab 没节流,~10s 完成。
     //    用户会看到一个 Temu tab 短暂闪过然后自动关闭,可接受。
+    //    pageUrl 可以是字符串或 (payload) => string 的函数(activity-products 需要带 payload 参数算)。
     checkAbort();
-    const tab = await chrome.tabs.create({ url: spec.pageUrl, active: true, pinned: false });
+    const resolvedPageUrl = typeof spec.pageUrl === 'function' ? spec.pageUrl(payload) : spec.pageUrl;
+    const tab = await chrome.tabs.create({ url: resolvedPageUrl, active: true, pinned: false });
     tabId = tab.id;
 
     // 2) wait for tab to finish loading (tabs.onUpdated complete; poll fallback)
@@ -293,10 +347,16 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     const fetchSpec = {
       apiUrlPattern: spec.apiUrlPattern,
       method: spec.method,
-      bodyTemplate: spec.buildBody(payload, 1),  // 第一页 body 作为模板;runFetchInTab 每页覆盖 pageNo
+      bodyTemplate: spec.buildBody(payload),
       listPath: spec.listPath,
       totalPath: spec.totalPath ?? null,
-      pageSize: 50,
+      // pagination
+      paginationMode: spec.paginationMode ?? 'pageNo',
+      pageSize: spec.pageSize ?? 50,
+      // scroll-mode 字段(pageNo-mode 时这些被忽略)
+      cursorOutPath: spec.cursorOutPath ?? null,
+      hasMorePath: spec.hasMorePath ?? null,
+      cursorInKey: spec.cursorInKey ?? 'scrollContext',
       maxPages: 200,
       timeoutMs: FETCH_TIMEOUT_MS,
       captureTimeoutMs: CAPTURE_TIMEOUT_MS,
@@ -384,18 +444,29 @@ function runFetchInTab(fetchSpec) {
         await new Promise(r => setTimeout(r, 200));
       }
 
-      // 用借来的 headers 自己分页
+      // 用借来的 headers 自己分页(支持 pageNo 和 scroll 两种模式)
       const headers = { ...captured.headers, 'content-type': 'application/json' };
       const url = captured.url;
       const collected = [];
-      let pageNo = 1;
       const getPath = (obj, path) => {
         if (!path) return undefined;
         return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
       };
+      const mode = fetchSpec.paginationMode || 'pageNo';
+      let pageNo = 1;
+      let cursor = null;
+      let iter = 0;
 
-      while (pageNo <= fetchSpec.maxPages) {
-        const body = { ...fetchSpec.bodyTemplate, pageNo, pageSize: fetchSpec.pageSize };
+      while (iter < fetchSpec.maxPages) {
+        // 构造本页 body — pageNo 模式注入 pageNo+pageSize,scroll 模式注入 cursor
+        let body;
+        if (mode === 'scroll') {
+          body = { ...fetchSpec.bodyTemplate };
+          if (cursor) body[fetchSpec.cursorInKey] = cursor;
+        } else {
+          body = { ...fetchSpec.bodyTemplate, pageNo, pageSize: fetchSpec.pageSize };
+        }
+
         const resp = await fetch(url, {
           method: fetchSpec.method,
           credentials: 'include',
@@ -420,17 +491,25 @@ function runFetchInTab(fetchSpec) {
         collected.push(...list);
 
         // 分页结束判定
-        if (list.length === 0) break;
-        if (fetchSpec.totalPath) {
-          const total = Number(getPath(data, fetchSpec.totalPath) ?? list.length);
-          const lastPage = Math.ceil(total / fetchSpec.pageSize) || 1;
-          if (pageNo >= lastPage) break;
-        } else if (list.length < fetchSpec.pageSize) {
-          break;
+        if (mode === 'scroll') {
+          const hasMore = !!getPath(data, fetchSpec.hasMorePath);
+          if (!hasMore) break;
+          cursor = getPath(data, fetchSpec.cursorOutPath);
+          if (!cursor) break;  // 防御:hasMore=true 但没 cursor 时也退出
+        } else {
+          if (list.length === 0) break;
+          if (fetchSpec.totalPath) {
+            const total = Number(getPath(data, fetchSpec.totalPath) ?? list.length);
+            const lastPage = Math.ceil(total / fetchSpec.pageSize) || 1;
+            if (pageNo >= lastPage) break;
+          } else if (list.length < fetchSpec.pageSize) {
+            break;
+          }
+          pageNo++;
         }
-        pageNo++;
+        iter++;
       }
-      return { ok: true, items: collected, pages: pageNo };
+      return { ok: true, items: collected, pages: iter + 1 };
     } catch (e) {
       return { ok: false, phase: 'unknown', error: String(e?.message ?? e) };
     }
