@@ -16,7 +16,11 @@
 //   selectedShopIds     限定派单到这些店铺（null = 不限）
 // ────────────────────────────────────────────────────────────────────
 
-import { transformAvailableActivities, transformActivityProducts } from './transform/activity_transform.js';
+import {
+  transformAvailableActivities,
+  transformActivityProducts,
+  transformActivityEnrollments,
+} from './transform/activity_transform.js';
 import { transformSales30dResponse } from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
@@ -28,7 +32,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-real-marketing-20260517a';
+const AGENT_BUILD_ID   = 'agent-real-activity-data-20260517a';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -188,6 +192,20 @@ const KIND_TO_FETCH_SPEC = {
     listPath: 'result.matchList',
     transform: (rawItems) => transformActivityProducts(rawItems),
   },
+  // scrape:activity-data — 抓本店"已报名活动 SKU 价格"快照
+  // payload: { mallId }  其他不需要(API 按 mallid header 隔离店铺)
+  // 落库:ActivityEnrollment(一行 = shop × activity × session × SKU)
+  'scrape:activity-data': {
+    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity/log',
+    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/list',
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    buildBody: (_payload) => ({}),     // runFetchInTab 注入 pageNo+pageSize
+    listPath: 'result.list',
+    totalPath: 'result.total',
+    transform: (rawItems) => transformActivityEnrollments(rawItems),
+  },
   // scrape:sales-30d — 近 30 天销量 + 库存(全托管 SKU 级 snapshot)
   'scrape:sales-30d': {
     pageUrl: 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
@@ -221,8 +239,11 @@ async function dispatch(task, signal) {
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchSales30d (REAL path)`);
       return dispatchSales30d(task, signal);
 
-    // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:activity-data':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityData (REAL path)`);
+      return dispatchActivityData(task, signal);
+
+    // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:settlement':
     case 'scrape:flux-analysis':
     case 'scrape:declared-price':
@@ -309,6 +330,27 @@ async function dispatchSales30d(task, signal) {
     );
   }
   const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:activity-data 专用 wrapper ────────────────────────────
+// 任务语义:抓本店"已报名活动 SKU 列表+活动价",落到 ActivityEnrollment。
+// payload: { mallId } — API 按 mallid header 隔离店铺,其他不必要
+async function dispatchActivityData(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:activity-data (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:activity-data'];
   const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
   return {
     rows: transformed,

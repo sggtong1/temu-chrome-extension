@@ -195,6 +195,117 @@ export function transformAvailableActivities(rawData, { shopName, mallId, region
 }
 
 /**
+ * Maps raw /enroll/list response → ActivityEnrollment rows.
+ * API: /api/kiana/gamblers/marketing/enroll/list
+ *
+ * 与 transformActivityResponse(写老 sku_activity_history)不同,这里产出符合
+ * duoshou-erp `ActivityEnrollment` 表的扁平行:一行 = 一个 (shop × activity × session × SKU)。
+ *
+ * 关键字段映射:
+ *   - platformActivityId  ← act.activityThematicId / act.activityId(关联 Activity 主表)
+ *   - platformSessionId   ← act.sessionId(可选 — 用于 ActivitySession lookup-or-create)
+ *   - platformEnrollId    ← act.enrollId(店铺粒度的报名记录 id,留作 forensic)
+ *   - platformSkuId       ← sku.skuId / sku.productSkuId
+ *   - activityPriceCents  ← sku.activityPrice(Temu 已是分,直传)
+ *
+ * status 启发式:Temu API 没有统一的 enrollStatus 字段,这里基于 sessionEndTime 判断:
+ *   - sessionEndTime < now → 'ended'
+ *   - 否则 → 'active'
+ * 真实拒绝状态(rejectReason)只在 act.rejectReason 出现时才标 'rejected'。
+ */
+export function transformActivityEnrollments(rawItems) {
+  const rows = [];
+  const now = Date.now();
+  let skippedTest = 0;
+  let skippedNoActivity = 0;
+  let skippedNoSku = 0;
+
+  for (const act of rawItems) {
+    // activityStock===1 是 Temu 的测试/占位活动,不要落库
+    if (act.activityStock === 1) { skippedTest++; continue; }
+
+    const platformActivityId = String(
+      act.activityThematicId ?? act.activityId ?? act.thematicId ?? ''
+    ).trim();
+    if (!platformActivityId) { skippedNoActivity++; continue; }
+
+    const platformSessionId = act.sessionId != null ? String(act.sessionId) : null;
+    const platformEnrollId  = act.enrollId  != null ? String(act.enrollId)  : null;
+
+    const endMs = act.sessionEndTime ?? act.endTime ?? 0;
+    const derivedStatus =
+      act.rejectReason ? 'rejected'
+      : (endMs && endMs < now) ? 'ended'
+      : 'active';
+
+    // 标题:SPU 名(常见)→ thematicName → typeName,任一即可
+    const skuTitleBase = act.productName || act.activityThematicName || act.activityTypeName || null;
+
+    // SKU 级展开:skcList[].skuList[] 是常态,productSkuIds 是 legacy fallback
+    let skuCount = 0;
+    if (Array.isArray(act.skcList) && act.skcList.length) {
+      for (const skc of act.skcList) {
+        for (const sku of (skc.skuList ?? skc.productSkuList ?? [])) {
+          const id = sku.skuId ?? sku.productSkuId ?? sku.id;
+          if (id == null) continue;
+          const priceCents = sku.activityPrice ?? skc.activityPrice ?? act.activityPrice ?? null;
+          rows.push({
+            platformActivityId,
+            platformSessionId,
+            platformEnrollId,
+            platformSkuId: String(id),
+            skuTitle: skuTitleBase,
+            activityPriceCents: priceCents != null ? Math.round(priceCents) : null,
+            currency: sku.currency ?? skc.currency ?? act.currency ?? null,
+            status: derivedStatus,
+            rejectReason: act.rejectReason ?? null,
+            sessionStartAt: act.sessionStartTime ? new Date(act.sessionStartTime).toISOString() : null,
+            sessionEndAt:   endMs ? new Date(endMs).toISOString() : null,
+            platformPayload: { act_summary: {
+              enrollId: act.enrollId,
+              activityId: act.activityId,
+              activityThematicId: act.activityThematicId,
+              productName: act.productName,
+              goodsId: act.goodsId,
+              canEditStock: act.canEditStock,
+              canResubmit: act.canResubmit,
+            }, sku },
+          });
+          skuCount++;
+        }
+      }
+    } else if (Array.isArray(act.productSkuIds)) {
+      // legacy fallback
+      for (const id of act.productSkuIds) {
+        rows.push({
+          platformActivityId,
+          platformSessionId,
+          platformEnrollId,
+          platformSkuId: String(id),
+          skuTitle: skuTitleBase,
+          activityPriceCents: act.activityPrice != null ? Math.round(act.activityPrice) : null,
+          currency: act.currency ?? null,
+          status: derivedStatus,
+          rejectReason: act.rejectReason ?? null,
+          sessionStartAt: act.sessionStartTime ? new Date(act.sessionStartTime).toISOString() : null,
+          sessionEndAt:   endMs ? new Date(endMs).toISOString() : null,
+          platformPayload: act,
+        });
+        skuCount++;
+      }
+    }
+
+    if (skuCount === 0) skippedNoSku++;
+  }
+
+  console.log(
+    `[temu] transformActivityEnrollments: ${rawItems.length} acts → ${rows.length} rows ` +
+    `(skippedTest=${skippedTest}, skippedNoActivity=${skippedNoActivity}, skippedNoSku=${skippedNoSku})`
+  );
+  return rows;
+}
+
+/**
  * Maps raw /enroll/scroll/match response → ActivityProduct table rows.
  *
  * One row = one Temu SPU (productId). skcList/skuList full tree stays as JSON
