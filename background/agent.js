@@ -36,7 +36,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-rate-limit-20260517a';
+const AGENT_BUILD_ID   = 'agent-inline-retry-20260518a';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -463,8 +463,13 @@ async function dispatchDeclaredPrice(task, signal) {
 // 冷却时长:有 retryAfterMs 用之;没有则默认 10 分钟。
 // 落 chrome.storage.session 让 SW 重启也不丢。
 
-const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;     // 10 min
-const RATE_LIMIT_MAX_COOLDOWN_MS     = 60 * 60 * 1000;     // 1 h hard cap
+// inline 递增重试策略(借鉴 Python 插件实践):
+// 初次失败后,先在任务内 sleep+re-capture session 重试 3 次,只有全部失败才进真冷却。
+// 多数 Temu 限流是几十秒短窗口,内联重试常能拿回数据,不需要锁住 10min。
+const RATE_LIMIT_RETRY_DELAYS_MS = [10_000, 30_000, 60_000];   // 第 N 次重试前的延迟
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 3 * 60 * 1000;          // 3 min(原 10min 缩到 3min,内联重试已经给了 100s 恢复窗口)
+const RATE_LIMIT_MIN_COOLDOWN_MS     = 30_000;                 // ≥ 30s(避免循环 burst)
+const RATE_LIMIT_MAX_COOLDOWN_MS     = 30 * 60 * 1000;         // 30 min hard cap
 const COOLDOWN_KEY = (mallId) => `agent:cooldown:${mallId}`;
 
 // Temu / 通用限流 error_code 黑名单(已知 + 启发)。
@@ -515,17 +520,23 @@ async function getMallCooldown(mallId) {
 
 async function setMallCooldown(mallId, retryAfterMs, reason) {
   const dur = Math.min(
-    Math.max(retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, 60_000),  // ≥ 1 min
+    Math.max(retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MIN_COOLDOWN_MS),
     RATE_LIMIT_MAX_COOLDOWN_MS,
   );
   const entry = { untilMs: Date.now() + dur, durationMs: dur, reason };
   try {
     await chrome.storage.session.set({ [COOLDOWN_KEY(mallId)]: entry });
-    console.warn(`[agent ${AGENT_BUILD_ID}] cooldown SET mall=${mallId} for ${(dur/60000).toFixed(1)}min — ${reason}`);
+    console.warn(`[agent ${AGENT_BUILD_ID}] cooldown SET mall=${mallId} for ${(dur/1000).toFixed(0)}s — ${reason}`);
   } catch (e) {
     console.warn('[agent] cooldown set failed:', e?.message);
   }
   return entry;
+}
+
+// 清掉本店的 session cache,强制下次 fetch 重开 tab 重抓 anti-content + mallid headers
+async function invalidateSession(mallId) {
+  sessionCacheMem.delete(mallId);
+  try { await chrome.storage.session.remove(SESSION_KEY(mallId)); } catch {}
 }
 
 // ── Session cache:每个 mallId 一份 captured headers ───────────────────
@@ -582,40 +593,64 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
 
   const mallId = payload.mallId || 'default';
 
-  // 冷却 check —— 限流后冷却窗口内,fail-fast,免得一直撞 + 让 retry 调度自然 backoff
+  // 冷却 check —— 真冷却窗口内 fail-fast,不浪费 tab capture
   const cd = await getMallCooldown(mallId);
   if (cd) {
-    const remainMin = ((cd.untilMs - Date.now()) / 60000).toFixed(1);
+    const remainSec = ((cd.untilMs - Date.now()) / 1000).toFixed(0);
     throw Object.assign(
-      new Error(`RATE_LIMITED: mall=${mallId} cooldown active, ${remainMin}min remaining (${cd.reason})`),
+      new Error(`RATE_LIMITED: mall=${mallId} cooldown active, ${remainSec}s remaining (${cd.reason})`),
       { code: 'RATE_LIMITED', retryAfterMs: cd.untilMs - Date.now(), source: 'cooldown-cache' },
     );
   }
 
-  let session = await getCachedSession(mallId);
+  // 内联递增重试 — 灵感来自 user Python 插件经验。
+  // 多数 Temu 限流是短窗口(几十秒),内联 sleep + re-capture session 常能拿回数据,
+  // 不需要直接锁 10min。延迟节奏 0 / 10s / 30s / 60s,共 4 次 attempt(初次 + 3 retry)。
+  // 每次重试前 invalidateSession 让下一次 fetch 重抓 anti-content + mallid。
+  let rawItems = null;
+  let lastErr = null;
 
-  if (!session) {
-    console.log(`[agent ${AGENT_BUILD_ID}] session MISS mall=${mallId} — capturing via tab`);
-    checkAbort();
-    session = await captureSessionViaTab(spec, payload, signal);
-    await setCachedSession(mallId, session.headers, session.origin);
-  } else {
-    console.log(`[agent ${AGENT_BUILD_ID}] session HIT mall=${mallId} — skipping tab(SW fetch)`);
-  }
-
-  // SW 上下文分页 fetch — host_permissions + credentials:include → cookies 自动带
-  checkAbort();
-  const targetUrl = `${session.origin}${spec.apiUrlPattern}`;
-
-  let rawItems;
-  try {
-    rawItems = await paginatedFetchInSW(spec, payload, targetUrl, session.headers, signal);
-  } catch (e) {
-    // 命中限流 → 写冷却,然后原样上抛
-    if (e?.code === 'RATE_LIMITED') {
-      await setMallCooldown(mallId, e.retryAfterMs, e.message?.slice(0, 200));
+  for (let attempt = 0; attempt <= RATE_LIMIT_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      const delayMs = RATE_LIMIT_RETRY_DELAYS_MS[attempt - 1];
+      console.warn(
+        `[agent ${AGENT_BUILD_ID}] rate-limit retry ${attempt}/${RATE_LIMIT_RETRY_DELAYS_MS.length} ` +
+        `mall=${mallId} — sleeping ${delayMs/1000}s + invalidating session (will re-capture)`,
+      );
+      await sleep(delayMs, signal);
+      await invalidateSession(mallId);
     }
-    throw e;
+
+    let session = await getCachedSession(mallId);
+    if (!session) {
+      console.log(`[agent ${AGENT_BUILD_ID}] session MISS mall=${mallId} attempt=${attempt} — capturing via tab`);
+      checkAbort();
+      session = await captureSessionViaTab(spec, payload, signal);
+      await setCachedSession(mallId, session.headers, session.origin);
+    } else {
+      console.log(`[agent ${AGENT_BUILD_ID}] session HIT mall=${mallId} attempt=${attempt} — SW fetch`);
+    }
+
+    checkAbort();
+    const targetUrl = `${session.origin}${spec.apiUrlPattern}`;
+    try {
+      rawItems = await paginatedFetchInSW(spec, payload, targetUrl, session.headers, signal);
+      // 成功 — 跳出重试循环
+      lastErr = null;
+      break;
+    } catch (e) {
+      if (e?.code === 'RATE_LIMITED') {
+        lastErr = e;
+        if (attempt < RATE_LIMIT_RETRY_DELAYS_MS.length) {
+          continue;  // 还有重试机会
+        }
+        // 最后一次也限流 → 写短冷却 + 上抛
+        await setMallCooldown(mallId, e.retryAfterMs, `after ${RATE_LIMIT_RETRY_DELAYS_MS.length} inline retries: ` + (e.message?.slice(0, 160) ?? ''));
+        throw e;
+      }
+      // 非限流错误:直接上抛,不重试
+      throw e;
+    }
   }
 
   // transform
