@@ -265,3 +265,73 @@ export function transformSales30dResponse(rawItems) {
   return rows;
 }
 
+/**
+ * Maps /api/kiana/magnus/mms/price-adjust/product-adjust-query response →
+ * 一行 = 一个 (SPU × SKU) 调价/申报价记录。
+ *
+ * Sallfox 把这个 endpoint 命名为"申报价格"任务来源(见 Sallfox 接口盘点表
+ * "Temu 调价单 magnus/mms/price-adjust/*",官方对应 bg.full.adjust.price.page.query)。
+ *
+ * 输入(推断,实测时按 result.list 兜底):每一条是一个 SPU 调价单,内含 skuList[]。
+ * 输出字段尽量平铺关键价位 + 审核状态;原始 payload 保 platformPayload 留作 forensic。
+ * 入库逻辑(后续 PR):
+ *   - 设计 PriceReview / DeclaredPrice 表(候选 schema 见 README#TODO)
+ *   - 落表前,raw rows 已经存进 agent_task.result(ingester 暂时 no-handler-yet)
+ */
+export function transformPriceAdjustResponse(rawItems) {
+  const rows = [];
+  for (const item of rawItems) {
+    const productId    = item?.productId    != null ? String(item.productId)    : null;
+    const productSkcId = item?.productSkcId != null ? String(item.productSkcId) : null;
+    const productName  = item?.productName ?? null;
+    const skus = Array.isArray(item?.skuList ?? item?.adjustSkuList ?? item?.skuAdjustList)
+      ? (item.skuList ?? item.adjustSkuList ?? item.skuAdjustList)
+      : [];
+
+    // 没 SKU 子项时,把 SPU 自己作为一行(部分 endpoint 形态是 SPU-level 单价)
+    if (skus.length === 0) {
+      rows.push({
+        platformSkuId:    null,
+        platformProductId: productId,
+        productSkcId,
+        productName,
+        skuExtCode:       item?.skuExtCode ?? item?.extCode ?? null,
+        currency:         item?.currency ?? null,
+        currentPriceCents:  item?.currentPrice  ?? item?.declaredPrice ?? item?.adjustPrice ?? null,
+        previousPriceCents: item?.previousPrice ?? item?.beforePrice   ?? null,
+        suggestPriceCents:  item?.suggestPrice  ?? null,
+        adjustStatus:     item?.adjustStatus ?? item?.reviewStatus ?? item?.status ?? null,
+        adjustReason:     item?.adjustReason ?? item?.reviewReason ?? null,
+        submittedAt:      item?.submitTime ? new Date(item.submitTime).toISOString() : null,
+        resolvedAt:       item?.resolveTime ?? item?.reviewTime ? new Date(item.resolveTime ?? item.reviewTime).toISOString() : null,
+        platformPayload:  item,
+      });
+      continue;
+    }
+
+    for (const sku of skus) {
+      rows.push({
+        platformSkuId:     sku?.productSkuId != null ? String(sku.productSkuId) : null,
+        platformProductId: productId,
+        productSkcId,
+        productName,
+        skuExtCode:        sku?.skuExtCode ?? sku?.extCode ?? null,
+        className:         sku?.className ?? null,
+        currency:          sku?.currency ?? item?.currency ?? null,
+        // Temu 金额都是 cents/分 — 不做单位换算,保原始 int
+        currentPriceCents:  sku?.currentPrice  ?? sku?.declaredPrice ?? sku?.adjustPrice ?? null,
+        previousPriceCents: sku?.previousPrice ?? sku?.beforePrice   ?? null,
+        suggestPriceCents:  sku?.suggestPrice  ?? null,
+        supplierPriceCents: sku?.supplierPrice ?? null,
+        adjustStatus:      sku?.adjustStatus ?? sku?.reviewStatus ?? sku?.status ?? item?.status ?? null,
+        adjustReason:      sku?.adjustReason ?? sku?.reviewReason ?? null,
+        submittedAt:       sku?.submitTime ? new Date(sku.submitTime).toISOString() : null,
+        resolvedAt:        (sku?.resolveTime ?? sku?.reviewTime) ? new Date(sku.resolveTime ?? sku.reviewTime).toISOString() : null,
+        platformPayload:   { sku, parent: { productId, productSkcId, productName } },
+      });
+    }
+  }
+  console.log(`[temu] transformPriceAdjustResponse: ${rawItems.length} items → ${rows.length} rows`);
+  return rows;
+}
+

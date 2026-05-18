@@ -21,7 +21,10 @@ import {
   transformActivityProducts,
   transformActivityEnrollments,
 } from './transform/activity_transform.js';
-import { transformSales30dResponse } from './transform/sku_transform.js';
+import {
+  transformSales30dResponse,
+  transformPriceAdjustResponse,
+} from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -32,7 +35,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-real-activity-data-20260517a';
+const AGENT_BUILD_ID   = 'agent-real-declared-price-20260517a';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -206,6 +209,22 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems) => transformActivityEnrollments(rawItems),
   },
+  // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
+  // payload: { mallId }
+  // 数据先存 agent_task.result;PriceReview / DeclaredPrice 表 schema 后续设计。
+  // 对照 Sallfox 接口盘点:"Temu 调价单 magnus/mms/price-adjust/*"
+  //   = 官方 bg.full.adjust.price.page.query
+  'scrape:declared-price': {
+    pageUrl: 'https://agentseller.temu.com/price-management/price-adjust',
+    apiUrlPattern: '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    buildBody: (_payload) => ({}),
+    listPath: 'result.list',
+    totalPath: 'result.total',
+    transform: (rawItems) => transformPriceAdjustResponse(rawItems),
+  },
   // scrape:sales-30d — 近 30 天销量 + 库存(全托管 SKU 级 snapshot)
   'scrape:sales-30d': {
     pageUrl: 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
@@ -243,10 +262,13 @@ async function dispatch(task, signal) {
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityData (REAL path)`);
       return dispatchActivityData(task, signal);
 
+    case 'scrape:declared-price':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchDeclaredPrice (REAL path)`);
+      return dispatchDeclaredPrice(task, signal);
+
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:settlement':
     case 'scrape:flux-analysis':
-    case 'scrape:declared-price':
     case 'scrape:promo': {
       console.log(`[agent ${AGENT_BUILD_ID}] → 走 stub branch`);
       // TODO[wire]: 接到现有 background/service_worker.js 里的 handleStartCollection
@@ -351,6 +373,27 @@ async function dispatchActivityData(task, signal) {
     );
   }
   const spec = KIND_TO_FETCH_SPEC['scrape:activity-data'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:declared-price 专用 wrapper ───────────────────────────
+// 任务语义:抓"商品当前申报价 / 调价单"列表(Sallfox 申报价格任务)。
+// payload: { mallId }
+async function dispatchDeclaredPrice(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:declared-price (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:declared-price'];
   const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
   return {
     rows: transformed,
