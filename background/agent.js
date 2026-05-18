@@ -36,7 +36,16 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-inline-retry-20260518a';
+const AGENT_BUILD_ID   = 'agent-region-aware-20260518a';
+
+// 全托管流量分析按地区分 3 个 tab,Temu 后端用 siteId 区分。具体数字暂占位
+// (TODO:实测全球/美国/欧洲页面的请求 body 后修正)。Frontend 也可以传明确
+// siteId 覆盖这个默认表。
+const REGION_TO_SITE_ID = {
+  global: 0,       // 全球(已实测)
+  us:     100,     // 美国 — TODO 实测
+  eu:     200,     // 欧洲 — TODO 实测
+};
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -211,11 +220,12 @@ const KIND_TO_FETCH_SPEC = {
     transform: (rawItems) => transformActivityEnrollments(rawItems),
   },
   // scrape:flux-analysis — 商品流量分析(全托管 SPU 级)
-  // payload: { mallId, statisticType?, siteId?, quickFilter? }
+  // payload: { mallId, region?, statisticType?, siteId?, quickFilter? }
+  //   region        'global'(默认) | 'us' | 'eu' — 全托管页 UI 三选一
   //   statisticType 期望值见 UI 标签:1=今日 / 2=昨日 / 3=本周 / 4=本月 / 5=近7日(默认) / 6=近30日
-  //   siteId       0=全球 / 否则单站(实测前默认 0)
-  //   quickFilter  Sallfox UI 快速筛选 tag — 流量待增长 / 短期增长中 / 长期增长中 / Best Seller
-  // 落库:目标表 flux_analysis_daily(待新建);raw rows 先 land 在 agent_task.result
+  //   siteId        直接覆盖 region 默认值;最终对照表见 REGION_TO_SITE_ID(实测 TODO)
+  //   quickFilter   流量待增长 / 短期增长中 / 长期增长中 / Best Seller
+  // 落库:flux_analysis_daily,unique 含 region
   'scrape:flux-analysis': {
     pageUrl: 'https://agentseller.temu.com/main/flux-analysis-full',
     apiUrlPattern: '/api/seller/full/flow/analysis/goods/list',
@@ -223,9 +233,8 @@ const KIND_TO_FETCH_SPEC = {
     paginationMode: 'pageNo',
     pageSize: 50,
     buildBody: (payload) => ({
-      // 真 Temu 字段名最终在实测时纠正 — 这版兜底值是基于 UI 反推的合理猜测
-      statisticType: payload?.statisticType ?? 5,    // 5 = 近7日
-      siteId:        payload?.siteId ?? 0,           // 0 = 全球
+      statisticType: payload?.statisticType ?? 5,                                  // 5 = 近7日
+      siteId:        payload?.siteId ?? REGION_TO_SITE_ID[payload?.region ?? 'global'],
       ...(payload?.quickFilter ? { quickFilter: payload.quickFilter } : {}),
     }),
     listPath: 'result.list',

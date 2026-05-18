@@ -367,6 +367,7 @@ export function transformPriceAdjustResponse(rawItems) {
 export function transformFluxAnalysisResponse(rawItems, payload = {}) {
   const rows = [];
   const dateLabel = payload?.statisticType ?? 'unknown';
+  const region    = payload?.region ?? 'global';   // global / us / eu
   const snapshotDate = new Date().toISOString().slice(0, 10);
 
   // 宽容 picker:多 alias 取第一个非 null
@@ -429,9 +430,10 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
       categoryName:     item?.category?.name ?? item?.categoryName ?? null,
       siteId:           item?.siteId ?? null,
       siteName:         item?.siteName ?? null,
-      // 周期标识 + 采集日期(ingester 落 (shopId, platformProductId, statisticType, snapshotDate) 唯一键)
+      // 周期标识 + 采集日期 + 区域(ingester 落 (shopId, platformProductId, region, statisticType, snapshotDate) 唯一键)
       statisticType:    dateLabel,
       snapshotDate,
+      region,
 
       // —— 流量情况
       exposureNum:      pick('exposeNum', 'exposureNum', 'impressionNum', 'pv'),
