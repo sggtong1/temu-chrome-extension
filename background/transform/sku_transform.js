@@ -335,3 +335,90 @@ export function transformPriceAdjustResponse(rawItems) {
   return rows;
 }
 
+/**
+ * Maps /api/seller/full/flow/analysis/goods/list response → 商品流量行。
+ *
+ * Sallfox 文档把这个 endpoint 简化写成 /api/flow/analysis/list,实测真路径
+ * 带 /api/seller/full/ 前缀 — 见 sallfox-endpoints-inventory.md。
+ *
+ * UI 列结构(实测页面 /main/flux-analysis-full):
+ *   商品信息 | 流量情况(曝光/点击/访客/浏览/加购/收藏)|
+ *   支付情况(支付件数/支付订单数/买家数)| 转化情况(转化率/点击率/点击后支付率)|
+ *   搜索数据(曝光/点击/支付订单/支付件数) | 推荐数据(同上) | 增长潜力 | 操作
+ *
+ * 因为 Temu 真实 response 字段名只能在实测时确定,这里写一份"宽容映射"版本:
+ *   - 试常见英文别名(impressionNum/exposeNum/clickNum/payNum 等)
+ *   - 实际字段不在已知别名表里时,保 platformPayload 原样,后续按需扩展映射
+ */
+export function transformFluxAnalysisResponse(rawItems, payload = {}) {
+  const rows = [];
+  const dateLabel = payload?.statisticType ?? 'unknown';
+  for (const item of rawItems) {
+    const platformProductId = String(
+      item?.productId ?? item?.goodsId ?? item?.productSpuId ?? ''
+    );
+    if (!platformProductId) continue;
+
+    // 取数字字段的宽容 helper — 多种可能的别名都试
+    const pick = (...keys) => {
+      for (const k of keys) {
+        const v = item?.[k];
+        if (v != null) return v;
+      }
+      return null;
+    };
+
+    rows.push({
+      // —— 商品信息
+      platformProductId,
+      platformSkcId:    item?.productSkcId != null ? String(item.productSkcId) : null,
+      productName:      item?.productName ?? item?.goodsName ?? item?.title ?? null,
+      pictureUrl:       item?.pictureUrl ?? item?.imageUrl ?? item?.mainImage ?? null,
+      skuExtCode:       item?.skuExtCode ?? item?.extCode ?? null,
+      categoryName:     item?.categoryName ?? item?.catName ?? null,
+      siteId:           item?.siteId ?? null,
+      siteName:         item?.siteName ?? null,
+      // 周期标识(查询条件之一,落库时按需)
+      statisticType:    dateLabel,
+
+      // —— 流量情况
+      exposureNum:      pick('exposureNum', 'exposeNum', 'impressionNum', 'pv'),
+      clickNum:         pick('clickNum', 'clk'),
+      visitorNum:       pick('visitorNum', 'uv'),
+      browseNum:        pick('browseNum', 'viewNum'),
+      addCartUserNum:   pick('addCartUserNum', 'cartUserNum'),
+      favoriteUserNum:  pick('favoriteUserNum', 'collectNum', 'collectUserNum'),
+
+      // —— 支付情况
+      payItemNum:       pick('payItemNum', 'salesItemNum', 'salesNum'),
+      payOrderNum:      pick('payOrderNum', 'salesOrderNum', 'orderNum'),
+      payBuyerNum:      pick('payBuyerNum', 'buyerNum'),
+
+      // —— 转化情况
+      conversionRate:   pick('conversionRate', 'payConvRate'),
+      clickRate:        pick('clickRate', 'ctr'),
+      clickPayRate:     pick('clickPayRate', 'clickConvRate', 'payRateAfterClick'),
+
+      // —— 搜索数据
+      searchExposureNum:  pick('searchExposureNum', 'searchExposeNum'),
+      searchClickNum:     pick('searchClickNum'),
+      searchPayOrderNum:  pick('searchPayOrderNum'),
+      searchPayItemNum:   pick('searchPayItemNum'),
+
+      // —— 推荐数据
+      recExposureNum:     pick('recommendExposureNum', 'recExposureNum'),
+      recClickNum:        pick('recommendClickNum', 'recClickNum'),
+      recPayOrderNum:     pick('recommendPayOrderNum', 'recPayOrderNum'),
+      recPayItemNum:      pick('recommendPayItemNum', 'recPayItemNum'),
+
+      // —— 增长潜力 / 标签
+      growthTagList:      Array.isArray(item?.tagList) ? item.tagList
+                          : (Array.isArray(item?.growthTags) ? item.growthTags : null),
+
+      platformPayload:    item,  // 保 raw,字段名 misalign 时方便事后映射
+    });
+  }
+  console.log(`[temu] transformFluxAnalysisResponse: ${rawItems.length} items → ${rows.length} rows (statisticType=${dateLabel})`);
+  return rows;
+}
+

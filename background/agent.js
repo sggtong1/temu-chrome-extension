@@ -24,6 +24,7 @@ import {
 import {
   transformSales30dResponse,
   transformPriceAdjustResponse,
+  transformFluxAnalysisResponse,
 } from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
@@ -35,7 +36,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-real-declared-price-20260517a';
+const AGENT_BUILD_ID   = 'agent-real-flux-analysis-20260517a';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -209,6 +210,28 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems) => transformActivityEnrollments(rawItems),
   },
+  // scrape:flux-analysis — 商品流量分析(全托管 SPU 级)
+  // payload: { mallId, statisticType?, siteId?, quickFilter? }
+  //   statisticType 期望值见 UI 标签:1=今日 / 2=昨日 / 3=本周 / 4=本月 / 5=近7日(默认) / 6=近30日
+  //   siteId       0=全球 / 否则单站(实测前默认 0)
+  //   quickFilter  Sallfox UI 快速筛选 tag — 流量待增长 / 短期增长中 / 长期增长中 / Best Seller
+  // 落库:目标表 flux_analysis_daily(待新建);raw rows 先 land 在 agent_task.result
+  'scrape:flux-analysis': {
+    pageUrl: 'https://agentseller.temu.com/main/flux-analysis-full',
+    apiUrlPattern: '/api/seller/full/flow/analysis/goods/list',
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    buildBody: (payload) => ({
+      // 真 Temu 字段名最终在实测时纠正 — 这版兜底值是基于 UI 反推的合理猜测
+      statisticType: payload?.statisticType ?? 5,    // 5 = 近7日
+      siteId:        payload?.siteId ?? 0,           // 0 = 全球
+      ...(payload?.quickFilter ? { quickFilter: payload.quickFilter } : {}),
+    }),
+    listPath: 'result.list',
+    totalPath: 'result.total',
+    transform: (rawItems, payload) => transformFluxAnalysisResponse(rawItems, payload),
+  },
   // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
   // payload: { mallId }
   // 数据先存 agent_task.result;PriceReview / DeclaredPrice 表 schema 后续设计。
@@ -266,9 +289,12 @@ async function dispatch(task, signal) {
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchDeclaredPrice (REAL path)`);
       return dispatchDeclaredPrice(task, signal);
 
+    case 'scrape:flux-analysis':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysis (REAL path)`);
+      return dispatchFluxAnalysis(task, signal);
+
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:settlement':
-    case 'scrape:flux-analysis':
     case 'scrape:promo': {
       console.log(`[agent ${AGENT_BUILD_ID}] → 走 stub branch`);
       // TODO[wire]: 接到现有 background/service_worker.js 里的 handleStartCollection
@@ -377,6 +403,29 @@ async function dispatchActivityData(task, signal) {
   return {
     rows: transformed,
     rawCount: rawItems.length,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:flux-analysis 专用 wrapper ────────────────────────────
+// 任务语义:抓"商品流量"(全托管 SPU 级,Sallfox 产品分析的流量数据源)。
+// payload: { mallId, statisticType?, siteId?, quickFilter? }
+async function dispatchFluxAnalysis(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:flux-analysis (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:flux-analysis'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    statisticType: payload.statisticType ?? 5,
+    siteId: payload.siteId ?? 0,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
@@ -675,7 +724,8 @@ function captureHeadersInTab(spec) {
             const candidates = Array.from(document.querySelectorAll('a, [role="tab"], button'));
             const target = candidates.find(el => {
               const t = (el.textContent || '').trim();
-              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品';
+              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品'
+                  || t === '商品流量' || t === '店铺流量' || t === '查询';
             });
             if (target) target.click();
           } catch {}
@@ -736,7 +786,8 @@ function runFetchInTab(fetchSpec) {
             const candidates = Array.from(document.querySelectorAll('a, [role="tab"], button'));
             const target = candidates.find(el => {
               const t = (el.textContent || '').trim();
-              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品';
+              return t === '营销活动首页' || t === '报名记录' || t === '活动机遇商品'
+                  || t === '商品流量' || t === '店铺流量' || t === '查询';
             });
             if (target) target.click();
           } catch {}
