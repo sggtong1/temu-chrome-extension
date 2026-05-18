@@ -482,3 +482,98 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
   return rows;
 }
 
+/**
+ * Maps /api/seller/full/flow/analysis/goods/detail response → 每日真实数据明细行。
+ *
+ * 用法:plugin scrape:flux-analysis-detail 任务,payload 携带单个 productId,
+ * detail 接口返回该 SPU 在指定窗口内每一天的明细数据。
+ *
+ * Detail response 字段(基于 list 模式 + 用户经验推测,实测后修正):
+ *   - 顶层 result 可能是 array OR result.list OR result.dailyList
+ *   - 每个元素:{ date(yyyy-mm-dd), exposeNum, clickNum, goodsDetailVisitorNum,
+ *               addToCartUserNum, collectUserNum, payGoodsNum, payOrderNum,
+ *               buyerNum, exposeClickConversionRate, clickPayConversionRate,
+ *               exposePayConversionRate, ... }
+ *   - 用户预判:detail **不返回** *LinkRelative 环比字段(环比由本地 SQL 聚合)
+ *
+ * 输出 dataSource='detail', reportDate=Temu 返的真实日期。
+ */
+export function transformFluxAnalysisDetailResponse(rawItems, payload = {}) {
+  const rows = [];
+  const region    = payload?.region ?? 'global';
+  const platformProductId = String(payload?.productId ?? '');
+  if (!platformProductId) {
+    console.warn('[temu] transformFluxAnalysisDetailResponse: missing payload.productId');
+    return rows;
+  }
+
+  // 宽容 picker
+  const makePick = (item) => (...keys) => {
+    for (const k of keys) {
+      const v = item?.[k];
+      if (v != null) return v;
+    }
+    return null;
+  };
+  const rate = (v) => (v == null ? null : Number(v) * 100);
+
+  // rawItems 可能是 result.list 或 result.dailyList 或直接 result(array)— 调度层用
+  // listPath 选定后这里只看 item 内字段。
+  for (const item of rawItems) {
+    const pick = makePick(item);
+
+    // 真实日期 — 可能是 yyyy-mm-dd 字符串 / epoch ms / 别的格式
+    const rawDate = item?.date ?? item?.statDate ?? item?.dataDate ?? item?.reportDate ?? null;
+    if (!rawDate) continue;
+    const reportDate = String(rawDate).match(/^\d{4}-\d{2}-\d{2}/)
+      ? String(rawDate).slice(0, 10)
+      : new Date(rawDate).toISOString().slice(0, 10);
+
+    rows.push({
+      // —— 标识
+      platformProductId,
+      productName:   payload?.productName ?? null,   // 头部复用 list,detail 不会再返
+      pictureUrl:    payload?.pictureUrl ?? null,
+      region,
+      reportDate,
+      dataSource:    'detail',
+      statisticType: 1,    // detail 是按日,固定 1 (今日单点)
+
+      // —— 流量
+      exposureNum:      pick('exposeNum', 'exposureNum', 'impressionNum'),
+      clickNum:         pick('clickNum', 'clk'),
+      visitorNum:       pick('goodsDetailVisitorNum', 'visitorNum'),
+      browseNum:        pick('goodsDetailVisitNum', 'browseNum'),
+      addCartUserNum:   pick('addToCartUserNum', 'addCartUserNum'),
+      favoriteUserNum:  pick('collectUserNum', 'favoriteUserNum'),
+
+      // —— 支付
+      payItemNum:       pick('payGoodsNum', 'payItemNum'),
+      payOrderNum:      pick('payOrderNum'),
+      payBuyerNum:      pick('buyerNum', 'payBuyerNum'),
+
+      // —— 转化(同 list,×100 转 %)
+      conversionRate:   rate(pick('exposePayConversionRate')),
+      clickRate:        rate(pick('exposeClickConversionRate')),
+      clickPayRate:     rate(pick('clickPayConversionRate')),
+
+      // —— 搜索 / 推荐(detail 是否给这部分未知,先 try)
+      searchExposureNum:  pick('searchExposeNum'),
+      searchClickNum:     pick('searchClickNum'),
+      searchPayOrderNum:  pick('searchPayOrderNum'),
+      searchPayItemNum:   pick('searchPayGoodsNum'),
+      recExposureNum:     pick('recommendExposeNum'),
+      recClickNum:        pick('recommendClickNum'),
+      recPayOrderNum:     pick('recommendPayOrderNum'),
+      recPayItemNum:      pick('recommendPayGoodsNum'),
+
+      // detail 不携带环比(用户预判) — service.query 时本地 SQL 聚合算
+      compareData:      null,
+      growthTagList:    null,
+      platformPayload:  item,
+    });
+  }
+  console.log(`[temu] transformFluxAnalysisDetailResponse: ${rawItems.length} day-rows for product ${platformProductId} region=${region}`);
+  return rows;
+}
+

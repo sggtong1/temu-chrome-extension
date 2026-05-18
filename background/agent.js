@@ -25,6 +25,7 @@ import {
   transformSales30dResponse,
   transformPriceAdjustResponse,
   transformFluxAnalysisResponse,
+  transformFluxAnalysisDetailResponse,
 } from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
@@ -241,6 +242,27 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems, payload) => transformFluxAnalysisResponse(rawItems, payload),
   },
+  // scrape:flux-analysis-detail — 单 SPU 历史明细(每日真值)
+  // payload: { mallId, region, productId, statisticType?, siteId?, productName?, pictureUrl? }
+  //   productId 必传 — detail endpoint per-product 调用
+  //   productName / pictureUrl 由上游 list 任务结果传入(detail response 通常不含头部信息)
+  //   statisticType 通常用 5(近7日)或 6(近30日)— 触发 Temu 返对应窗口的逐日数据
+  // 落库:flux_analysis_daily,dataSource='detail',一行/天,真 reportDate
+  'scrape:flux-analysis-detail': {
+    pageUrl: 'https://agentseller.temu.com/main/flux-analysis-full',
+    apiUrlPattern: '/api/seller/full/flow/analysis/goods/detail',
+    method: 'POST',
+    paginationMode: 'single',     // detail 一次返完整窗口,不分页
+    pageSize: 1,
+    buildBody: (payload) => ({
+      productId:     payload?.productId,
+      statisticType: payload?.statisticType ?? 6,    // 默认 6=近30日,够 7d/30d 聚合
+      siteId:        payload?.siteId ?? REGION_TO_SITE_ID[payload?.region ?? 'global'],
+    }),
+    // listPath 默认 'result.list'(实测后修正,失败时 SHAPE_BAD 会暴露真路径)
+    listPath: 'result.list',
+    transform: (rawItems, payload) => transformFluxAnalysisDetailResponse(rawItems, payload),
+  },
   // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
   // payload: { mallId }
   // 数据先存 agent_task.result;PriceReview / DeclaredPrice 表 schema 后续设计。
@@ -301,6 +323,10 @@ async function dispatch(task, signal) {
     case 'scrape:flux-analysis':
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysis (REAL path)`);
       return dispatchFluxAnalysis(task, signal);
+
+    case 'scrape:flux-analysis-detail':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysisDetail (REAL path)`);
+      return dispatchFluxAnalysisDetail(task, signal);
 
     // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
     case 'scrape:settlement':
@@ -435,6 +461,32 @@ async function dispatchFluxAnalysis(task, signal) {
     rawCount: rawItems.length,
     statisticType: payload.statisticType ?? 5,
     siteId: payload.siteId ?? 0,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:flux-analysis-detail 专用 wrapper ─────────────────────
+// 任务语义:抓单 SPU 在指定窗口内的每日真值明细。Block C 核心。
+// payload: { mallId, region, productId, productName?, pictureUrl?, statisticType?, siteId? }
+async function dispatchFluxAnalysisDetail(task, signal) {
+  const payload = task.payload ?? {};
+  const required = ['mallId', 'productId'];
+  for (const k of required) {
+    if (payload[k] == null || payload[k] === '') {
+      throw Object.assign(
+        new Error(`payload.${k} missing for scrape:flux-analysis-detail`),
+        { code: 'BAD_PAYLOAD' },
+      );
+    }
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:flux-analysis-detail'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    productId: payload.productId,
+    region: payload.region ?? 'global',
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
@@ -768,6 +820,9 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
     if (mode === 'scroll') {
       body = { ...bodyTemplate };
       if (cursor) body[spec.cursorInKey ?? 'scrollContext'] = cursor;
+    } else if (mode === 'single') {
+      // 不分页 — 单次 fetch,适合 detail 这类一次性返完整数据的接口
+      body = { ...bodyTemplate };
     } else {
       body = { ...bodyTemplate, pageNo, pageSize };
     }
@@ -822,6 +877,9 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       if (!getPath(data, spec.hasMorePath)) break;
       cursor = getPath(data, spec.cursorOutPath);
       if (!cursor) break;
+    } else if (mode === 'single') {
+      // 单次 fetch 模式 — 一次就够,直接退出
+      break;
     } else {
       if (list.length === 0) break;
       if (spec.totalPath) {
