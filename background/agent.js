@@ -37,7 +37,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-region-aware-20260518a';
+const AGENT_BUILD_ID   = 'agent-detail-real-20260518b';
 
 // 全托管流量分析按地区分 3 个 tab,Temu 后端用 siteId 区分。具体数字暂占位
 // (TODO:实测全球/美国/欧洲页面的请求 body 后修正)。Frontend 也可以传明确
@@ -242,25 +242,31 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems, payload) => transformFluxAnalysisResponse(rawItems, payload),
   },
-  // scrape:flux-analysis-detail — 单 SPU 历史明细(每日真值)
-  // payload: { mallId, region, productId, statisticType?, siteId?, productName?, pictureUrl? }
-  //   productId 必传 — detail endpoint per-product 调用
-  //   productName / pictureUrl 由上游 list 任务结果传入(detail response 通常不含头部信息)
-  //   statisticType 通常用 5(近7日)或 6(近30日)— 触发 Temu 返对应窗口的逐日数据
-  // 落库:flux_analysis_daily,dataSource='detail',一行/天,真 reportDate
+  // scrape:flux-analysis-detail — 单 SPU 历史日明细(每日真值)
+  // payload: { mallId, region, goodsId, siteId?, statTimeDimension?, productName?, pictureUrl? }
+  //   ★ 真 body 实测(2026-05-18 PM 提供):
+  //     URL: /api/seller/full/flow/analysis/goods/detail
+  //     body: { pageNum, pageSize, siteId, goodsId, statTimeDimension }
+  //     siteId: -1=全部 / 10=加拿大 / 20=澳大利亚 / ...(其他从 site/list 查)
+  //     statTimeDimension: 1=按日 / 2=按周 / 3=按月
+  //     pageNum 字段名特殊 — paginatedFetchInSW 用 spec.pageNoKey override
+  //   返:result.list[] 每行一日数据,result.total = 总天数
+  // 落库:flux_analysis_daily,dataSource='detail',一行/天,真 statDate
   'scrape:flux-analysis-detail': {
     pageUrl: 'https://agentseller.temu.com/main/flux-analysis-full',
     apiUrlPattern: '/api/seller/full/flow/analysis/goods/detail',
     method: 'POST',
-    paginationMode: 'single',     // detail 一次返完整窗口,不分页
-    pageSize: 1,
+    paginationMode: 'pageNo',
+    pageSize: 10,         // 默认 10 行/页 = 10 天/页;30 天 3 页
+    pageNoKey: 'pageNum',     // ★ Temu detail 用 pageNum 不是 pageNo
+    pageSizeKey: 'pageSize',
     buildBody: (payload) => ({
-      productId:     payload?.productId,
-      statisticType: payload?.statisticType ?? 6,    // 默认 6=近30日,够 7d/30d 聚合
-      siteId:        payload?.siteId ?? REGION_TO_SITE_ID[payload?.region ?? 'global'],
+      goodsId:            Number(payload?.goodsId ?? payload?.productId),
+      siteId:             payload?.siteId ?? -1,    // -1 全部站点
+      statTimeDimension:  payload?.statTimeDimension ?? 1,  // 1 按日
     }),
-    // listPath 默认 'result.list'(实测后修正,失败时 SHAPE_BAD 会暴露真路径)
     listPath: 'result.list',
+    totalPath: 'result.total',
     transform: (rawItems, payload) => transformFluxAnalysisDetailResponse(rawItems, payload),
   },
   // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
@@ -471,14 +477,12 @@ async function dispatchFluxAnalysis(task, signal) {
 // payload: { mallId, region, productId, productName?, pictureUrl?, statisticType?, siteId? }
 async function dispatchFluxAnalysisDetail(task, signal) {
   const payload = task.payload ?? {};
-  const required = ['mallId', 'productId'];
-  for (const k of required) {
-    if (payload[k] == null || payload[k] === '') {
-      throw Object.assign(
-        new Error(`payload.${k} missing for scrape:flux-analysis-detail`),
-        { code: 'BAD_PAYLOAD' },
-      );
-    }
+  if (!payload.mallId) {
+    throw Object.assign(new Error(`payload.mallId missing for scrape:flux-analysis-detail`), { code: 'BAD_PAYLOAD' });
+  }
+  // 接受 goodsId 或 productId(向后兼容旧 payload)
+  if (!payload.goodsId && !payload.productId) {
+    throw Object.assign(new Error(`payload.goodsId (or productId) missing for scrape:flux-analysis-detail`), { code: 'BAD_PAYLOAD' });
   }
   const spec = KIND_TO_FETCH_SPEC['scrape:flux-analysis-detail'];
   const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
@@ -824,7 +828,10 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       // 不分页 — 单次 fetch,适合 detail 这类一次性返完整数据的接口
       body = { ...bodyTemplate };
     } else {
-      body = { ...bodyTemplate, pageNo, pageSize };
+      // pageNo/pageSize 默认字段名为 pageNo,但部分接口要 pageNum(detail / flow analysis)
+      const pNoKey = spec.pageNoKey ?? 'pageNo';
+      const pSizeKey = spec.pageSizeKey ?? 'pageSize';
+      body = { ...bodyTemplate, [pNoKey]: pageNo, [pSizeKey]: pageSize };
     }
 
     const resp = await fetch(url, {

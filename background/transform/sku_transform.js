@@ -501,9 +501,11 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
 export function transformFluxAnalysisDetailResponse(rawItems, payload = {}) {
   const rows = [];
   const region    = payload?.region ?? 'global';
-  const platformProductId = String(payload?.productId ?? '');
+  // ★ platformProductId 是 DB key — 用 productSpuId 跟 list 一致(可 JOIN snapshot.parent.productId)
+  // goodsId 是 API body 用的(detail API 收 goodsId);二者不同,chain-trigger 同时传过来
+  const platformProductId = String(payload?.productSpuId ?? payload?.productId ?? payload?.goodsId ?? '');
   if (!platformProductId) {
-    console.warn('[temu] transformFluxAnalysisDetailResponse: missing payload.productId');
+    console.warn('[temu] transformFluxAnalysisDetailResponse: missing payload productSpuId/productId/goodsId');
     return rows;
   }
 
@@ -522,8 +524,8 @@ export function transformFluxAnalysisDetailResponse(rawItems, payload = {}) {
   for (const item of rawItems) {
     const pick = makePick(item);
 
-    // 真实日期 — 可能是 yyyy-mm-dd 字符串 / epoch ms / 别的格式
-    const rawDate = item?.date ?? item?.statDate ?? item?.dataDate ?? item?.reportDate ?? null;
+    // ★ 实测真字段是 statDate(2026-05-18 实测)— 其他名字保留作 fallback
+    const rawDate = item?.statDate ?? item?.date ?? item?.dataDate ?? item?.reportDate ?? null;
     if (!rawDate) continue;
     const reportDate = String(rawDate).match(/^\d{4}-\d{2}-\d{2}/)
       ? String(rawDate).slice(0, 10)
