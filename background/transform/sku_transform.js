@@ -338,46 +338,95 @@ export function transformPriceAdjustResponse(rawItems) {
 /**
  * Maps /api/seller/full/flow/analysis/goods/list response → 商品流量行。
  *
- * Sallfox 文档把这个 endpoint 简化写成 /api/flow/analysis/list,实测真路径
- * 带 /api/seller/full/ 前缀 — 见 sallfox-endpoints-inventory.md。
+ * 接口路径:实测 /api/seller/full/flow/analysis/goods/list(非 Sallfox 文档简版)。
  *
- * UI 列结构(实测页面 /main/flux-analysis-full):
- *   商品信息 | 流量情况(曝光/点击/访客/浏览/加购/收藏)|
- *   支付情况(支付件数/支付订单数/买家数)| 转化情况(转化率/点击率/点击后支付率)|
- *   搜索数据(曝光/点击/支付订单/支付件数) | 推荐数据(同上) | 增长潜力 | 操作
+ * 真字段名(2026-05-18 cesi 店实测,见 agent_task ac4e1bce 的 platformPayload):
+ *   goodsId / productSpuId      商品 ID
+ *   goodsName / goodsImageUrl   商品名 + 图
+ *   exposeNum                   曝光量          ✱ 不带 ure
+ *   clickNum                    点击量
+ *   goodsDetailVisitorNum       访客数(进详情页 UV)
+ *   goodsDetailVisitNum         浏览量(进详情页 PV)
+ *   addToCartUserNum            加购人数        ✱ addToCart 中间有 To
+ *   collectUserNum              收藏人数
+ *   payGoodsNum                 支付件数        ✱ Temu 叫"goods"不叫 "item"
+ *   payOrderNum                 支付订单数
+ *   buyerNum                    买家数
+ *   exposeClickConversionRate   曝光→点击 转化率(即"点击率")  ✱ 单位是小数 0-1
+ *   clickPayConversionRate      点击→支付 转化率("点击后支付率")
+ *   exposePayConversionRate     曝光→支付 转化率(综合"转化率")
+ *   searchExposeNum/...         搜索的曝光/点击/订单/件数(同 payGoodsNum 模式)
+ *   recommendExposeNum/...      推荐的曝光/点击/订单/件数
+ *   bsrGoods/canContinueToGrow  增长潜力相关 boolean
+ *   growDataText                "9%" 之类的增长文本
  *
- * 因为 Temu 真实 response 字段名只能在实测时确定,这里写一份"宽容映射"版本:
- *   - 试常见英文别名(impressionNum/exposeNum/clickNum/payNum 等)
- *   - 实际字段不在已知别名表里时,保 platformPayload 原样,后续按需扩展映射
+ *   ★★ 关键发现:每个指标字段都有对应的 ${name}LinkRelative 字段表示**环比**
+ *      (近 7 日 vs 上 7 日的小数变化,如 -0.154 = 下降 15.4%)。
+ *      → Sallfox 显示的"环比 0.00% ↑↓"完全可以直接用这个,不用自己存历史快照表。
  */
 export function transformFluxAnalysisResponse(rawItems, payload = {}) {
   const rows = [];
   const dateLabel = payload?.statisticType ?? 'unknown';
-  // 采集当天的本地日期(yyyy-mm-dd)— ingester 落 snapshotDate 唯一键
   const snapshotDate = new Date().toISOString().slice(0, 10);
+
+  // 宽容 picker:多 alias 取第一个非 null
+  const makePick = (item) => (...keys) => {
+    for (const k of keys) {
+      const v = item?.[k];
+      if (v != null) return v;
+    }
+    return null;
+  };
+
+  // Temu 的 conversionRate / clickRate 单位是小数(0.0667),前端展示要 %,所以 *100。
+  const rate = (v) => (v == null ? null : Number(v) * 100);
+
   for (const item of rawItems) {
+    // ★ 重要:Temu 有两个 ID
+    //   - goodsId       平台 SPU 上架 ID(eg 601099540371116)— 详情页 / 公开外显
+    //   - productSpuId  内部产品 SPU ID(eg 134255251)— sales-30d listOverall 用的 productId
+    // 我们用 productSpuId 作 platformProductId,这样能和 shop_sku_snapshot.platform_payload.parent.productId
+    // JOIN 上(后者也是 productSpuId 值);goodsId 保 platformPayload.goodsId 备用
     const platformProductId = String(
-      item?.productId ?? item?.goodsId ?? item?.productSpuId ?? ''
+      item?.productSpuId ?? item?.productId ?? item?.goodsId ?? ''
     );
     if (!platformProductId) continue;
 
-    // 取数字字段的宽容 helper — 多种可能的别名都试
-    const pick = (...keys) => {
-      for (const k of keys) {
-        const v = item?.[k];
-        if (v != null) return v;
-      }
-      return null;
+    const pick = makePick(item);
+
+    // 提取所有指标的环比(LinkRelative),组装成 compareData object;
+    // 都是 0-1 小数(Temu 已经算好了的 (now - prev) / prev),前端按需展示 ↑/↓%。
+    const compareData = {
+      exposureNum:        item?.exposeNumLinkRelative ?? null,
+      clickNum:           item?.clickNumLinkRelative ?? null,
+      visitorNum:         item?.goodsDetailVisitorNumLinkRelative ?? null,
+      browseNum:          item?.goodsDetailVisitNumLinkRelative ?? null,
+      addCartUserNum:     item?.addToCartUserNumLinkRelative ?? null,
+      favoriteUserNum:    item?.collectUserNumLinkRelative ?? null,
+      payItemNum:         item?.payGoodsNumLinkRelative ?? null,
+      payOrderNum:        item?.payOrderNumLinkRelative ?? null,
+      payBuyerNum:        item?.buyerNumLinkRelative ?? null,
+      conversionRate:     item?.exposePayConversionRateLinkRelative ?? null,
+      clickRate:          item?.exposeClickConversionRateLinkRelative ?? null,
+      clickPayRate:       item?.clickPayConversionRateLinkRelative ?? null,
+      searchExposureNum:  item?.searchExposeNumLinkRelative ?? null,
+      searchClickNum:     item?.searchClickNumLinkRelative ?? null,
+      searchPayOrderNum:  item?.searchPayOrderNumLinkRelative ?? null,
+      searchPayItemNum:   item?.searchPayGoodsNumLinkRelative ?? null,
+      recExposureNum:     item?.recommendExposeNumLinkRelative ?? null,
+      recClickNum:        item?.recommendClickNumLinkRelative ?? null,
+      recPayOrderNum:     item?.recommendPayOrderNumLinkRelative ?? null,
+      recPayItemNum:      item?.recommendPayGoodsNumLinkRelative ?? null,
     };
 
     rows.push({
       // —— 商品信息
       platformProductId,
       platformSkcId:    item?.productSkcId != null ? String(item.productSkcId) : null,
-      productName:      item?.productName ?? item?.goodsName ?? item?.title ?? null,
-      pictureUrl:       item?.pictureUrl ?? item?.imageUrl ?? item?.mainImage ?? null,
+      productName:      item?.goodsName ?? item?.productName ?? item?.title ?? null,
+      pictureUrl:       item?.goodsImageUrl ?? item?.pictureUrl ?? item?.imageUrl ?? item?.mainImage ?? null,
       skuExtCode:       item?.skuExtCode ?? item?.extCode ?? null,
-      categoryName:     item?.categoryName ?? item?.catName ?? null,
+      categoryName:     item?.category?.name ?? item?.categoryName ?? null,
       siteId:           item?.siteId ?? null,
       siteName:         item?.siteName ?? null,
       // 周期标识 + 采集日期(ingester 落 (shopId, platformProductId, statisticType, snapshotDate) 唯一键)
@@ -385,40 +434,46 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
       snapshotDate,
 
       // —— 流量情况
-      exposureNum:      pick('exposureNum', 'exposeNum', 'impressionNum', 'pv'),
+      exposureNum:      pick('exposeNum', 'exposureNum', 'impressionNum', 'pv'),
       clickNum:         pick('clickNum', 'clk'),
-      visitorNum:       pick('visitorNum', 'uv'),
-      browseNum:        pick('browseNum', 'viewNum'),
-      addCartUserNum:   pick('addCartUserNum', 'cartUserNum'),
-      favoriteUserNum:  pick('favoriteUserNum', 'collectNum', 'collectUserNum'),
+      visitorNum:       pick('goodsDetailVisitorNum', 'visitorNum', 'uv'),
+      browseNum:        pick('goodsDetailVisitNum', 'browseNum', 'viewNum'),
+      addCartUserNum:   pick('addToCartUserNum', 'addCartUserNum', 'cartUserNum'),
+      favoriteUserNum:  pick('collectUserNum', 'favoriteUserNum', 'collectNum'),
 
       // —— 支付情况
-      payItemNum:       pick('payItemNum', 'salesItemNum', 'salesNum'),
+      payItemNum:       pick('payGoodsNum', 'payItemNum', 'salesItemNum', 'salesNum'),
       payOrderNum:      pick('payOrderNum', 'salesOrderNum', 'orderNum'),
-      payBuyerNum:      pick('payBuyerNum', 'buyerNum'),
+      payBuyerNum:      pick('buyerNum', 'payBuyerNum'),
 
-      // —— 转化情况
-      conversionRate:   pick('conversionRate', 'payConvRate'),
-      clickRate:        pick('clickRate', 'ctr'),
-      clickPayRate:     pick('clickPayRate', 'clickConvRate', 'payRateAfterClick'),
+      // —— 转化情况(Temu 返小数 0-1,这里 ×100 转成 0-100 整数%)
+      conversionRate:   rate(pick('exposePayConversionRate', 'conversionRate', 'payConvRate')),
+      clickRate:        rate(pick('exposeClickConversionRate', 'clickRate', 'ctr')),
+      clickPayRate:     rate(pick('clickPayConversionRate', 'clickPayRate', 'clickConvRate')),
 
       // —— 搜索数据
-      searchExposureNum:  pick('searchExposureNum', 'searchExposeNum'),
+      searchExposureNum:  pick('searchExposeNum', 'searchExposureNum'),
       searchClickNum:     pick('searchClickNum'),
       searchPayOrderNum:  pick('searchPayOrderNum'),
-      searchPayItemNum:   pick('searchPayItemNum'),
+      searchPayItemNum:   pick('searchPayGoodsNum', 'searchPayItemNum'),
 
       // —— 推荐数据
-      recExposureNum:     pick('recommendExposureNum', 'recExposureNum'),
+      recExposureNum:     pick('recommendExposeNum', 'recommendExposureNum', 'recExposureNum'),
       recClickNum:        pick('recommendClickNum', 'recClickNum'),
       recPayOrderNum:     pick('recommendPayOrderNum', 'recPayOrderNum'),
-      recPayItemNum:      pick('recommendPayItemNum', 'recPayItemNum'),
+      recPayItemNum:      pick('recommendPayGoodsNum', 'recommendPayItemNum', 'recPayItemNum'),
 
       // —— 增长潜力 / 标签
-      growthTagList:      Array.isArray(item?.tagList) ? item.tagList
-                          : (Array.isArray(item?.growthTags) ? item.growthTags : null),
+      growthTagList: [
+        ...(item?.bsrGoods ? ['BSR'] : []),
+        ...(item?.canContinueToGrow ? ['可持续增长'] : []),
+        ...(typeof item?.growDataText === 'string' && item.growDataText ? [item.growDataText] : []),
+      ],
 
-      platformPayload:    item,  // 保 raw,字段名 misalign 时方便事后映射
+      // ★ 环比 — 各指标的环比变化(Temu 返的小数 (now-prev)/prev),前端直接用
+      compareData,
+
+      platformPayload:    item,  // 保 raw,后续字段扩展时方便对照
     });
   }
   console.log(`[temu] transformFluxAnalysisResponse: ${rawItems.length} items → ${rows.length} rows (statisticType=${dateLabel})`);
