@@ -353,6 +353,8 @@ export function transformPriceAdjustResponse(rawItems) {
 export function transformFluxAnalysisResponse(rawItems, payload = {}) {
   const rows = [];
   const dateLabel = payload?.statisticType ?? 'unknown';
+  // 采集当天的本地日期(yyyy-mm-dd)— ingester 落 snapshotDate 唯一键
+  const snapshotDate = new Date().toISOString().slice(0, 10);
   for (const item of rawItems) {
     const platformProductId = String(
       item?.productId ?? item?.goodsId ?? item?.productSpuId ?? ''
@@ -378,8 +380,9 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
       categoryName:     item?.categoryName ?? item?.catName ?? null,
       siteId:           item?.siteId ?? null,
       siteName:         item?.siteName ?? null,
-      // 周期标识(查询条件之一,落库时按需)
+      // 周期标识 + 采集日期(ingester 落 (shopId, platformProductId, statisticType, snapshotDate) 唯一键)
       statisticType:    dateLabel,
+      snapshotDate,
 
       // —— 流量情况
       exposureNum:      pick('exposureNum', 'exposeNum', 'impressionNum', 'pv'),
