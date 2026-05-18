@@ -36,7 +36,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-real-flux-analysis-20260517a';
+const AGENT_BUILD_ID   = 'agent-rate-limit-20260517a';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -452,6 +452,82 @@ async function dispatchDeclaredPrice(task, signal) {
   };
 }
 
+// ── 限流检测 + per-mallId 冷却 ────────────────────────────────────
+// 背景:Temu agentseller 在限流时常常 HTTP 200 + body 里塞 error_code/error_msg,
+// 前端组件吞掉只显示"暂无数据";真要靠这个就出生产事故。所以双层检测:
+//   1) HTTP 429 + Retry-After
+//   2) body 启发式(error_code 模式 + 关键字)
+// 命中后:抛 RATE_LIMITED → executeTask 兜底 → 同时把这个 mallId 标进冷却。
+// 后续 task 来到 dispatchViaHiddenTab 先看冷却,active 就 fail-fast。
+//
+// 冷却时长:有 retryAfterMs 用之;没有则默认 10 分钟。
+// 落 chrome.storage.session 让 SW 重启也不丢。
+
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;     // 10 min
+const RATE_LIMIT_MAX_COOLDOWN_MS     = 60 * 60 * 1000;     // 1 h hard cap
+const COOLDOWN_KEY = (mallId) => `agent:cooldown:${mallId}`;
+
+// Temu / 通用限流 error_code 黑名单(已知 + 启发)。
+// 边遇到边补,不要太严:误判会让正常 task 假死。
+const RATE_LIMIT_ERROR_CODES = new Set([
+  // Temu 系列(常见):
+  // 4xx 系列里以 1xxx / 2xxx 结尾的常是"请求过于频繁/被风控"
+  // 这里先按观察样本兜:遇到精确 code 时补 set
+]);
+const RATE_LIMIT_MSG_PATTERNS = [
+  /频次/i, /频率/i, /请求过于频繁/i, /稍后(重试|再试)/i,
+  /rate.?limit/i, /too many requests/i, /try again later/i, /throttl/i,
+];
+
+function rateLimitedError({ retryAfterMs, httpStatus, msg }) {
+  return Object.assign(new Error(`RATE_LIMITED: ${msg}`), {
+    code: 'RATE_LIMITED',
+    retryAfterMs,
+    httpStatus,
+  });
+}
+
+function detectRateLimitInBody(data) {
+  if (!data || typeof data !== 'object') return null;
+  const code = data.error_code ?? data.errorCode ?? data.code;
+  const msg = String(data.error_msg ?? data.errorMsg ?? data.message ?? data.msg ?? '');
+  if (code != null && RATE_LIMIT_ERROR_CODES.has(Number(code))) {
+    return { reason: `error_code=${code} ${msg.slice(0, 120)}`, retryAfterMs: null };
+  }
+  for (const pat of RATE_LIMIT_MSG_PATTERNS) {
+    if (pat.test(msg)) {
+      return { reason: `msg matches ${pat} (${msg.slice(0, 80)})`, retryAfterMs: null };
+    }
+  }
+  return null;
+}
+
+async function getMallCooldown(mallId) {
+  try {
+    const key = COOLDOWN_KEY(mallId);
+    const stored = await chrome.storage.session.get(key);
+    const c = stored[key];
+    if (c && c.untilMs > Date.now()) return c;
+    if (c) await chrome.storage.session.remove(key).catch(() => {});
+  } catch {}
+  return null;
+}
+
+async function setMallCooldown(mallId, retryAfterMs, reason) {
+  const dur = Math.min(
+    Math.max(retryAfterMs ?? RATE_LIMIT_DEFAULT_COOLDOWN_MS, 60_000),  // ≥ 1 min
+    RATE_LIMIT_MAX_COOLDOWN_MS,
+  );
+  const entry = { untilMs: Date.now() + dur, durationMs: dur, reason };
+  try {
+    await chrome.storage.session.set({ [COOLDOWN_KEY(mallId)]: entry });
+    console.warn(`[agent ${AGENT_BUILD_ID}] cooldown SET mall=${mallId} for ${(dur/60000).toFixed(1)}min — ${reason}`);
+  } catch (e) {
+    console.warn('[agent] cooldown set failed:', e?.message);
+  }
+  return entry;
+}
+
 // ── Session cache:每个 mallId 一份 captured headers ───────────────────
 // MV3 SW 在两次 task 之间(空闲 >30s)会被 chrome 终止,module-level Map 丢失。
 // 用 chrome.storage.session(in-memory,跨 SW 重启 OK,浏览器关进程才清)
@@ -505,6 +581,17 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
   };
 
   const mallId = payload.mallId || 'default';
+
+  // 冷却 check —— 限流后冷却窗口内,fail-fast,免得一直撞 + 让 retry 调度自然 backoff
+  const cd = await getMallCooldown(mallId);
+  if (cd) {
+    const remainMin = ((cd.untilMs - Date.now()) / 60000).toFixed(1);
+    throw Object.assign(
+      new Error(`RATE_LIMITED: mall=${mallId} cooldown active, ${remainMin}min remaining (${cd.reason})`),
+      { code: 'RATE_LIMITED', retryAfterMs: cd.untilMs - Date.now(), source: 'cooldown-cache' },
+    );
+  }
+
   let session = await getCachedSession(mallId);
 
   if (!session) {
@@ -519,7 +606,17 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
   // SW 上下文分页 fetch — host_permissions + credentials:include → cookies 自动带
   checkAbort();
   const targetUrl = `${session.origin}${spec.apiUrlPattern}`;
-  const rawItems = await paginatedFetchInSW(spec, payload, targetUrl, session.headers, signal);
+
+  let rawItems;
+  try {
+    rawItems = await paginatedFetchInSW(spec, payload, targetUrl, session.headers, signal);
+  } catch (e) {
+    // 命中限流 → 写冷却,然后原样上抛
+    if (e?.code === 'RATE_LIMITED') {
+      await setMallCooldown(mallId, e.retryAfterMs, e.message?.slice(0, 200));
+    }
+    throw e;
+  }
 
   // transform
   checkAbort();
@@ -637,6 +734,15 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       headers,
       body: JSON.stringify(body),
     });
+    // 限流检测(HTTP 层):429 + Retry-After
+    if (resp.status === 429) {
+      const retryAfterSec = Number(resp.headers.get('Retry-After')) || 0;
+      throw rateLimitedError({
+        retryAfterMs: retryAfterSec ? retryAfterSec * 1000 : null,
+        httpStatus: 429,
+        msg: `HTTP 429 Too Many Requests${retryAfterSec ? ` (Retry-After=${retryAfterSec}s)` : ''}`,
+      });
+    }
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
       throw Object.assign(
@@ -647,6 +753,17 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
     let data;
     try { data = await resp.json(); }
     catch (e) { throw Object.assign(new Error(`PARSE_FAILED: ${e.message}`), { code: 'PARSE_FAILED' }); }
+
+    // 限流检测(应用层):Temu 经常 HTTP 200 + body 里塞 error_code/error_msg。
+    // 走 detectRateLimit 启发式判断,命中就抛 RATE_LIMITED 让上游做冷却。
+    const rl = detectRateLimitInBody(data);
+    if (rl) {
+      throw rateLimitedError({
+        retryAfterMs: rl.retryAfterMs ?? null,
+        httpStatus: 200,
+        msg: `Temu rate-limited: ${rl.reason}`,
+      });
+    }
 
     const list = getPath(data, spec.listPath);
     if (!Array.isArray(list)) {
