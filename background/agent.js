@@ -26,6 +26,7 @@ import {
   transformPriceAdjustResponse,
   transformFluxAnalysisResponse,
   transformFluxAnalysisDetailResponse,
+  transformLifecycleResponse,
 } from './transform/sku_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
@@ -37,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-detail-real-20260518b';
+const AGENT_BUILD_ID   = 'agent-mallcache-fix-20260519d';
 
 // 全托管流量分析按地区分 3 个 tab,Temu 后端用 siteId 区分。具体数字暂占位
 // (TODO:实测全球/美国/欧洲页面的请求 body 后修正)。Frontend 也可以传明确
@@ -46,6 +47,27 @@ const REGION_TO_SITE_ID = {
   global: 0,       // 全球(已实测)
   us:     100,     // 美国 — TODO 实测
   eu:     200,     // 欧洲 — TODO 实测
+};
+
+// ★ 流量页 region-aware endpoint(2026-05-18 用户确认):三个 region 的 API path
+// 完全一致,只是 origin(域名前缀)不同。plugin 走 dispatchViaHiddenTab → 打开
+// pageUrl 拿 session.origin → 拼接 apiUrlPattern 后 fetch,所以 path 共用即可。
+const REGION_TO_FLUX_PAGE_URL = {
+  global: 'https://agentseller.temu.com/main/flux-analysis-full',
+  us:     'https://agentseller-us.temu.com/main/flux-analysis-full',
+  eu:     'https://agentseller-eu.temu.com/main/flux-analysis-full',
+};
+const FLUX_LIST_API_PATH   = '/api/seller/full/flow/analysis/goods/list';
+const FLUX_DETAIL_API_PATH = '/api/seller/full/flow/analysis/goods/detail';
+const REGION_TO_FLUX_LIST_API = {
+  global: FLUX_LIST_API_PATH,
+  us:     FLUX_LIST_API_PATH,
+  eu:     FLUX_LIST_API_PATH,
+};
+const REGION_TO_FLUX_DETAIL_API = {
+  global: FLUX_DETAIL_API_PATH,
+  us:     FLUX_DETAIL_API_PATH,
+  eu:     FLUX_DETAIL_API_PATH,
 };
 const AGENT_IMPORT_URL = import.meta.url;
 
@@ -60,6 +82,51 @@ function agentDiag() {
 
 // 正在执行的 task: taskId → { heartbeatTimer, abort }
 const _running = new Map();
+
+// ── 登录健康度(plugin 实测)─────────────────────────────────────
+// chrome.cookies 只能查存在性,查不出 token 是否过期。plugin 端在每次 capture
+// 成功/失败时把对应子域的真实状态写进 chrome.storage.local,popup 的"在线情况"
+// 优先读这个实测值,覆盖 cookie 检测。
+const LOGIN_HEALTH_KEY = 'agent:loginHealth';
+
+function regionKeyFromPageUrl(pageUrl) {
+  try {
+    const host = new URL(pageUrl).hostname;
+    const HOST_TO_KEY = {
+      'agentseller.temu.com':    'global',
+      'agentseller-us.temu.com': 'us',
+      'agentseller-eu.temu.com': 'eu',
+      'seller.kuajingmaihuo.com': 'kjmh',
+    };
+    return HOST_TO_KEY[host] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ★ 从 captured headers 抽 Temu 当前登录的 mallId。Temu agentseller 用 lowercase 'mallid' header,
+// 部分接口经 cookies 出现 mall_id_cookies 等变种 — 这里尽量宽容多 alias。
+function extractMallIdFromHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return null;
+  const aliases = ['mallid', 'mallId', 'mall-id', 'mall_id', 'mall_id_cookies', 'mallid_cookies'];
+  for (const k of aliases) {
+    const v = headers[k] ?? headers[k.toLowerCase()];
+    if (v != null && String(v).trim()) return String(v).trim();
+  }
+  return null;
+}
+
+async function updateLoginHealth(regionKey, status, reason = null) {
+  if (!regionKey) return;
+  try {
+    const stored = await chrome.storage.local.get(LOGIN_HEALTH_KEY);
+    const cur = stored[LOGIN_HEALTH_KEY] || {};
+    cur[regionKey] = { status, reason, updatedAt: Date.now() };
+    await chrome.storage.local.set({ [LOGIN_HEALTH_KEY]: cur });
+  } catch (e) {
+    console.warn(`[agent] updateLoginHealth(${regionKey}=${status}) failed:`, e?.message);
+  }
+}
 
 // ── 配置 ───────────────────────────────────────────────────────────
 async function getCfg() {
@@ -172,7 +239,9 @@ const KIND_TO_FETCH_SPEC = {
     paginationMode: 'pageNo',
     pageSize: 50,
     // buildBody 返 base body — runFetchInTab 在 pageNo 模式下注入 pageNo+pageSize
-    buildBody: (_payload) => ({}),
+    // needSessionItem/needCanEnrollCnt:tips.txt 2026-05-18 实测 cURL 揭示后台真用这俩 flag
+    // 拿到 thematicList[].sessionItem(场次)+ canEnrollCnt(可报数量),不带 flag 时这两块字段为空。
+    buildBody: (_payload) => ({ needSessionItem: true, needCanEnrollCnt: true }),
     listPath: 'result.activityList',
     totalPath: 'result.total',
     transform: (rawItems, payload) =>
@@ -269,6 +338,29 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems, payload) => transformFluxAnalysisDetailResponse(rawItems, payload),
   },
+  // scrape:lifecycle-management — 抓"上新生命周期 — 价格申报中"列表(对照 Sallfox Temu核价主表)
+  // payload: { mallId, supplierTodoType?(默认1=价格申报中) }
+  //   POST /api/kiana/mms/robin/searchForChainSupplier
+  //   body: { pageSize, pageNum, removeStatus:0, supplierTodoTypeList:[type] }
+  //   pagination: pageNum 字段(不是 pageNo)+ pageSize
+  //   listPath: result.dataList  totalPath: result.total
+  // 落库:price_review (展开 SPU → SKC → SKU → siteList)
+  'scrape:lifecycle-management': {
+    pageUrl: 'https://agentseller.temu.com/newon/product-select',
+    apiUrlPattern: '/api/kiana/mms/robin/searchForChainSupplier',
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 30,
+    pageNoKey: 'pageNum',        // ★ Temu 用 pageNum 不是 pageNo
+    pageSizeKey: 'pageSize',
+    buildBody: (payload) => ({
+      removeStatus: 0,
+      supplierTodoTypeList: [payload?.supplierTodoType ?? 1],   // 1 = 价格申报中
+    }),
+    listPath: 'result.dataList',
+    totalPath: 'result.total',
+    transform: (rawItems, payload) => transformLifecycleResponse(rawItems, payload),
+  },
   // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
   // payload: { mallId }
   // 数据先存 agent_task.result;PriceReview / DeclaredPrice 表 schema 后续设计。
@@ -326,6 +418,14 @@ async function dispatch(task, signal) {
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchDeclaredPrice (REAL path)`);
       return dispatchDeclaredPrice(task, signal);
 
+    case 'scrape:lifecycle-management':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchLifecycleManagement (REAL path)`);
+      return dispatchLifecycleManagement(task, signal);
+
+    case 'submit:price-confirm':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchPriceConfirm (REAL path)`);
+      return dispatchPriceConfirm(task, signal);
+
     case 'scrape:flux-analysis':
       console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysis (REAL path)`);
       return dispatchFluxAnalysis(task, signal);
@@ -351,7 +451,9 @@ async function dispatch(task, signal) {
       };
     }
     case 'submit:activity-enroll':
-    case 'submit:price-confirm':
+      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityEnroll (REAL path)`);
+      return dispatchActivityEnroll(task, signal);
+
     case 'submit:price-reject':
       throw Object.assign(new Error('写操作还没接，第三阶段做'), { code: 'NOT_IMPLEMENTED' });
     default:
@@ -450,8 +552,14 @@ async function dispatchActivityData(task, signal) {
 }
 
 // ── scrape:flux-analysis 专用 wrapper ────────────────────────────
-// 任务语义:抓"商品流量"(全托管 SPU 级,Sallfox 产品分析的流量数据源)。
-// payload: { mallId, statisticType?, siteId?, quickFilter? }
+// 任务语义:抓"商品流量"(全托管 SPU 级,Sallfox 产品分析的数据源)。
+// ★ 2026-05-18 改为 list+detail 捆绑:
+//   1) 跑 list 拉 SPU 汇总
+//   2) 复用同 session(已 captured headers / origin)对 exposureNum>0 的 SPU
+//      并发 fetch detail(单 SPU 30 天明细),累积进 result.detailRows
+//   server ingester 同时落 list rows + detail rows,不再走 chain-trigger 派
+//   单独的 scrape:flux-analysis-detail task。
+// payload: { mallId, region?, statisticType?, siteId?, quickFilter?, detailPageSize? }
 async function dispatchFluxAnalysis(task, signal) {
   const payload = task.payload ?? {};
   if (!payload.mallId) {
@@ -460,13 +568,115 @@ async function dispatchFluxAnalysis(task, signal) {
       { code: 'BAD_PAYLOAD' },
     );
   }
-  const spec = KIND_TO_FETCH_SPEC['scrape:flux-analysis'];
-  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  const region = payload.region ?? 'global';
+  const listApi = REGION_TO_FLUX_LIST_API[region];
+  const detailApi = REGION_TO_FLUX_DETAIL_API[region];
+  const pageUrl = REGION_TO_FLUX_PAGE_URL[region];
+  if (!listApi || !detailApi) {
+    throw Object.assign(
+      new Error(`flux endpoints not configured for region=${region}`),
+      { code: 'BAD_REGION' },
+    );
+  }
+  const spec = {
+    ...KIND_TO_FETCH_SPEC['scrape:flux-analysis'],
+    apiUrlPattern: listApi,
+    pageUrl,
+  };
+  const { rawItems, transformed: listRows } = await dispatchViaHiddenTab(spec, payload, signal);
+
+  // ── Phase 2:同 session 批量 fetch detail ────────────────────────
+  // dispatchViaHiddenTab 跑完后 mallId session 已 cached(setCachedSession),拿来直接 POST detail。
+  const session = await getCachedSession(payload.mallId);
+  let detailRows = [];
+  let detailStats = { candidates: 0, success: 0, failed: 0, skipped: 0 };
+  if (!session) {
+    console.warn(`[agent ${AGENT_BUILD_ID}] flux-analysis: list 完成但 session 丢失(罕见),跳过 detail`);
+  } else {
+    const candidates = listRows.filter((r) => Number(r?.exposureNum ?? 0) > 0 && r?.platformProductId);
+    detailStats.candidates = candidates.length;
+    const detailUrl = `${session.origin}${detailApi}`;
+    const detailHeaders = { ...session.headers, 'content-type': 'application/json' };
+    const detailPageSize = payload.detailPageSize ?? 30;   // 一次 30 天够覆盖 weekly + 月度对比窗口
+    const CONCURRENCY = 3;
+    let idx = 0;
+    async function worker() {
+      while (idx < candidates.length) {
+        if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+        const i = idx++;
+        const r = candidates[i];
+        const goodsId = r?.platformPayload?.goodsId
+          ?? r?.platformPayload?.productSpuId
+          ?? null;
+        if (!goodsId) { detailStats.skipped++; continue; }
+        try {
+          const body = {
+            goodsId: Number(goodsId),
+            siteId: payload.siteId ?? -1,
+            statTimeDimension: 1,
+            pageNum: 1,
+            pageSize: detailPageSize,
+          };
+          const resp = await fetch(detailUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: detailHeaders,
+            body: JSON.stringify(body),
+          });
+          if (resp.status === 429) {
+            const retryAfterSec = Number(resp.headers.get('Retry-After')) || 0;
+            throw rateLimitedError({
+              retryAfterMs: retryAfterSec ? retryAfterSec * 1000 : null,
+              httpStatus: 429,
+              msg: `detail HTTP 429 Too Many Requests`,
+            });
+          }
+          if (!resp.ok) throw new Error(`detail HTTP ${resp.status}`);
+          const data = await resp.json();
+          const rl = detectRateLimitInBody(data);
+          if (rl) {
+            throw rateLimitedError({
+              retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200,
+              msg: `Temu rate-limited (detail): ${rl.reason}`,
+            });
+          }
+          const dayItems = data?.result?.list ?? [];
+          const rows = transformFluxAnalysisDetailResponse(dayItems, {
+            region,
+            productSpuId: r.platformProductId,
+            productName:  r.productName,
+            pictureUrl:   r.pictureUrl,
+            goodsId,
+          });
+          detailRows.push(...rows);
+          detailStats.success++;
+        } catch (e) {
+          if (e?.code === 'RATE_LIMITED') {
+            // 限流时直接停止其余 detail fetch — list 仍正常返回,detail 部分留给下次任务
+            console.warn(`[agent ${AGENT_BUILD_ID}] detail rate-limited at SPU ${i + 1}/${candidates.length},停止 detail batch`);
+            idx = candidates.length;       // 让其他 worker 也退出
+            detailStats.failed++;
+            return;
+          }
+          console.warn(`[agent ${AGENT_BUILD_ID}] detail fetch fail spu=${r.platformProductId}: ${e.message}`);
+          detailStats.failed++;
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+    console.log(`[agent ${AGENT_BUILD_ID}] flux-analysis detail batch: ` +
+      `${detailStats.success}/${detailStats.candidates} ok, ${detailStats.failed} failed, ` +
+      `${detailStats.skipped} no-goodsId — ${detailRows.length} day-rows`);
+  }
+
   return {
-    rows: transformed,
+    rows: listRows,
+    detailRows,
+    detailStats,
     rawCount: rawItems.length,
     statisticType: payload.statisticType ?? 5,
     siteId: payload.siteId ?? 0,
+    region,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
@@ -484,13 +694,297 @@ async function dispatchFluxAnalysisDetail(task, signal) {
   if (!payload.goodsId && !payload.productId) {
     throw Object.assign(new Error(`payload.goodsId (or productId) missing for scrape:flux-analysis-detail`), { code: 'BAD_PAYLOAD' });
   }
-  const spec = KIND_TO_FETCH_SPEC['scrape:flux-analysis-detail'];
+  const region = payload.region ?? 'global';
+  const detailApi = REGION_TO_FLUX_DETAIL_API[region];
+  const pageUrl = REGION_TO_FLUX_PAGE_URL[region];
+  if (!detailApi) {
+    throw Object.assign(
+      new Error(`flux detail endpoint not configured for region=${region} (US/EU pending real URL)`),
+      { code: 'BAD_REGION' },
+    );
+  }
+  const spec = {
+    ...KIND_TO_FETCH_SPEC['scrape:flux-analysis-detail'],
+    apiUrlPattern: detailApi,
+    // ★ 关键:flux-analysis-full 列表页默认只发 /list 不发 /detail,所以 capture
+    //   阶段必须等 list 请求(同 mallId session 跨 path 通用)。fetch 仍走 detail。
+    captureApiUrlPattern: REGION_TO_FLUX_LIST_API[region],
+    pageUrl,
+  };
   const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
   return {
     rows: transformed,
     rawCount: rawItems.length,
     productId: payload.productId,
     region: payload.region ?? 'global',
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── submit:price-confirm 专用 wrapper ────────────────────────────
+// 任务语义:把用户在 ERP "查看并确认申报价" modal 里填的新价提交回 Temu。
+// payload: { mallId, priceOrderId, action, items?, reference?, bargainReasonList? }
+//   action='set-ref' / 'set-new' / 'abandon'
+//     set-ref:   bargain-no-bom POST body supplierResult=1, price=参考申报价
+//     set-new:   bargain-no-bom POST body supplierResult=2, price=新申报价(items 必传)
+//     abandon:   reject-remark POST body { orderId }
+//   items: [{ productSkuId, priceCents }]
+// 走 captureSessionViaTab 跟 scrape:lifecycle-management 复用同一 pageUrl(/newon/product-select)
+// 等 list 请求自然发生时 capture anti-content+mallid headers,然后 SW 端 POST 提交。
+async function dispatchPriceConfirm(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId || !payload.priceOrderId) {
+    throw Object.assign(
+      new Error(`payload.mallId/priceOrderId missing for submit:price-confirm`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const action = String(payload.action || 'set-new');
+  const isAbandon = action === 'abandon';
+
+  // Capture spec:复用 lifecycle 同一页 + list endpoint 作为 capture 锚点
+  const captureSpec = {
+    pageUrl: 'https://agentseller.temu.com/newon/product-select',
+    apiUrlPattern: '/api/kiana/mms/robin/searchForChainSupplier',
+  };
+
+  // 拿 session(可能 cache 命中)
+  const mallId = payload.mallId;
+  let session = await getCachedSession(mallId);
+  let freshlyCaptured = false;
+  if (!session) {
+    console.log(`[agent ${AGENT_BUILD_ID}] submit session MISS mall=${mallId} — capturing`);
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+    session = await captureSessionViaTab(captureSpec, payload, signal);
+    freshlyCaptured = true;
+    // 暂不写缓存 — 先 MALL_MISMATCH 检测,避免缓存污染
+  }
+  // MALL_MISMATCH 防御
+  const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
+  if (capturedMall && String(capturedMall) !== String(mallId)) {
+    await invalidateSession(mallId);
+    throw Object.assign(
+      new Error(`MALL_MISMATCH: submit expects mallId=${mallId} but chrome is ${capturedMall}`),
+      { code: 'MALL_MISMATCH' },
+    );
+  }
+  if (freshlyCaptured) {
+    await setCachedSession(mallId, session.headers, session.origin, session.mallId);
+  }
+
+  // 构造请求
+  const submitUrl = isAbandon
+    ? `${session.origin}/api/kiana/mms/magneto/api/price-review-order/no-bom/reject-remark`
+    : `${session.origin}/api/kiana/mms/magneto/price/bargain-no-bom`;
+  const submitBody = isAbandon
+    ? { orderId: Number(payload.priceOrderId) }
+    : {
+        supplierResult: action === 'set-ref' ? 1 : 2,
+        priceOrderId: Number(payload.priceOrderId),
+        items: Array.isArray(payload.items)
+          ? payload.items.map((it) => ({
+              productSkuId: Number(it.productSkuId),
+              price: Number(it.priceCents),    // already in cents
+            }))
+          : [],
+        reference: payload.reference ?? '',
+        bargainReasonList: Array.isArray(payload.bargainReasonList) ? payload.bargainReasonList : [],
+      };
+
+  const headers = { ...session.headers, 'content-type': 'application/json' };
+
+  let respJson;
+  try {
+    const resp = await fetch(submitUrl, {
+      method: 'POST', credentials: 'include', headers, body: JSON.stringify(submitBody),
+    });
+    if (resp.status === 429) {
+      const ra = Number(resp.headers.get('Retry-After')) || 0;
+      throw rateLimitedError({ retryAfterMs: ra ? ra * 1000 : null, httpStatus: 429, msg: 'submit HTTP 429' });
+    }
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw Object.assign(new Error(`SUBMIT_FAILED: HTTP ${resp.status}: ${txt.slice(0, 200)}`), { code: 'SUBMIT_FAILED' });
+    }
+    respJson = await resp.json();
+  } catch (e) {
+    if (e?.code === 'RATE_LIMITED' || e?.code === 'SUBMIT_FAILED' || e?.code === 'MALL_MISMATCH') throw e;
+    throw Object.assign(new Error(`SUBMIT_NETWORK: ${e.message}`), { code: 'SUBMIT_NETWORK' });
+  }
+
+  const rl = detectRateLimitInBody(respJson);
+  if (rl) throw rateLimitedError({ retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200, msg: `submit rate-limited: ${rl.reason}` });
+
+  const ok = respJson?.success === true;
+  return {
+    success: ok,
+    action,
+    endpoint: isAbandon ? 'reject-remark' : 'bargain-no-bom',
+    priceOrderId: payload.priceOrderId,
+    items: submitBody.items ?? null,
+    response: respJson,
+    errorCode: respJson?.errorCode ?? null,
+    errorMsg: respJson?.errorMsg ?? null,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── submit:activity-enroll 专用 wrapper ─────────────────────────
+// 任务语义:报名营销活动(Sallfox "申报" 按钮提交)。
+// payload: { mallId, thematicId, activityType?, sessionId?, items: [{...}] }
+//   items: [{ productId, skcId, productSkuId, supplyPrice(cents), targetActivityStock }]
+// 端点:POST /api/kiana/gamblers/marketing/enroll/submit
+// body 结构 推断(基于 /enroll/* 系列字段命名,实战可能需要 1-2 轮迭代修正)
+//
+// 重要:Temu 返回 errorCode/errorMsg 全量上抛 result(包括 requestBody),
+//      方便事后 debug 字段名是否对得上。
+async function dispatchActivityEnroll(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(new Error('payload.mallId missing'), { code: 'BAD_PAYLOAD' });
+  }
+  if (!payload.thematicId || !Array.isArray(payload.items) || payload.items.length === 0) {
+    throw Object.assign(new Error('payload.thematicId/items missing'), { code: 'BAD_PAYLOAD' });
+  }
+  if (payload.activityType == null) {
+    throw Object.assign(new Error('payload.activityType missing (Temu detail-new 页必须 type 参数)'), { code: 'BAD_PAYLOAD' });
+  }
+
+  // ★ capture 锚点 = activity detail-new 页(对应 thematicId),NOT 顶层 list 页
+  //   原因:Temu submit 不接受随便一个 session,必须是"已经看过这个 thematic 详情页"的 session,
+  //   否则服务端找不到 enrollment context,返回 errorCode=3000000 "报名货品不可为空"。
+  //   detail-new 页自然会触发 /enroll/scroll/match(可报 SKU 列表),从那里捕 headers。
+  const captureSpec = {
+    pageUrl: (p) => `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${p.activityType}&thematicId=${p.thematicId}`,
+    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/scroll/match',
+  };
+
+  const mallId = payload.mallId;
+  // ★ NOT 走 getCachedSession — submit 必须每次 fresh capture 在 detail-new 页上下文,
+  //   再用一遍 list-page cached session 会让 Temu 服务端"忘了"当前正在哪个 thematic 上。
+  console.log(`[agent ${AGENT_BUILD_ID}] enroll always fresh-capture (detail-new) thematic=${payload.thematicId}`);
+  if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+  const session = await captureSessionViaTab(captureSpec, payload, signal);
+  // MALL_MISMATCH 防御
+  const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
+  if (capturedMall && String(capturedMall) !== String(mallId)) {
+    throw Object.assign(
+      new Error(`MALL_MISMATCH: enroll expects mallId=${mallId} but chrome is ${capturedMall}`),
+      { code: 'MALL_MISMATCH' },
+    );
+  }
+
+  // ★ Temu /enroll/submit body 结构(2026-05-19 真 cURL 实测 — DevTools 不显示 Payload,
+  //   用 window.fetch 注入 hook 在 console 捕到):
+  //   {
+  //     activityType: 13,
+  //     activityThematicId: 2605120000000022,             // ← 数字 不是 string
+  //     productList: [                                    // ← productList,NOT submitList
+  //       { productId, activityStock, skcList: [
+  //         { skcId, skuList: [{ skuId, activityPrice }] }
+  //       ]}
+  //     ]
+  //   }
+  // ★ 旧版本错用 submitList → Temu 找不到货品数组 → "报名货品不可为空"。
+  // ★ 所有 ID 字段都是 number(实测 10-16 位都在 Number.MAX_SAFE_INTEGER 之内)。
+  const byProduct = new Map();
+  for (const it of payload.items) {
+    if (it.productId == null || it.productId === '') {
+      throw Object.assign(
+        new Error(`BAD_PAYLOAD: items[].productId missing — Temu 必填,空值必返回"报名货品不可为空"`),
+        { code: 'BAD_PAYLOAD', offendingItem: it },
+      );
+    }
+    const pKey = String(it.productId);
+    if (!byProduct.has(pKey)) {
+      byProduct.set(pKey, {
+        productId: Number(it.productId),                    // ★ number(真 body 是 numeric)
+        activityStock: Number(it.targetActivityStock) || 0,
+        skcMap: new Map(),
+      });
+    }
+    const prod = byProduct.get(pKey);
+    const sKey = String(it.skcId ?? '');
+    if (!prod.skcMap.has(sKey)) prod.skcMap.set(sKey, { skcId: Number(it.skcId), skuList: [] });
+    prod.skcMap.get(sKey).skuList.push({
+      skuId: Number(it.productSkuId),
+      activityPrice: Number(it.supplyPrice),                // cents
+    });
+  }
+  const productList = Array.from(byProduct.values()).map((p) => ({
+    productId: p.productId,
+    activityStock: p.activityStock,
+    skcList: Array.from(p.skcMap.values()),
+  }));
+
+  const submitBody = {
+    activityType: Number(payload.activityType),
+    activityThematicId: Number(payload.thematicId),
+    productList,
+    ...(payload.sessionId != null ? { sessionId: Number(payload.sessionId) } : {}),
+  };
+
+  const submitUrl = `${session.origin}/api/kiana/gamblers/marketing/enroll/submit`;
+  const headers = { ...session.headers, 'content-type': 'application/json' };
+
+  let respJson;
+  try {
+    const resp = await fetch(submitUrl, {
+      method: 'POST', credentials: 'include', headers, body: JSON.stringify(submitBody),
+    });
+    if (resp.status === 429) {
+      const ra = Number(resp.headers.get('Retry-After')) || 0;
+      throw rateLimitedError({ retryAfterMs: ra ? ra * 1000 : null, httpStatus: 429, msg: 'enroll HTTP 429' });
+    }
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw Object.assign(
+        new Error(`SUBMIT_FAILED: HTTP ${resp.status}: ${txt.slice(0, 200)}`),
+        { code: 'SUBMIT_FAILED', requestBody: submitBody, httpStatus: resp.status, rawText: txt.slice(0, 500) },
+      );
+    }
+    respJson = await resp.json();
+  } catch (e) {
+    if (e?.code === 'RATE_LIMITED' || e?.code === 'SUBMIT_FAILED' || e?.code === 'MALL_MISMATCH') throw e;
+    throw Object.assign(new Error(`SUBMIT_NETWORK: ${e.message}`), { code: 'SUBMIT_NETWORK' });
+  }
+
+  const rl = detectRateLimitInBody(respJson);
+  if (rl) throw rateLimitedError({ retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200, msg: `enroll rate-limited: ${rl.reason}` });
+
+  // 全量上抛 response + requestBody,便于 server 端 ingester debug + 后续修正 body schema
+  return {
+    success: respJson?.success === true,
+    response: respJson,
+    requestBody: submitBody,
+    errorCode: respJson?.errorCode ?? respJson?.error_code ?? null,
+    errorMsg: respJson?.errorMsg ?? respJson?.error_msg ?? null,
+    submittedCount: payload.items.length,
+    thematicId: payload.thematicId,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:lifecycle-management 专用 wrapper ─────────────────────
+// 任务语义:抓 Temu "上新生命周期 — 价格申报中" 列表(Sallfox Temu核价 数据源)。
+// payload: { mallId, supplierTodoType? }
+async function dispatchLifecycleManagement(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:lifecycle-management`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const spec = KIND_TO_FETCH_SPEC['scrape:lifecycle-management'];
+  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
+  return {
+    rows: transformed,
+    rawCount: rawItems.length,
+    supplierTodoType: payload?.supplierTodoType ?? 1,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
@@ -637,8 +1131,9 @@ async function getCachedSession(mallId) {
   return null;
 }
 
-async function setCachedSession(mallId, headers, origin) {
-  const entry = { headers, origin, expiresAt: Date.now() + SESSION_TTL_MS };
+async function setCachedSession(mallId, headers, origin, capturedMallId = null) {
+  // capturedMallId = 从 captured headers 实测出的 mallId(可能跟 mallId arg 不一致,用于反向校验)
+  const entry = { headers, origin, mallId: capturedMallId ?? mallId, expiresAt: Date.now() + SESSION_TTL_MS };
   sessionCacheMem.set(mallId, entry);
   try {
     await chrome.storage.session.set({ [SESSION_KEY(mallId)]: entry });
@@ -687,13 +1182,35 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     }
 
     let session = await getCachedSession(mallId);
+    let freshlyCaptured = false;
     if (!session) {
       console.log(`[agent ${AGENT_BUILD_ID}] session MISS mall=${mallId} attempt=${attempt} — capturing via tab`);
       checkAbort();
       session = await captureSessionViaTab(spec, payload, signal);
-      await setCachedSession(mallId, session.headers, session.origin);
+      freshlyCaptured = true;
+      // ★ 注意:暂时不写缓存 — 先做 MALL_MISMATCH 检测,
+      //   chrome 登的是别的 mall 时 capture 出来的 headers 跟 task 期望对不上,
+      //   写进缓存会污染下次同 mallId 任务(造成 "session HIT" + MALL_MISMATCH 怪象)
     } else {
       console.log(`[agent ${AGENT_BUILD_ID}] session HIT mall=${mallId} attempt=${attempt} — SW fetch`);
+    }
+
+    // ★ 跨店数据污染防御:plugin 打开的 hidden tab 永远是 chrome 当前登录的 mallId,
+    // 跟 payload.mallId 不一致就 fail-fast,避免把 A 店的数据写进 B 店。
+    // (例如同 chrome profile 多个 ERP 店共享一个 Temu 登录账号时)
+    const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
+    if (capturedMall && String(capturedMall) !== String(mallId)) {
+      // 把脏缓存清掉,下次任务来再 capture 一次(用户可能切登过来了)
+      await invalidateSession(mallId);
+      throw Object.assign(
+        new Error(`MALL_MISMATCH: task expects mallId=${mallId} but chrome is logged in as ${capturedMall}`),
+        { code: 'MALL_MISMATCH', expectedMallId: mallId, capturedMallId: capturedMall },
+      );
+    }
+
+    // 校验通过才写缓存(只在 fresh capture 时;HIT 路径不重复写)
+    if (freshlyCaptured) {
+      await setCachedSession(mallId, session.headers, session.origin, session.mallId);
     }
 
     checkAbort();
@@ -777,22 +1294,46 @@ async function captureSessionViaTab(spec, payload, signal) {
     }
 
     // executeScript:只捕 headers,不 fetch(fetch 移到 SW 上下文)
+    // ★ captureApiUrlPattern 优先:detail 接口页面不会主动发,要等 list 请求来捕 mallId/anti-content
+    //   headers(同 mallId session 跨 path 通用),fetch 时仍走原 spec.apiUrlPattern。
+    const captureUrlPattern = spec.captureApiUrlPattern ?? spec.apiUrlPattern;
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       func: captureHeadersInTab,
       args: [{
-        apiUrlPattern: spec.apiUrlPattern,
+        apiUrlPattern: captureUrlPattern,
         captureTimeoutMs: CAPTURE_TIMEOUT_MS,
       }],
     });
     if (!result || result.ok !== true) {
+      // ★ capture 失败时,先看 tab 是不是被 redirect 到登录页 — 这是子域 token 过期
+      // 最常见的症状。识别到了就标 LOGIN_REQUIRED + 更新 loginHealth,popup 实时反映。
+      const regionKey = regionKeyFromPageUrl(resolvedPageUrl);
+      let currentUrl = null;
+      try {
+        const t = await chrome.tabs.get(tabId);
+        currentUrl = t?.url || null;
+      } catch {}
+      const isLoginRedirect = currentUrl && /\/(login|sign-?in|auth|oauth|seller-login)/i.test(currentUrl);
+      if (isLoginRedirect && regionKey) {
+        await updateLoginHealth(regionKey, 'expired', `redirected to login: ${currentUrl}`);
+        throw Object.assign(
+          new Error(`LOGIN_REQUIRED: ${regionKey} 子域 token 已过期,需要重新登录 (now at ${currentUrl})`),
+          { code: 'LOGIN_REQUIRED', region: regionKey, currentUrl },
+        );
+      }
+      if (regionKey) await updateLoginHealth(regionKey, 'unknown', result?.error ?? 'capture failed');
       throw Object.assign(
         new Error(`CAPTURE_FAILED: ${result?.error ?? 'unknown'} (phase=${result?.phase ?? 'n/a'})`),
         { code: 'CAPTURE_FAILED', detail: result },
       );
     }
-    return { headers: result.headers, origin: result.origin };
+    // ★ 成功 — region 已确认登录态有效
+    const okRegionKey = regionKeyFromPageUrl(resolvedPageUrl);
+    if (okRegionKey) await updateLoginHealth(okRegionKey, 'ok', null);
+    const capturedMallId = extractMallIdFromHeaders(result.headers);
+    return { headers: result.headers, origin: result.origin, mallId: capturedMallId };
   } finally {
     await cleanup();
   }

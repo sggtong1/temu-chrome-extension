@@ -104,122 +104,296 @@ const shadow = host.attachShadow({ mode: 'closed' });
 shadow.innerHTML = `
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  :host { font-family: system-ui; font-size: 12px; }
-
-  .bar {
-    background: #1e40af; color: white;
-    padding: 6px 10px; border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(30,64,175,.35);
-    display: flex; align-items: center; gap: 8px;
-    cursor: grab; white-space: nowrap;
+  :host {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 12px;
+    color: #1f2937;
   }
-  .bar-label { font-weight: 600; }
-  .bar-sub { opacity: .65; font-size: 10px; }
-  .bar-btn { margin-left: 4px; background: rgba(255,255,255,.2); border-radius: 3px; padding: 1px 5px; font-size: 11px; cursor: pointer; }
 
-  .panel { width: 340px; box-shadow: 0 4px 20px rgba(0,0,0,.15); border-radius: 8px; overflow: hidden; }
+  /* ─── 收起态：横向 bar ─── */
+  .bar {
+    background: linear-gradient(135deg, #232c47 0%, #1f2740 100%);
+    color: #e3e7f3;
+    padding: 7px 10px 7px 8px;
+    border-radius: 18px;
+    box-shadow: 0 6px 20px rgba(31,39,64,.35);
+    display: flex; align-items: center; gap: 6px;
+    cursor: grab; white-space: nowrap;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .bar-logo {
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    background: #f0b429;
+    color: #1f2740;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px;
+    flex-shrink: 0;
+  }
+  .bar-label { font-weight: 600; color: #fff; font-size: 12px; }
+  .bar-sub { color: #9aa3c7; font-size: 11px; }
+  .bar-btn {
+    margin-left: 2px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 11px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    color: #d8def0;
+    transition: background .15s;
+  }
+  .bar-btn:hover { background: rgba(255,255,255,0.16); color: #fff; }
+
+  /* ─── 展开态：panel ─── */
+  .panel {
+    width: 340px;
+    background: #fff;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #eef0f4;
+  }
 
   .header {
-    background: #1e40af; color: white; padding: 8px 12px; cursor: grab;
-    display: flex; justify-content: space-between; align-items: center;
+    background: linear-gradient(180deg, #1f2740 0%, #232c47 100%);
+    color: #fff;
+    padding: 10px 12px;
+    cursor: grab;
+    display: flex; align-items: center; gap: 8px;
   }
-  .header-title { font-weight: 600; font-size: 13px; pointer-events: none; }
+  .header-logo {
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    background: #f0b429;
+    color: #1f2740;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px;
+    pointer-events: none;
+  }
+  .header-title { font-weight: 600; font-size: 13px; flex: 1; pointer-events: none; }
+  .header-sub { font-size: 10px; color: #9aa3c7; margin-left: auto; pointer-events: none; }
   .header-btn {
-    background: rgba(255,255,255,.2); border: none; color: white;
-    border-radius: 4px; width: 22px; height: 22px; cursor: pointer;
-    font-size: 15px; line-height: 1;
+    background: rgba(255,255,255,0.1);
+    border: 0; color: #d8def0;
+    border-radius: 4px; width: 22px; height: 22px;
+    cursor: pointer; font-size: 14px; line-height: 1;
     display: flex; align-items: center; justify-content: center;
+    margin-left: 4px;
+  }
+  .header-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
+
+  .body { background: #fff; }
+
+  .section {
+    padding: 10px 14px;
+    border-bottom: 1px solid #f0f2f5;
+  }
+  .section:last-of-type { border-bottom: 0; }
+  .section-label {
+    font-size: 10px; font-weight: 600; color: #6b7280;
+    letter-spacing: .04em; margin-bottom: 8px;
+    text-transform: uppercase;
   }
 
-  .body { background: white; }
-  .two-col { display: flex; border-bottom: 1px solid #e2e8f0; }
-  .col { flex: 1; padding: 12px; }
-  .col:first-child { border-right: 1px solid #e2e8f0; }
-  .col-label { font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: .05em; margin-bottom: 8px; }
+  .modules {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+  }
+  .modules label {
+    display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; font-size: 12px; color: #4b5563;
+    padding: 2px 0;
+  }
+  .modules input[type=checkbox] {
+    accent-color: #4f64f6;
+    width: 13px; height: 13px;
+    margin: 0;
+  }
 
-  .modules { display: flex; flex-direction: column; gap: 6px; }
-  .modules label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-
-  .param-row { margin-bottom: 8px; }
-  .param-row:last-child { margin-bottom: 0; }
-  .param-label { font-size: 10px; color: #94a3b8; margin-bottom: 3px; }
+  .param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
+  }
+  .param-grid .param-row.full { grid-column: 1 / -1; }
+  .param-row { display: flex; flex-direction: column; gap: 3px; }
+  .param-label {
+    font-size: 11px; color: #6b7280;
+  }
   select, input[type=date] {
-    width: 100%; font-size: 11px; padding: 4px;
-    border: 1px solid #e2e8f0; border-radius: 4px; background: #f8fafc;
+    width: 100%; font-size: 12px; padding: 5px 6px;
+    border: 1px solid #d1d5db; border-radius: 4px; background: #fff;
+    color: #1f2937;
+    font-family: inherit;
+  }
+  select:focus, input[type=date]:focus {
+    outline: none; border-color: #4f64f6;
   }
 
-  .footer { padding: 10px 12px; }
-  .start-btn, .export-btn, .clear-btn {
-    width: 100%; color: white; border: none;
-    padding: 8px; border-radius: 5px; font-size: 13px;
-    font-weight: 600; cursor: pointer; letter-spacing: .03em; margin-top: 8px;
+  .footer {
+    padding: 10px 14px 12px;
+    display: flex; flex-direction: column; gap: 6px;
   }
-  .start-btn          { background: #1e40af; }
-  .export-btn         { background: #059669; }
-  .clear-btn          { background: #ea580c; }
+  .start-btn, .export-btn, .clear-btn {
+    width: 100%; border: 0;
+    padding: 7px; border-radius: 4px; font-size: 12px;
+    font-weight: 500; cursor: pointer;
+    font-family: inherit;
+    transition: opacity .15s;
+  }
+  .start-btn  { background: #4f64f6; color: #fff; }
+  .start-btn:hover { background: #4054e0; }
+  .export-btn { background: #fff; color: #15803d; border: 1px solid #bbf7d0; }
+  .export-btn:hover { background: #f0fdf4; }
+  .clear-btn  { background: #fff; color: #c2410c; border: 1px solid #fed7aa; }
+  .clear-btn:hover { background: #fff7ed; }
   .start-btn:disabled,
   .export-btn:disabled,
-  .clear-btn:disabled { background: #94a3b8; cursor: default; }
+  .clear-btn:disabled {
+    background: #f3f4f6; color: #9ca3af; border-color: #e5e7eb;
+    cursor: not-allowed;
+  }
 
   /* Error / info banner */
   .banner {
-    border-radius: 4px; padding: 6px 8px; margin-top: 8px;
+    border-radius: 4px; padding: 6px 8px;
     font-size: 11px; display: none; align-items: flex-start; gap: 6px;
+    line-height: 1.5;
   }
-  .banner.error { background: #fef2f2; color: #b91c1c; display: flex; }
-  .banner.info  { background: #eff6ff; color: #1e40af; display: flex; }
+  .banner.error { background: #fef2f2; color: #b91c1c; display: flex; border: 1px solid #fecaca; }
+  .banner.info  { background: #eff6ff; color: #1e40af; display: flex; border: 1px solid #bfdbfe; }
 
   /* Progress */
-  .progress-wrap { margin-top: 8px; display: none; flex-direction: column; gap: 0; }
+  .progress-wrap {
+    margin-top: 4px;
+    display: none;
+    flex-direction: column;
+    gap: 0;
+    max-height: 200px;
+    overflow-y: auto;
+  }
   .progress-date {
-    font-size: 10px; color: #64748b; font-weight: 600;
-    padding: 4px 0 4px; border-bottom: 1px solid #f1f5f9; margin-bottom: 4px;
+    font-size: 10px; color: #6b7280; font-weight: 500;
+    padding: 6px 0 4px; border-bottom: 1px solid #f0f2f5;
+    margin-bottom: 4px;
   }
   .prog-row {
     display: flex; align-items: center; justify-content: space-between;
     padding: 5px 8px; border-radius: 4px; margin-bottom: 2px;
-    background: #f8fafc;
+    background: #fafbfd;
   }
-  .prog-name { font-size: 11px; color: #374151; }
+  .prog-name { font-size: 11px; color: #4b5563; }
   .prog-badge {
-    font-size: 10px; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+    font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 500;
   }
-  .badge-wait    { background: #f1f5f9; color: #94a3b8; }
-  .badge-running { background: #dbeafe; color: #1e40af; }
+  .badge-wait    { background: #f3f4f6; color: #6b7280; }
+  .badge-running { background: #dbeafe; color: #1d4ed8; }
   .badge-done    { background: #dcfce7; color: #15803d; }
   .badge-error   { background: #fee2e2; color: #b91c1c; }
   .badge-retry   { background: #fff7ed; color: #c2410c; }
+
+  /* Cookie health popover */
+  .cookie-pop {
+    position: absolute;
+    top: 50px; right: 12px;
+    width: 240px;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+    z-index: 10;
+    overflow: hidden;
+    display: none;
+  }
+  .cookie-pop.open { display: block; }
+  .cookie-pop-head {
+    padding: 8px 10px;
+    background: #fafbfd;
+    border-bottom: 1px solid #eef0f4;
+    font-size: 11px;
+    font-weight: 600;
+    color: #1f2937;
+  }
+  .cookie-pop-body { max-height: 240px; overflow-y: auto; }
+  .cookie-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    font-size: 11px;
+    border-bottom: 1px solid #f0f2f5;
+  }
+  .cookie-row:last-child { border-bottom: 0; }
+  .cookie-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .cookie-dot.ok { background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,0.15); }
+  .cookie-dot.partial { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,158,11,0.15); }
+  .cookie-dot.off { background: #9ca3af; }
+  .cookie-dot.error { background: #ef4444; }
+  .cookie-info { flex: 1; min-width: 0; }
+  .cookie-name { color: #1f2937; font-weight: 500; }
+  .cookie-host { color: #9ca3af; font-size: 9px; }
+  .cookie-action {
+    color: #4f64f6;
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .cookie-action:hover { text-decoration: underline; }
+  .cookie-pop-foot {
+    padding: 6px 10px;
+    background: #fafbfd;
+    border-top: 1px solid #eef0f4;
+    text-align: right;
+  }
+  .cookie-refresh-btn {
+    background: none;
+    border: 0;
+    color: #4f64f6;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .cookie-refresh-btn:hover { text-decoration: underline; }
 </style>
 
 <div class="bar" id="bar" style="display:flex">
-  <span>🛒</span>
+  <span class="bar-logo">舵</span>
   <span class="bar-label">Temu 采集</span>
   <span class="bar-sub" id="bar-sub">· 就绪</span>
   <span class="bar-btn" id="bar-clear" title="一键清除弹窗">🧹</span>
-  <span class="bar-btn" id="bar-expand">＋</span>
+  <span class="bar-btn" id="bar-expand" title="展开面板">＋</span>
 </div>
 
 <div class="panel" id="panel" style="display:none">
   <div class="header" id="drag-header">
-    <span class="header-title">🛒 Temu 数据采集</span>
+    <span class="header-logo">舵</span>
+    <span class="header-title">Temu 数据采集</span>
+    <span class="header-sub" id="cookie-health-sub">在线 ✓</span>
+    <button class="header-btn" id="cookie-health-btn" title="查看在线情况">⌖</button>
     <button class="header-btn" id="collapse-btn" title="最小化">−</button>
   </div>
   <div class="body">
-    <div class="two-col">
-      <div class="col">
-        <div class="col-label">采集模块</div>
-        <div class="modules">
-          <label><input type="checkbox" name="mod" value="list" checked> 流量分析</label>
-          <label><input type="checkbox" name="mod" value="sales"> 销售管理</label>
-          <label><input type="checkbox" name="mod" value="orders" checked> 订单管理</label>
-          <label><input type="checkbox" name="mod" value="activity"> 营销活动</label>
-          <label><input type="checkbox" name="mod" value="promo" checked> 广告报表</label>
-        </div>
+    <div class="section">
+      <div class="section-label">采集模块</div>
+      <div class="modules">
+        <label><input type="checkbox" name="mod" value="list" checked> 流量分析</label>
+        <label><input type="checkbox" name="mod" value="sales"> 销售管理</label>
+        <label><input type="checkbox" name="mod" value="orders" checked> 订单管理</label>
+        <label><input type="checkbox" name="mod" value="activity"> 营销活动</label>
+        <label><input type="checkbox" name="mod" value="promo" checked> 广告报表</label>
       </div>
-      <div class="col">
-        <div class="col-label">采集参数</div>
+    </div>
+
+    <div class="section">
+      <div class="section-label">采集参数</div>
+      <div class="param-grid">
         <div class="param-row">
-          <div class="param-label">区域</div>
+          <span class="param-label">区域</span>
           <select id="region">
             <option value="us">🇺🇸 美国</option>
             <option value="eu">🌍 欧洲</option>
@@ -227,27 +401,41 @@ shadow.innerHTML = `
           </select>
         </div>
         <div class="param-row">
-          <div class="param-label">开始日期</div>
+          <span class="param-label">店铺</span>
+          <select id="mall-select" disabled>
+            <option value="">⏳ 等待页面加载</option>
+          </select>
+        </div>
+        <div class="param-row">
+          <span class="param-label">开始日期</span>
           <input type="date" id="date-start">
         </div>
         <div class="param-row">
-          <div class="param-label">结束日期</div>
+          <span class="param-label">结束日期</span>
           <input type="date" id="date-end">
         </div>
       </div>
     </div>
+
     <div class="footer">
-      <div class="param-row">
-        <div class="param-label">店铺</div>
-        <select id="mall-select" disabled>
-          <option value="">⏳ 等待页面加载...</option>
-        </select>
-      </div>
       <div class="banner" id="banner"><span id="banner-text"></span></div>
-      <button class="start-btn" id="start-btn" disabled>▶ 开始采集</button>
-      <button class="export-btn" id="export-btn" disabled>📊 导出 Excel</button>
-      <button class="clear-btn" id="clear-btn" title="隐藏页面上所有弹窗 / 弹出层 / 遮罩">🧹 一键清除弹窗</button>
+      <button class="start-btn" id="start-btn" disabled>开始采集</button>
+      <div style="display:flex;gap:6px">
+        <button class="export-btn" id="export-btn" disabled style="flex:1">导出 Excel</button>
+        <button class="clear-btn" id="clear-btn" title="隐藏页面上所有弹窗" style="flex:1">清除弹窗</button>
+      </div>
       <div class="progress-wrap" id="progress-wrap"></div>
+    </div>
+  </div>
+
+  <!-- Cookie 健康 popover -->
+  <div class="cookie-pop" id="cookie-pop">
+    <div class="cookie-pop-head">Temu 后台在线情况</div>
+    <div class="cookie-pop-body" id="cookie-pop-body">
+      <div style="padding:10px;text-align:center;color:#9ca3af;font-size:11px">检测中…</div>
+    </div>
+    <div class="cookie-pop-foot">
+      <button class="cookie-refresh-btn" id="cookie-refresh-btn">重新检测</button>
     </div>
   </div>
 </div>
@@ -308,11 +496,88 @@ function togglePanel() {
 shadow.getElementById('collapse-btn').addEventListener('click', (e) => {
   e.stopPropagation();
   panel.style.display = 'none'; bar.style.display = 'flex';
+  closeCookiePop();
 });
 shadow.getElementById('bar-expand').addEventListener('click', (e) => {
   e.stopPropagation();
   bar.style.display = 'none'; panel.style.display = 'block';
 });
+
+// ── Cookie 健康检查 ────────────────────────────────────────────────────────────
+//   header 上的 ⌖ 按钮 → 询问 background → 渲染到 popover
+//   header-sub 同步显示一个"3/4 在线"的总览
+
+const cookiePop = shadow.getElementById('cookie-pop');
+const cookieSub = shadow.getElementById('cookie-health-sub');
+const cookieBtn = shadow.getElementById('cookie-health-btn');
+const cookieRefreshBtn = shadow.getElementById('cookie-refresh-btn');
+const STATUS_LABEL = { ok: '在线', partial: '部分', off: '未登录', error: '失败' };
+
+function closeCookiePop() {
+  cookiePop.classList.remove('open');
+}
+function toggleCookiePop() {
+  if (cookiePop.classList.contains('open')) closeCookiePop();
+  else { cookiePop.classList.add('open'); refreshCookieHealth(); }
+}
+
+cookieBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleCookiePop(); });
+cookieRefreshBtn.addEventListener('click', (e) => { e.stopPropagation(); refreshCookieHealth(); });
+// 点 panel 其它地方关闭 popover
+panel.addEventListener('click', (e) => {
+  if (!cookiePop.contains(e.target) && e.target.id !== 'cookie-health-btn') closeCookiePop();
+});
+
+let _cookieTimer = null;
+function startCookiePolling() {
+  refreshCookieHealth();
+  if (_cookieTimer) clearInterval(_cookieTimer);
+  _cookieTimer = setInterval(refreshCookieHealth, 30_000);
+}
+
+async function refreshCookieHealth() {
+  let res = null;
+  try {
+    res = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'AGENT_CHECK_COOKIES' }, (r) => resolve(r));
+      setTimeout(() => resolve(null), 2500);
+    });
+  } catch { /* background 没在线 */ }
+
+  if (!res || !Array.isArray(res.domains)) {
+    cookieSub.textContent = '在线 ?';
+    cookieSub.style.color = '#9aa3c7';
+    shadow.getElementById('cookie-pop-body').innerHTML =
+      '<div style="padding:12px;text-align:center;color:#9ca3af;font-size:11px">无法连接 background</div>';
+    return;
+  }
+
+  // 顶部 sub：例如 "在线 3/4"
+  const ok = res.domains.filter((d) => d.status === 'ok').length;
+  const total = res.domains.length;
+  cookieSub.textContent = `在线 ${ok}/${total}`;
+  cookieSub.style.color = ok === total ? '#86efac' : ok > 0 ? '#fde68a' : '#fca5a5';
+
+  // popover 列表
+  shadow.getElementById('cookie-pop-body').innerHTML = res.domains.map((d) => {
+    const needLogin = d.status !== 'ok';
+    const action = needLogin
+      ? `<a class="cookie-action" href="${d.url}" target="_blank" rel="noopener">去登录</a>`
+      : `<span style="color:#15803d;font-size:11px">${STATUS_LABEL[d.status]}</span>`;
+    return `
+      <div class="cookie-row">
+        <span class="cookie-dot ${d.status}"></span>
+        <div class="cookie-info">
+          <div class="cookie-name">${d.label}</div>
+          <div class="cookie-host">${d.gateway}</div>
+        </div>
+        ${action}
+      </div>
+    `;
+  }).join('');
+}
+
+startCookiePolling();
 
 // ── Dragging ──────────────────────────────────────────────────────────────────
 

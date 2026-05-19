@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>Temu 数据采集</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ============ 顶栏 ============ -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🛒</span>
+        <div class="brand-text">
+          <div class="brand-title">Temu 数据采集</div>
+          <div class="brand-sub">v<span id="version">1.0.0</span></div>
+        </div>
+      </div>
+
+      <div class="account-switch">
+        <span class="account-name" id="account-name">未绑定 ERP</span>
+        <button class="account-caret" id="btn-switch-account" title="切换账号">▾</button>
+      </div>
+
+      <div class="topbar-right">
+        <span class="custody-pill" id="custody-pill">未配置</span>
+      </div>
+    </header>
+
+    <!-- ============ 托管模式 Tab ============ -->
+    <nav class="custody-tabs">
+      <button class="custody-tab active" data-custody="full">Temu 全托</button>
+      <button class="custody-tab" data-custody="semi">Temu 半托</button>
+    </nav>
+
+    <!-- ============ 主体：左模块树 + 右进度区 ============ -->
+    <main class="main">
+      <!-- 左：模块列表 -->
+      <aside class="sidebar">
+        <ul class="module-list" id="module-list">
+          <!-- rendered by JS -->
+        </ul>
+
+        <div class="sidebar-foot">
+          <label class="hint">日期</label>
+          <select class="date-range" id="date-range">
+            <option value="today">今日</option>
+            <option value="7d" selected>近 7 天</option>
+            <option value="30d">近 30 天</option>
+            <option value="lm">上月</option>
+          </select>
+          <label class="hint">区域</label>
+          <select class="region" id="region">
+            <option value="global">全球</option>
+            <option value="us">美区</option>
+            <option value="eu">欧区</option>
+            <option value="jp">日区</option>
+          </select>
+        </div>
+      </aside>
+
+      <!-- 右：进度与日志 -->
+      <section class="content">
+        <!-- 操作栏 -->
+        <div class="action-bar">
+          <button class="btn-primary" id="btn-fetch">手动获取</button>
+          <button class="shop-picker-btn" id="shop-picker-btn">
+            <span class="shop-picker-icon">🏪</span>
+            <span id="shop-picker-label">全部店铺</span>
+            <span class="shop-picker-caret">▾</span>
+          </button>
+          <span class="hint-inline">
+            <span class="hint-dot" id="online-dot" title="登录健康度"></span>
+            <a class="hint-link" id="link-online">在线情况</a>
+          </span>
+          <div class="flex-spacer"></div>
+          <label class="check-row">
+            <input type="checkbox" id="only-failed" />
+            <span>仅看失败</span>
+          </label>
+          <button class="icon-btn" id="btn-log" title="操作日志">📋</button>
+          <button class="icon-btn" id="btn-refresh" title="刷新">↻</button>
+        </div>
+
+        <!-- 店铺选择下拉 -->
+        <div class="shop-picker-pop" id="shop-picker-pop" hidden>
+          <header class="shop-picker-head">
+            <label class="check-row">
+              <input type="checkbox" id="shop-pick-all" />
+              <span>全选</span>
+            </label>
+            <span class="hint">共 <b id="shop-pick-count">0</b> 个店铺</span>
+          </header>
+          <div class="shop-picker-body" id="shop-picker-body"></div>
+          <footer class="shop-picker-foot">
+            <button class="btn-secondary" id="shop-pick-cancel">取消</button>
+            <button class="btn-primary" id="shop-pick-apply">应用</button>
+          </footer>
+        </div>
+
+        <!-- 进度树 -->
+        <div class="progress-area" id="progress-area">
+          <!-- rendered by JS -->
+        </div>
+
+        <!-- 空状态（无任务） -->
+        <div class="empty-state" id="empty-state" hidden>
+          <div class="empty-illust">📭</div>
+          <div class="empty-title">还没有任务</div>
+          <div class="empty-sub">先选模块和日期，再点"手动获取"</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ============ 底状态栏 ============ -->
+    <footer class="footer">
+      <span class="stat">
+        <span class="dot dot-ok" id="dot-server"></span>
+        服务器 <span id="server-host">未连</span>
+      </span>
+      <span class="stat">待派单 <b id="pending-tasks">0</b></span>
+      <span class="stat">上次同步 <b id="last-sync">—</b></span>
+      <div class="flex-spacer"></div>
+      <a class="footer-link" id="open-options">⚙️ 设置</a>
+    </footer>
+  </div>
+
+  <!-- ============ 操作日志 Modal ============ -->
+  <div class="modal-mask" id="log-modal" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <h3>操作日志</h3>
+        <button class="modal-close" id="modal-close">×</button>
+      </header>
+      <div class="modal-stats">
+        共 <b id="log-total">0</b> 条数据，距离下次更新还有
+        <b id="log-countdown">—</b> 秒
+      </div>
+      <div class="modal-body">
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>操作内容</th>
+              <th class="r">操作时间</th>
+            </tr>
+          </thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+      <footer class="modal-foot">
+        <button class="btn-secondary" id="btn-close-modal">关闭</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ============ 在线情况 弹出卡（小气泡） ============ -->
+  <div class="popover" id="online-pop" hidden>
+    <header class="pop-head">
+      <span>Temu 后台在线情况</span>
+      <button class="modal-close" id="online-pop-close">×</button>
+    </header>
+    <div class="pop-body" id="online-pop-body">
+      <div class="hint-row">检测中…</div>
+    </div>
+    <div class="pop-foot">
+      <span class="hint">凭证从浏览器 cookie 读取，登录 / 退出 Temu 即时生效</span>
+      <button class="btn-secondary" id="online-pop-refresh">重新检测</button>
+    </div>
+  </div>
+
+  <!-- ============ 切换账号 Modal ============ -->
+  <div class="modal-mask" id="account-modal" hidden>
+    <div class="modal modal-small">
+      <header class="modal-head">
+        <h3>切换 / 绑定 ERP 账号</h3>
+        <button class="modal-close" id="account-modal-close">×</button>
+      </header>
+      <div class="modal-body modal-pad">
+        <label class="form-label">ERP API 地址</label>
+        <input id="cfg-api-url" type="url" class="form-input" placeholder="https://api.duoshou.local" />
+        <label class="form-label">访问令牌</label>
+        <input id="cfg-token" type="password" class="form-input" placeholder="bearer token" />
+        <div class="form-hint" id="cfg-status"></div>
+      </div>
+      <footer class="modal-foot">
+        <button class="btn-secondary" id="cfg-cancel">取消</button>
+        <button class="btn-primary" id="cfg-save">保存并测试</button>
+      </footer>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

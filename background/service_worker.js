@@ -184,8 +184,24 @@ const SESSION_COOKIE_HINTS = [
   'PASS_ID',
 ];
 
+// ★ plugin 实测优先:agent.js captureSessionViaTab 把每次成功/失败的 region 状态
+// 写到 chrome.storage.local['agent:loginHealth'],这里读取后覆盖 cookie 检测 —
+// 因为 cookie 还在但 token 过期的情况(Temu 7000020),cookie 检测会假报 'ok'。
+async function getLoginHealth() {
+  try {
+    const stored = await chrome.storage.local.get('agent:loginHealth');
+    return stored['agent:loginHealth'] || {};
+  } catch {
+    return {};
+  }
+}
+
 async function handleCheckCookies() {
   const out = [];
+  const health = await getLoginHealth();
+  const HEALTH_FRESH_MS = 24 * 60 * 60 * 1000;  // 24h 内的实测视为有效;过期了让位给 cookie 检测
+  const now = Date.now();
+
   for (const d of TEMU_DOMAINS) {
     try {
       const cookies = await chrome.cookies.getAll({ url: d.url });
@@ -193,33 +209,42 @@ async function handleCheckCookies() {
       const hasSession = cookies.some((c) =>
         SESSION_COOKIE_HINTS.some((k) => c.name.toLowerCase() === k.toLowerCase())
       );
-      // 取最新的过期时间作为"最近登录"提示
       const latest = cookies
         .filter((c) => c.expirationDate)
         .map((c) => c.expirationDate)
         .sort((a, b) => b - a)[0];
       const expiresAt = latest ? new Date(latest * 1000).toISOString() : null;
+
+      // 默认状态:来自 cookie 检测
+      let status = hasSession ? 'ok' : total > 0 ? 'partial' : 'off';
+      let source = 'cookie';
+      let reason = null;
+
+      // 实测覆盖
+      const h = health[d.key];
+      if (h && (now - (h.updatedAt || 0)) < HEALTH_FRESH_MS) {
+        if (h.status === 'expired') {
+          status = 'off';        // 实测 token 失效 → 显示未登录,引导去登
+          source = 'plugin-actual';
+          reason = h.reason || 'plugin 实测:token 过期';
+        } else if (h.status === 'ok') {
+          status = 'ok';
+          source = 'plugin-actual';
+        }
+        // 'unknown' 不覆盖,留 cookie 判断
+      }
+
       out.push({
-        key: d.key,
-        label: d.label,
-        gateway: d.gateway,
-        url: d.url,
-        cookieCount: total,
-        hasSession,
-        // 状态：ok = 有 session / partial = 有 cookie 没 session / off = 没 cookie
-        status: hasSession ? 'ok' : total > 0 ? 'partial' : 'off',
-        expiresAt,
+        key: d.key, label: d.label, gateway: d.gateway, url: d.url,
+        cookieCount: total, hasSession, status, expiresAt,
+        source, reason,
+        healthCheckedAt: h?.updatedAt ? new Date(h.updatedAt).toISOString() : null,
       });
     } catch (e) {
       out.push({
-        key: d.key,
-        label: d.label,
-        gateway: d.gateway,
-        url: d.url,
-        cookieCount: 0,
-        hasSession: false,
-        status: 'error',
-        error: e?.message ?? String(e),
+        key: d.key, label: d.label, gateway: d.gateway, url: d.url,
+        cookieCount: 0, hasSession: false,
+        status: 'error', error: e?.message ?? String(e), source: 'cookie',
       });
     }
   }

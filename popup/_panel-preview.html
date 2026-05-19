@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<!-- 用来预览注入到 Temu 页面里的 floating panel 样式（非生产文件，调样式用） -->
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<title>Floating Panel — 预览</title>
+<style>
+  body { margin: 0; padding: 30px; background: #f5f7fa; font-family: system-ui; }
+  h3 { font-size: 13px; color: #6b7280; margin: 0 0 8px; }
+  .preview-row { display: flex; gap: 40px; align-items: flex-start; }
+  .preview-col { display: flex; flex-direction: column; gap: 8px; }
+</style>
+</head>
+<body>
+<div class="preview-row">
+  <div class="preview-col">
+    <h3>收起态 (bar)</h3>
+    <div id="bar-host"></div>
+  </div>
+  <div class="preview-col">
+    <h3>展开态 (panel)</h3>
+    <div id="panel-host"></div>
+  </div>
+</div>
+
+<script>
+// 把 content_script.js 里的同一段 shadow innerHTML 复制过来预览
+const styleAndHtml = `
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :host { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12px; color: #1f2937; }
+
+  .bar {
+    background: linear-gradient(135deg, #232c47 0%, #1f2740 100%);
+    color: #e3e7f3;
+    padding: 7px 10px 7px 8px;
+    border-radius: 18px;
+    box-shadow: 0 6px 20px rgba(31,39,64,.35);
+    display: flex; align-items: center; gap: 6px;
+    cursor: grab; white-space: nowrap;
+    border: 1px solid rgba(255,255,255,0.06);
+    width: fit-content;
+  }
+  .bar-logo {
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    background: #f0b429;
+    color: #1f2740;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px;
+    flex-shrink: 0;
+  }
+  .bar-label { font-weight: 600; color: #fff; font-size: 12px; }
+  .bar-sub { color: #9aa3c7; font-size: 11px; }
+  .bar-btn {
+    margin-left: 2px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 11px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    color: #d8def0;
+  }
+  .bar-btn:hover { background: rgba(255,255,255,0.16); color: #fff; }
+
+  .panel {
+    width: 340px;
+    background: #fff;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #eef0f4;
+  }
+  .header {
+    background: linear-gradient(180deg, #1f2740 0%, #232c47 100%);
+    color: #fff;
+    padding: 10px 12px;
+    cursor: grab;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .header-logo {
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    background: #f0b429;
+    color: #1f2740;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px;
+  }
+  .header-title { font-weight: 600; font-size: 13px; flex: 1; }
+  .header-sub { font-size: 10px; color: #9aa3c7; margin-left: auto; }
+  .header-btn {
+    background: rgba(255,255,255,0.1);
+    border: 0; color: #d8def0;
+    border-radius: 4px; width: 22px; height: 22px;
+    cursor: pointer; font-size: 14px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    margin-left: 4px;
+  }
+  .header-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
+
+  .body { background: #fff; }
+  .section { padding: 10px 14px; border-bottom: 1px solid #f0f2f5; }
+  .section:last-of-type { border-bottom: 0; }
+  .section-label {
+    font-size: 10px; font-weight: 600; color: #6b7280;
+    letter-spacing: .04em; margin-bottom: 8px; text-transform: uppercase;
+  }
+  .modules { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+  .modules label {
+    display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; font-size: 12px; color: #4b5563; padding: 2px 0;
+  }
+  .modules input { accent-color: #4f64f6; width: 13px; height: 13px; margin: 0; }
+  .param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+  .param-row { display: flex; flex-direction: column; gap: 3px; }
+  .param-label { font-size: 11px; color: #6b7280; }
+  select, input[type=date] {
+    width: 100%; font-size: 12px; padding: 5px 6px;
+    border: 1px solid #d1d5db; border-radius: 4px; background: #fff; color: #1f2937;
+  }
+  .footer { padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .start-btn { background: #4f64f6; color: #fff; border: 0; padding: 7px; border-radius: 4px; font-size: 12px; font-weight: 500; cursor: pointer; width: 100%; }
+  .export-btn { background: #fff; color: #15803d; border: 1px solid #bbf7d0; padding: 7px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  .clear-btn  { background: #fff; color: #c2410c; border: 1px solid #fed7aa; padding: 7px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+</style>
+
+<div class="bar">
+  <span class="bar-logo">舵</span>
+  <span class="bar-label">Temu 采集</span>
+  <span class="bar-sub">· 就绪</span>
+  <span class="bar-btn" title="一键清除弹窗">🧹</span>
+  <span class="bar-btn" title="展开面板">＋</span>
+</div>
+`;
+
+const styleAndPanel = `
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :host { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12px; color: #1f2937; }
+  .panel { width: 340px; background: #fff; box-shadow: 0 12px 32px rgba(0,0,0,0.18); border-radius: 10px; overflow: hidden; border: 1px solid #eef0f4; }
+  .header { background: linear-gradient(180deg, #1f2740 0%, #232c47 100%); color: #fff; padding: 10px 12px; display: flex; align-items: center; gap: 8px; }
+  .header-logo { width: 22px; height: 22px; border-radius: 5px; background: #f0b429; color: #1f2740; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 12px; }
+  .header-title { font-weight: 600; font-size: 13px; flex: 1; }
+  .header-sub { font-size: 10px; color: #9aa3c7; margin-left: auto; }
+  .header-btn { background: rgba(255,255,255,0.1); border: 0; color: #d8def0; border-radius: 4px; width: 22px; height: 22px; cursor: pointer; font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center; margin-left: 4px; }
+  .body { background: #fff; }
+  .section { padding: 10px 14px; border-bottom: 1px solid #f0f2f5; }
+  .section:last-of-type { border-bottom: 0; }
+  .section-label { font-size: 10px; font-weight: 600; color: #6b7280; letter-spacing: .04em; margin-bottom: 8px; text-transform: uppercase; }
+  .modules { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+  .modules label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: #4b5563; padding: 2px 0; }
+  .modules input { accent-color: #4f64f6; width: 13px; height: 13px; margin: 0; }
+  .param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+  .param-row { display: flex; flex-direction: column; gap: 3px; }
+  .param-label { font-size: 11px; color: #6b7280; }
+  select, input[type=date] { width: 100%; font-size: 12px; padding: 5px 6px; border: 1px solid #d1d5db; border-radius: 4px; background: #fff; color: #1f2937; }
+  .footer { padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .start-btn { background: #4f64f6; color: #fff; border: 0; padding: 7px; border-radius: 4px; font-size: 12px; font-weight: 500; cursor: pointer; width: 100%; }
+  .export-btn { background: #fff; color: #15803d; border: 1px solid #bbf7d0; padding: 7px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  .clear-btn  { background: #fff; color: #c2410c; border: 1px solid #fed7aa; padding: 7px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+</style>
+
+<div class="panel">
+  <div class="header">
+    <span class="header-logo">舵</span>
+    <span class="header-title">Temu 数据采集</span>
+    <span class="header-sub">在线 ✓</span>
+    <button class="header-btn" title="查看在线情况">⌖</button>
+    <button class="header-btn" title="最小化">−</button>
+  </div>
+  <div class="body">
+    <div class="section">
+      <div class="section-label">采集模块</div>
+      <div class="modules">
+        <label><input type="checkbox" checked> 流量分析</label>
+        <label><input type="checkbox"> 销售管理</label>
+        <label><input type="checkbox" checked> 订单管理</label>
+        <label><input type="checkbox"> 营销活动</label>
+        <label><input type="checkbox" checked> 广告报表</label>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-label">采集参数</div>
+      <div class="param-grid">
+        <div class="param-row"><span class="param-label">区域</span><select><option>🇺🇸 美国</option></select></div>
+        <div class="param-row"><span class="param-label">店铺</span><select><option>GlobalMartHub · 全托</option></select></div>
+        <div class="param-row"><span class="param-label">开始日期</span><input type="date" value="2026-05-09"></div>
+        <div class="param-row"><span class="param-label">结束日期</span><input type="date" value="2026-05-15"></div>
+      </div>
+    </div>
+    <div class="footer">
+      <button class="start-btn">开始采集</button>
+      <div style="display:flex;gap:6px">
+        <button class="export-btn" style="flex:1">导出 Excel</button>
+        <button class="clear-btn" style="flex:1">清除弹窗</button>
+      </div>
+    </div>
+  </div>
+</div>
+`;
+
+const barHost = document.getElementById('bar-host').attachShadow({ mode: 'open' });
+barHost.innerHTML = styleAndHtml;
+
+const panelHost = document.getElementById('panel-host').attachShadow({ mode: 'open' });
+panelHost.innerHTML = styleAndPanel;
+</script>
+</body>
+</html>

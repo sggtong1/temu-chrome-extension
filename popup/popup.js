@@ -517,50 +517,185 @@ $('#link-online').addEventListener('click', async (e) => {
 });
 
 $('#online-pop-close').addEventListener('click', () => { $('#online-pop').hidden = true; });
-$('#online-pop-refresh').addEventListener('click', () => { loadOnlineStatus(); });
+$('#online-pop-refresh').addEventListener('click', async () => {
+  // 清掉所有 'expired' 标记(用户刚去 Temu 登过了,陈旧的 expired 不该再粘 24h);
+  // 然后让 loadOnlineStatus 重新读 cookies + 剩余 health,如果用户真登录了显示 ok,
+  // 否则下次 task fire 会重新标 expired。
+  await clearExpiredHealth();
+  await loadOnlineStatus();
+});
+
+async function clearExpiredHealth() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) return;
+  try {
+    const s = await chrome.storage.local.get('agent:loginHealth');
+    const h = s['agent:loginHealth'] || {};
+    const cleared = {};
+    for (const [k, v] of Object.entries(h)) {
+      if (v?.status === 'expired') continue;       // 丢弃 expired 标记
+      cleared[k] = v;                              // 保留 ok / unknown
+    }
+    await chrome.storage.local.set({ 'agent:loginHealth': cleared });
+  } catch (e) {
+    console.warn('[popup] clearExpiredHealth failed', e?.message);
+  }
+}
+
+// 汇总各子域状态 → 顶部 dot 着色
+function applyOnlineDotFromDomains(domains) {
+  const dot = $('#online-dot');
+  if (!dot || !Array.isArray(domains) || domains.length === 0) return;
+  // 只关注 global/us/eu(kjmh 是另一个域名,暂不计入主健康)
+  const main = domains.filter((d) => d.key === 'global' || d.key === 'us' || d.key === 'eu');
+  const statuses = main.map((d) => d.status);
+  const errCount = statuses.filter((s) => s === 'off' || s === 'error').length;
+  const okCount  = statuses.filter((s) => s === 'ok').length;
+  dot.classList.remove('ok', 'warn', 'err');
+  if (errCount === 0) {
+    dot.classList.add('ok');
+    dot.title = '三个区域登录态均正常';
+  } else if (okCount > 0) {
+    dot.classList.add('warn');
+    dot.title = `部分子域需要重新登录:${main.filter((d) => d.status === 'off' || d.status === 'error').map((d) => d.label).join(', ')}`;
+  } else {
+    dot.classList.add('err');
+    dot.title = '全部子域均需重新登录';
+  }
+}
+
+// 不再用假 fallback — SW 返不来就显示真的 "检测失败",让用户知道有问题而不是看到假"全部在线"
+const TEMU_DOMAINS_META = [
+  { key: 'global', label: '全球',     gateway: 'agentseller.temu.com',     url: 'https://agentseller.temu.com' },
+  { key: 'us',     label: '美区',     gateway: 'agentseller-us.temu.com',  url: 'https://agentseller-us.temu.com' },
+  { key: 'eu',     label: '欧区',     gateway: 'agentseller-eu.temu.com',  url: 'https://agentseller-eu.temu.com' },
+  { key: 'kjmh',   label: '跨境卖家', gateway: 'seller.kuajingmaihuo.com', url: 'https://seller.kuajingmaihuo.com' },
+];
+
+async function checkCookiesViaSW(timeoutMs = 6000) {
+  // SW 冷启动可能慢,bump 6s。返 null 不再 fallback 假数据。
+  if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return null;
+  try {
+    return await new Promise((resolve) => {
+      let done = false;
+      try {
+        chrome.runtime.sendMessage({ type: 'AGENT_CHECK_COOKIES' }, (r) => {
+          if (done) return;
+          done = true;
+          resolve(r ?? null);
+        });
+      } catch (e) {
+        done = true;
+        resolve(null);
+      }
+      setTimeout(() => { if (!done) { done = true; resolve(null); } }, timeoutMs);
+    });
+  } catch { return null; }
+}
+
+// 直接从 chrome.storage.local 读 plugin 实测得到的 loginHealth(SW 已写入)
+// 这条路径绕过 sendMessage,确保即便 SW 挂了也能拿到最近一次的 expired 状态
+async function readLoginHealthFromStorage() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) return {};
+  try {
+    const s = await chrome.storage.local.get('agent:loginHealth');
+    return s['agent:loginHealth'] || {};
+  } catch { return {}; }
+}
 
 async function loadOnlineStatus() {
   const body = $('#online-pop-body');
   body.innerHTML = '<div class="hint-row">检测中…</div>';
 
-  // 调 background：在 chrome.cookies 不可用（preview）时 mock 一个回退
-  const fallback = {
-    domains: [
-      { key: 'global', label: '全球', gateway: 'agentseller.temu.com', url: 'https://agentseller.temu.com', status: 'ok' },
-      { key: 'us',     label: '美区', gateway: 'agentseller-us.temu.com', url: 'https://agentseller-us.temu.com', status: 'ok' },
-      { key: 'eu',     label: '欧区', gateway: 'agentseller-eu.temu.com', url: 'https://agentseller-eu.temu.com', status: 'partial' },
-      { key: 'kjmh',   label: '跨境卖家', gateway: 'seller.kuajingmaihuo.com', url: 'https://seller.kuajingmaihuo.com', status: 'off' },
-    ],
-  };
+  const res = await checkCookiesViaSW();
 
-  let res;
-  try {
-    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-      res = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'AGENT_CHECK_COOKIES' }, (r) => resolve(r));
-        setTimeout(() => resolve(null), 2000);
-      });
-    }
-  } catch { /* file:// preview */ }
-  if (!res) res = fallback;
+  // 即便 SW 调用失败,我们也用 storage 直读的 loginHealth + meta 拼一份可显示数据
+  let domains;
+  if (res && Array.isArray(res.domains)) {
+    domains = res.domains;
+  } else {
+    const health = await readLoginHealthFromStorage();
+    domains = TEMU_DOMAINS_META.map((d) => {
+      const h = health[d.key];
+      let status = 'unknown';
+      if (h?.status === 'expired') status = 'off';
+      else if (h?.status === 'ok') status = 'ok';
+      return {
+        ...d,
+        status,
+        source: h ? 'plugin-actual' : 'cookie-unavailable',
+        reason: h?.reason ?? (res ? 'SW 返空' : 'SW 无响应或 chrome.cookies 不可用'),
+        cookieCount: 0,
+      };
+    });
+  }
 
-  const labelMap = { ok: '在线', partial: '部分凭证', off: '未登录', error: '失败' };
-  body.innerHTML = res.domains.map((d) => {
-    const action = (d.status === 'off' || d.status === 'partial' || d.status === 'error')
+  const labelMap = { ok: '在线', partial: '部分凭证', off: '未登录', error: '失败', unknown: '未检测' };
+  body.innerHTML = domains.map((d) => {
+    const isBad = d.status === 'off' || d.status === 'partial' || d.status === 'error' || d.status === 'unknown';
+    const action = isBad
       ? `<a class="domain-action" href="${d.url}" target="_blank" rel="noopener">去登录 →</a>`
       : `<span class="domain-status ${d.status}">${labelMap[d.status]}</span>`;
+    const sourceTag = d.source === 'plugin-actual'
+      ? `<span class="domain-source" title="${d.reason || ''}">实测</span>`
+      : (d.source === 'cookie-unavailable' ? `<span class="domain-source" title="${d.reason || ''}">未连</span>` : '');
     return `
       <div class="domain-row">
         <span class="indicator ${d.status}"></span>
         <div class="domain-info">
-          <div class="domain-label">${d.label}</div>
+          <div class="domain-label">${d.label} ${sourceTag}</div>
           <div class="domain-host">${d.gateway}</div>
         </div>
         ${action}
       </div>
     `;
   }).join('');
+
+  applyOnlineDotFromDomains(domains);
+  updateLoginBanner(domains);
 }
+
+// ★ 顶部"登录态过期"banner — 任何 region 显示 expired/off 就显眼提示用户去登
+function updateLoginBanner(domains) {
+  const expired = domains.filter((d) => d.status === 'off' && d.source === 'plugin-actual');
+  let banner = document.getElementById('login-banner');
+  if (expired.length === 0) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'login-banner';
+    banner.style.cssText = 'padding:8px 12px;background:#fef2f2;border-bottom:2px solid #ef4444;color:#991b1b;font-size:12px;display:flex;align-items:center;gap:8px;';
+    document.querySelector('.app').insertBefore(banner, document.querySelector('.custody-tabs'));
+  }
+  const names = expired.map((d) => d.label).join('、');
+  const firstUrl = expired[0].url;
+  banner.innerHTML = `
+    <span style="font-size:16px">⚠️</span>
+    <span><b>${names}</b> 登录态已过期,所有同步任务会失败 —
+      <a href="${firstUrl}" target="_blank" rel="noopener" style="color:#b91c1c;text-decoration:underline;font-weight:600">去 ${expired[0].label} 重新登录 Temu →</a>
+    </span>
+  `;
+}
+
+// 启动时静默检测一次,让顶部 dot 即刻有色 + banner 出现
+(async () => {
+  const res = await checkCookiesViaSW(6000);
+  if (res?.domains) {
+    applyOnlineDotFromDomains(res.domains);
+    updateLoginBanner(res.domains);
+  } else {
+    // SW 调用失败也试一下从 storage 直读 loginHealth
+    const health = await readLoginHealthFromStorage();
+    const domains = TEMU_DOMAINS_META.map((d) => ({
+      ...d,
+      status: health[d.key]?.status === 'expired' ? 'off' : (health[d.key]?.status === 'ok' ? 'ok' : 'unknown'),
+      source: health[d.key] ? 'plugin-actual' : 'cookie-unavailable',
+    }));
+    applyOnlineDotFromDomains(domains);
+    updateLoginBanner(domains);
+  }
+})();
 
 $('#open-options').addEventListener('click', (e) => {
   e.preventDefault();
@@ -568,41 +703,87 @@ $('#open-options').addEventListener('click', (e) => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// 6. 操作日志 modal
+// 6. 操作日志 modal — 真实拉 /api/agent/tasks?limit=50,每行 = 一次任务执行
 // ──────────────────────────────────────────────────────────────
-const mockLogs = [
-  { content: '获取全托管申报价格：获取任务列表 1 条', at: '2026-05-16 10:49:07' },
-  { content: '全托结算明细：获取任务列表 1 条', at: '2026-05-16 10:49:07' },
-  { content: '获取全托管活动数据：获取任务列表 2 条', at: '2026-05-16 10:49:07' },
-  { content: '全托管 - 获取营销活动：获取任务列表 1 条', at: '2026-05-16 10:49:07' },
-  { content: '全托近三十天销量数据：获取任务列表 0 条', at: '2026-05-16 10:49:07' },
-  { content: '全托结算明细：获取任务列表 0 条', at: '2026-05-16 10:49:07' },
-  { content: '全托近三十天销量数据：结束任务 end', at: '2026-05-16 10:48:19' },
-  { content: '全托近三十天销量数据：更新单个任务状态成功', at: '2026-05-16 10:48:19' },
-];
+const LOG_STATUS_LABELS = {
+  pending: '等待',
+  claimed: '已领',
+  running: '执行中',
+  success: '成功',
+  failed: '失败',
+  cancelled: '取消',
+};
+
+// kind → 中文展示名(跟 KIND_LABELS 重复但保留是为了日志独立可读)
+function logKindLabel(kind) {
+  return (KIND_LABELS && KIND_LABELS[kind]) || kind;
+}
+
+// Asia/Shanghai 时间格式化(plugin 不能 import vue util,这里内联一份)
+function shFmtTime(s) {
+  if (!s) return '—';
+  try {
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(new Date(s)).replace(/\//g, '-');
+  } catch { return String(s); }
+}
 
 $('#btn-log').addEventListener('click', () => openLogModal());
 $('#modal-close').addEventListener('click', () => closeLogModal());
 $('#btn-close-modal').addEventListener('click', () => closeLogModal());
 
 let countdownTimer = null;
-function openLogModal() {
-  $('#log-total').textContent = String(mockLogs.length);
+async function openLogModal() {
+  $('#log-modal').hidden = false;
+  $('#log-total').textContent = '…';
   const tbody = $('#log-body');
-  tbody.innerHTML = mockLogs.map((l) => `
-    <tr>
-      <td>${l.content}</td>
-      <td class="r">${l.at}</td>
-    </tr>
-  `).join('');
-  let c = 74;
+  tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:#9ca3af">加载中…</td></tr>';
+
+  try {
+    const resp = await apiFetch('/api/agent/tasks?limit=50');
+    const arr = Array.isArray(resp) ? resp : (resp?.tasks || resp?.items || []);
+    $('#log-total').textContent = String(arr.length);
+    if (arr.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:#9ca3af">还没有任务记录</td></tr>';
+    } else {
+      tbody.innerHTML = arr.map((t) => {
+        const kind = logKindLabel(t.kind);
+        const stat = LOG_STATUS_LABELS[t.status] || t.status || '?';
+        const trigger = t.createdBy ? '手动' : '系统';
+        const errMsg = (t.status === 'failed' && t.errorMessage)
+          ? ` <span style="color:#b91c1c">— ${String(t.errorMessage).slice(0, 80)}</span>`
+          : '';
+        const time = shFmtTime(t.completedAt || t.claimedAt || t.createdAt);
+        const statColor = t.status === 'success' ? '#15803d'
+          : t.status === 'failed' ? '#b91c1c'
+          : t.status === 'running' || t.status === 'claimed' ? '#2563eb'
+          : '#6b7280';
+        return `<tr>
+          <td>${kind} · <span style="color:${statColor}">${stat}</span> · ${trigger}${errMsg}</td>
+          <td class="r">${time}</td>
+        </tr>`;
+      }).join('');
+    }
+  } catch (e) {
+    $('#log-total').textContent = '0';
+    tbody.innerHTML = `<tr><td colspan="2" style="text-align:center;color:#b91c1c">加载失败: ${e.message}</td></tr>`;
+  }
+
+  // 倒计时自动刷新 — 30s 一轮
+  let c = 30;
   $('#log-countdown').textContent = c;
+  if (countdownTimer) clearInterval(countdownTimer);
   countdownTimer = setInterval(() => {
     c--;
-    if (c < 0) c = 120;
+    if (c <= 0) {
+      openLogModal();   // 重启自身,reset countdown
+      return;
+    }
     $('#log-countdown').textContent = c;
   }, 1000);
-  $('#log-modal').hidden = false;
 }
 function closeLogModal() {
   $('#log-modal').hidden = true;

@@ -241,20 +241,39 @@ export function transformActivityEnrollments(rawItems) {
     // 标题:SPU 名(常见)→ thematicName → typeName,任一即可
     const skuTitleBase = act.productName || act.activityThematicName || act.activityTypeName || null;
 
+    // Temu /enroll/list 顶层 productId/SPU 路径(SPU 是 act.goodsId,SPU 图 act.pictureUrl)
+    const platformProductId = act.goodsId != null ? String(act.goodsId) : null;
+    const productPictureUrl = act.pictureUrl ?? act.imageUrl ?? null;
+    const targetActivityStock = act.activityStock ?? act.targetActivityStock ?? null;
+
     // SKU 级展开:skcList[].skuList[] 是常态,productSkuIds 是 legacy fallback
     let skuCount = 0;
     if (Array.isArray(act.skcList) && act.skcList.length) {
       for (const skc of act.skcList) {
+        const platformSkcId = skc.skcId != null ? String(skc.skcId) : null;
         for (const sku of (skc.skuList ?? skc.productSkuList ?? [])) {
           const id = sku.skuId ?? sku.productSkuId ?? sku.id;
           if (id == null) continue;
           const priceCents = sku.activityPrice ?? skc.activityPrice ?? act.activityPrice ?? null;
+          const props = sku.properties && typeof sku.properties === 'object' ? sku.properties : {};
+          const attrText = Object.values(props).filter(Boolean).join(' / ') || null;
           rows.push({
             platformActivityId,
             platformSessionId,
             platformEnrollId,
             platformSkuId: String(id),
+            platformProductId,
+            platformSkcId,
+            targetActivityStock,
             skuTitle: skuTitleBase,
+            // 给 ingester 顺手传商品图/属性,供 enrollment.skuMeta 直接落,不必再 join ActivityProduct
+            skuMeta: {
+              pictureUrl: productPictureUrl,
+              skcExtCode: skc.extCode ?? null,
+              attrText,
+              dailyPriceCents: sku.dailyPrice ?? null,
+              activityPriceCents: priceCents != null ? Math.round(priceCents) : null,
+            },
             activityPriceCents: priceCents != null ? Math.round(priceCents) : null,
             currency: sku.currency ?? skc.currency ?? act.currency ?? null,
             status: derivedStatus,
@@ -267,6 +286,7 @@ export function transformActivityEnrollments(rawItems) {
               activityThematicId: act.activityThematicId,
               productName: act.productName,
               goodsId: act.goodsId,
+              pictureUrl: productPictureUrl,
               canEditStock: act.canEditStock,
               canResubmit: act.canResubmit,
             }, sku },

@@ -1,2 +1,7 @@
 node_modules/
 dev-reload.json
+.DS_Store
+**/.DS_Store
+*.bak
+*.bak.*
+*.js.bak

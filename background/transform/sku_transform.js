@@ -579,3 +579,126 @@ export function transformFluxAnalysisDetailResponse(rawItems, payload = {}) {
   return rows;
 }
 
+// ────────────────────────────────────────────────────────────────────
+// transformLifecycleResponse — 上新生命周期管理 / 价格申报中
+// 数据来源:plugin scrape:lifecycle-management
+//   POST /api/kiana/mms/robin/searchForChainSupplier
+//   body: { pageSize, pageNum, removeStatus:0, supplierTodoTypeList:[1] }
+//   (supplierTodoTypeList 1 = 价格申报中)
+//
+// 返回结构(2026-05-18 实测 cURL):
+//   result.dataList[]: SPU 级,含 skcList[](SKC 级)
+//   skcList[].skuList[]: SKU 级
+//   skcList[].supplierPriceReviewInfoList[]: 价格审核记录(SKC 级,共享 SKC 内所有 SKU)
+//     字段:supplyPrice / suggestSupplyPrice / priceOrderId / priceCurrency / status
+//   单位:supplyPrice/suggestSupplyPrice 都是 cents (¥90.00 = 9000)
+//
+// 展开方式:1 个 SPU → N 个 SKC → M 个 SKU = N×M 行 PriceReview;
+//          若 priceReviewInfo.siteList 含多站点,再 × 站点数。
+//          当前 sample siteList=null,默认 siteId=-1(全局未分发到具体站点)。
+// ────────────────────────────────────────────────────────────────────
+export function transformLifecycleResponse(rawItems, payload = {}) {
+  const rows = [];
+  const supplierTodoType = (payload?.supplierTodoTypeList?.[0]) ?? 1;
+
+  // status 映射:supplierPriceReviewInfoList[].status → PriceReview.status
+  // (sample 只见到 status=1;其他 code 待实测,fallback 到 pending)
+  const STATUS_MAP = {
+    1: 'pending',
+    // 后续实测:2=submitted / 3=approved / 4=rejected / etc.
+  };
+  const mapStatus = (s) => STATUS_MAP[Number(s)] ?? 'pending';
+
+  for (const spu of rawItems) {
+    const productId = spu?.productId != null ? String(spu.productId) : null;
+    if (!productId) continue;
+
+    const carouselFirst = Array.isArray(spu?.carouselImageUrlList) ? spu.carouselImageUrlList[0] : null;
+    const fullCat = Array.isArray(spu?.fullCategoryName) ? spu.fullCategoryName.join(' / ') : (spu?.leafCategoryName ?? null);
+    const spuAttrs = Array.isArray(spu?.productPropertyList) ? spu.productPropertyList : [];
+
+    // 拼 attributes:SPU 通用属性 + SKU 颜色等独有属性(后置覆盖)
+    const spuAttrsObj = {};
+    for (const p of spuAttrs) {
+      if (p?.name) spuAttrsObj[String(p.name)] = String(p.value ?? '');
+    }
+
+    const skcList = Array.isArray(spu?.skcList) ? spu.skcList : [];
+    for (const skc of skcList) {
+      const skcId = skc?.skcId != null ? String(skc.skcId) : null;
+      const skcPreview = Array.isArray(skc?.previewImgUrlList) ? skc.previewImgUrlList[0] : null;
+      const statusTime = skc?.statusTime ?? {};
+
+      const priceReviewList = Array.isArray(skc?.supplierPriceReviewInfoList) ? skc.supplierPriceReviewInfoList : [];
+      // 没有审核记录 → 这个 SKC 不在"价格申报中",跳过(supplierTodoTypeList 已过滤,理论上不会)
+      if (priceReviewList.length === 0) continue;
+
+      const skuList = Array.isArray(skc?.skuList) ? skc.skuList : [];
+      for (const sku of skuList) {
+        const skuId = sku?.skuId != null ? String(sku.skuId) : null;
+        if (!skuId) continue;
+
+        const skuAttrs = Array.isArray(sku?.productPropertyList) ? sku.productPropertyList : [];
+        const attrsObj = { ...spuAttrsObj };
+        for (const p of skuAttrs) {
+          if (p?.name) attrsObj[String(p.name)] = String(p.value ?? '');
+        }
+        const skuExtCode = sku?.extCode || skc?.extCode || null;
+
+        // 每个 priceReviewInfo 是一条核价记录(times 区分轮次,通常只看最新一条)
+        // 也展开 siteList — siteList=null 时默认 siteId=-1(全局,未分发到具体站点)
+        for (const review of priceReviewList) {
+          const orderId = review?.priceOrderId != null ? String(review.priceOrderId) : null;
+          const siteList = Array.isArray(review?.siteList) && review.siteList.length > 0
+            ? review.siteList
+            : [{ siteId: -1, siteName: null }];
+
+          for (const site of siteList) {
+            rows.push({
+              // —— 标识
+              platformProductId: productId,
+              platformSkcId:     skcId,
+              platformSkuId:     skuId,
+              skuExtCode,
+              productName:       spu?.productName ?? null,
+              pictureUrl:        sku?.skuPreviewImage || skcPreview || carouselFirst || null,
+              categoryName:      fullCat,
+              attributes:        attrsObj,
+
+              // —— 站点
+              siteId:            Number(site?.siteId ?? -1),
+              siteName:          site?.siteName ?? null,
+
+              // —— 价格(cents,Temu 端已经是 cents 单位)
+              originalPriceCents: review?.supplyPrice != null ? Number(review.supplyPrice) : (sku?.supplierPriceValue ?? null),
+              refPriceCents:      review?.suggestSupplyPrice != null ? Number(review.suggestSupplyPrice) : null,
+              newPriceCents:      null,    // 用户填,初始空
+              minReviewPriceCents: null,   // 来自 SkuCostProfile,server ingester JOIN 时填
+              activityDiscount:   null,    // 来自 SkuCostProfile
+              currency:           review?.priceCurrency || sku?.supplierPriceCurrencyType || 'CNY',
+
+              // —— 状态
+              status:             mapStatus(review?.status),
+              rejectReason:       null,
+
+              // —— 调价工单
+              platformOrderId:    orderId,
+
+              // —— 时间(epoch ms → ISO string)
+              createdAtRemote:    statusTime?.createdTime ? new Date(statusTime.createdTime).toISOString() : null,
+              priceConfirmedAt:   statusTime?.priceVerificationTime ? new Date(statusTime.priceVerificationTime).toISOString() : null,
+              addedToSiteAt:      statusTime?.addedToSiteTime ? new Date(statusTime.addedToSiteTime).toISOString() : null,
+              removedFromSiteAt:  statusTime?.unPublishedTime ? new Date(statusTime.unPublishedTime).toISOString() : null,
+              deadlineAt:         review?.remainedSeconds != null ? new Date(Date.now() + review.remainedSeconds * 1000).toISOString() : null,
+
+              platformPayload:    { sku, review },   // 只保 SKU+review 级 raw,SPU 级太大
+            });
+          }
+        }
+      }
+    }
+  }
+
+  console.log(`[temu] transformLifecycleResponse: ${rawItems.length} SPU → ${rows.length} PriceReview rows (todoType=${supplierTodoType})`);
+  return rows;
+}
