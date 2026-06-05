@@ -624,6 +624,15 @@ async function executeTask(task, pluginInstanceId) {
   }
 }
 
+// payload 字段名兼容:
+//   - scheduled-task.cron(ERP)派任务用 `shopType`
+//   - popup 手动派任务用 `siteType`(legacy plugin 词汇,值同 'semi'/'full')
+// 两种来源都正确把 shop.shopType 透传过来,只是字段名不同。统一在 SPEC 函数里 OR 一下。
+function isSemiPayload(payload) {
+  const v = payload?.shopType ?? payload?.siteType;
+  return v === 'semi';
+}
+
 // ── 每个 scrape:* kind 对应的 fetch + transform 配置 ─────────────
 // dispatchViaHiddenTab 在 page same-origin 上下文跑:
 //   1. 打开 pageUrl  → page 自然发起对 apiUrlPattern 的请求
@@ -633,7 +642,7 @@ async function executeTask(task, pluginInstanceId) {
 const KIND_TO_FETCH_SPEC = {
   'scrape:marketing-activity': {
     // 半托 endpoint 路径推测同 namespace,需绑真半托店实测(同 scrape:sales-30d 模式)
-    pageUrl: (payload) => payload?.shopType === 'semi'
+    pageUrl: (payload) => isSemiPayload(payload)
       ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity'
       : 'https://agentseller.temu.com/activity/marketing-activity',
     apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/activity/list',
@@ -686,7 +695,7 @@ const KIND_TO_FETCH_SPEC = {
   // payload: { mallId }  其他不需要(API 按 mallid header 隔离店铺)
   // 落库:ActivityEnrollment(一行 = shop × activity × session × SKU)
   'scrape:activity-data': {
-    pageUrl: (payload) => payload?.shopType === 'semi'
+    pageUrl: (payload) => isSemiPayload(payload)
       ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity/log'
       : 'https://agentseller.temu.com/activity/marketing-activity/log',
     apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/list',
@@ -755,7 +764,7 @@ const KIND_TO_FETCH_SPEC = {
   //   listPath: result.dataList  totalPath: result.total
   // 落库:price_review (展开 SPU → SKC → SKU → siteList)
   'scrape:lifecycle-management': {
-    pageUrl: (payload) => payload?.shopType === 'semi'
+    pageUrl: (payload) => isSemiPayload(payload)
       ? 'https://seller.kuajingmaihuo.com/newon/product-select'
       : 'https://agentseller.temu.com/newon/product-select',
     apiUrlPattern: (_payload) => '/api/kiana/mms/robin/searchForChainSupplier',
@@ -778,10 +787,16 @@ const KIND_TO_FETCH_SPEC = {
   // 对照 Sallfox 接口盘点:"Temu 调价单 magnus/mms/price-adjust/*"
   //   = 官方 bg.full.adjust.price.page.query
   'scrape:declared-price': {
-    pageUrl: (payload) => payload?.shopType === 'semi'
-      ? 'https://seller.kuajingmaihuo.com/price-management/price-adjust'
+    pageUrl: (payload) => isSemiPayload(payload)
+      // 半托 页面路由推测 — sellfox 文档 §3.6 写 "商品/价格管理/申报价格"
+      // 该路径未实测,失败会触发 capture-timeout(我们不接 ENDPOINT_MISMATCH,因为 timeout 不是 4xx)
+      ? 'https://seller.kuajingmaihuo.com/price-management/declared-price'
       : 'https://agentseller.temu.com/price-management/price-adjust',
-    apiUrlPattern: (_payload) => '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
+    apiUrlPattern: (payload) => isSemiPayload(payload)
+      // 半托:sellfox 反编译写的 robin namespace,非全托 magnus/price-adjust
+      // 详见 docs/sellfox-plugin-rev-eng.md §3.6 row 3
+      ? '/api/kiana/mms/robin/queryProductSkuPriceAndStatus'
+      : '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
@@ -796,10 +811,10 @@ const KIND_TO_FETCH_SPEC = {
   //   - 半托管:seller.kuajingmaihuo.com 销售管理页 → querySkuSalesNumber(详见 docs/sellfox-plugin-rev-eng.md §3.2 + §3.6)
   // ★ 半托 endpoint 路径尚未实测(用户绑了真半托店之后才能跑通);path 来自 sellfox-crx 反编译
   'scrape:sales-30d': {
-    pageUrl: (payload) => payload?.shopType === 'semi'
+    pageUrl: (payload) => isSemiPayload(payload)
       ? 'https://seller.kuajingmaihuo.com/main/sale-manage/main'
       : 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
-    apiUrlPattern: (payload) => payload?.shopType === 'semi'
+    apiUrlPattern: (payload) => isSemiPayload(payload)
       ? '/oms/bg/venom/api/supplier/sales/management/querySkuSalesNumber'
       : '/mms/venom/api/supplier/sales/management/listOverall',
     method: 'POST',

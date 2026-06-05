@@ -110,15 +110,43 @@ describe('scrape:declared-price', () => {
     expect(spec.pageUrl(fullPayload)).toBe('https://agentseller.temu.com/price-management/price-adjust');
   });
 
-  test('semi → seller.kuajingmaihuo.com pageUrl', () => {
-    expect(spec.pageUrl(semiPayload)).toBe('https://seller.kuajingmaihuo.com/price-management/price-adjust');
+  test('semi → seller.kuajingmaihuo.com/declared-price pageUrl', () => {
+    expect(spec.pageUrl(semiPayload)).toBe('https://seller.kuajingmaihuo.com/price-management/declared-price');
   });
 
-  test('full apiUrlPattern unchanged', () => {
+  test('full apiUrlPattern → magnus price-adjust path', () => {
     expect(spec.apiUrlPattern(fullPayload)).toBe('/api/kiana/magnus/mms/price-adjust/product-adjust-query');
   });
 
-  test('semi apiUrlPattern unchanged', () => {
-    expect(spec.apiUrlPattern(semiPayload)).toBe('/api/kiana/magnus/mms/price-adjust/product-adjust-query');
+  test('semi apiUrlPattern → robin queryProductSkuPriceAndStatus', () => {
+    expect(spec.apiUrlPattern(semiPayload)).toBe('/api/kiana/mms/robin/queryProductSkuPriceAndStatus');
+  });
+});
+
+// ── siteType compat (popup vocabulary) ───────────────────────────
+describe('siteType compat — popup 派任务用 siteType 字段', () => {
+  test('scrape:sales-30d siteType=semi (popup vocabulary) → semi URL', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    const url = spec.pageUrl({ siteType: 'semi' });
+    const api = spec.apiUrlPattern({ siteType: 'semi' });
+    expect(url).toContain('seller.kuajingmaihuo.com');
+    expect(api).toBe('/oms/bg/venom/api/supplier/sales/management/querySkuSalesNumber');
+  });
+
+  test('scrape:declared-price siteType=semi → robin namespace URL', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:declared-price'];
+    const api = spec.apiUrlPattern({ siteType: 'semi' });
+    expect(api).toBe('/api/kiana/mms/robin/queryProductSkuPriceAndStatus');
+  });
+
+  test('scrape:marketing-activity siteType=semi → semi host', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:marketing-activity'];
+    expect(spec.pageUrl({ siteType: 'semi' })).toContain('seller.kuajingmaihuo.com');
+  });
+
+  test('scrape:declared-price full → unchanged price-adjust path', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:declared-price'];
+    const api = spec.apiUrlPattern({ shopType: 'full' });
+    expect(api).toBe('/api/kiana/magnus/mms/price-adjust/product-adjust-query');
   });
 });
