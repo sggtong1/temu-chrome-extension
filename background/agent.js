@@ -771,8 +771,10 @@ const KIND_TO_FETCH_SPEC = {
   // 对照 Sallfox 接口盘点:"Temu 调价单 magnus/mms/price-adjust/*"
   //   = 官方 bg.full.adjust.price.page.query
   'scrape:declared-price': {
-    pageUrl: 'https://agentseller.temu.com/price-management/price-adjust',
-    apiUrlPattern: '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
+    pageUrl: (payload) => payload?.shopType === 'semi'
+      ? 'https://seller.kuajingmaihuo.com/price-management/price-adjust'
+      : 'https://agentseller.temu.com/price-management/price-adjust',
+    apiUrlPattern: (_payload) => '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
