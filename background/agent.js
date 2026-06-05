@@ -679,8 +679,10 @@ const KIND_TO_FETCH_SPEC = {
   // payload: { mallId }  其他不需要(API 按 mallid header 隔离店铺)
   // 落库:ActivityEnrollment(一行 = shop × activity × session × SKU)
   'scrape:activity-data': {
-    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity/log',
-    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/list',
+    pageUrl: (payload) => payload?.shopType === 'semi'
+      ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity/log'
+      : 'https://agentseller.temu.com/activity/marketing-activity/log',
+    apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/list',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
