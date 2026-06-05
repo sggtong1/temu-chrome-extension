@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Temu 数据采集",
-  "version": "1.7.3",
+  "version": "1.7.5",
   "description": "每日一键采集 Temu 卖家数据并同步到 Supabase",
   "permissions": [
     "storage",

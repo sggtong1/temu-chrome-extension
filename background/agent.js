@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-popuplog-20260604c';
+const AGENT_BUILD_ID   = 'agent-toplevelact-20260604e';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -507,7 +507,7 @@ async function ensurePluginInstanceId() {
   if (pluginInstanceId) return pluginInstanceId;
   const id = 'pi-' + (crypto.randomUUID?.() || (Date.now() + '-' + Math.random().toString(36).slice(2)));
   await chrome.storage.local.set({ pluginInstanceId: id });
-  console.log('[Temu后台] generated pluginInstanceId:', id);
+  console.log('生成 pluginInstanceId:', id);
   return id;
 }
 
@@ -561,7 +561,7 @@ export async function pollOnce() {
 
   const tasks = resp?.tasks || [];
   if (tasks.length === 0) return;
-  console.log(`[Temu后台] 领取 ${tasks.length} 个任务 | ${tasks.map((t) => taskKindLabel(t.kind)).join(' / ')}`);
+  console.log(`一、领取 ${tasks.length} 个任务:`, tasks.map((t) => taskKindLabel(t.kind)).join(' / '));
   for (const t of tasks) executeTask(t, pluginInstanceId);
 }
 
@@ -596,20 +596,21 @@ async function executeTask(task, pluginInstanceId) {
 
   const tid = task.id.slice(0, 8);
   const label = taskKindLabel(task.kind);
-  console.log(`[Temu后台] ▶ [${tid}] 开始执行: ${label}`);
+  console.log(`二、开始执行 [${tid}] ${label}`);
 
   try {
     const onProgress = (partial) => reportProgress(task.id, pluginInstanceId, partial);
     const result = await dispatch(task, abort.signal, onProgress);
     await reportResult(task.id, pluginInstanceId, { status: 'success', result });
-    console.log(`[Temu后台] ✓ [${tid}] ${label} 完成`);
+    const count = Array.isArray(result?.rows) ? result.rows.length : '-';
+    console.log(`四、✓ 完成 [${tid}] ${label} (${count} 条)`);
   } catch (e) {
     await reportResult(task.id, pluginInstanceId, {
       status: 'failed',
       errorCode: e.code || 'UNKNOWN',
       errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
     });
-    console.error(`[Temu后台] ✗ [${tid}] ${label} 失败: ${e.message}`);
+    console.error(`四、✗ 失败 [${tid}] ${label}: ${e.message}`);
   } finally {
     clearInterval(heartbeatTimer);
     _running.delete(task.id);
@@ -646,11 +647,15 @@ const KIND_TO_FETCH_SPEC = {
       ),
   },
   // scrape:activity-products — 抓"某活动可报商品 SKU 列表"
-  // payload: { mallId, activityType, activityThematicId, activityId(duoshou uuid) }
+  // payload: { mallId, activityType, activityId(duoshou uuid), activityThematicId?(顶层活动可空) }
+  // 顶层活动(官方大促/秒杀/清仓等)无 thematicId,Sellfox 路径(参 background.js 顶层活动分支):
+  //   - pageUrl 用 marketing-activity 主页(不能编出 detail-new URL)
+  //   - body 不传 activityThematicId,只传 activityType + rowCount + addSite
+  //   - Temu server 自动返该活动所有可报商品
   'scrape:activity-products': {
-    // pageUrl 由 payload 算 — type 和 thematicId 每个 task 不同
-    pageUrl: (payload) =>
-      `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${payload.activityType}&thematicId=${payload.activityThematicId}`,
+    pageUrl: (payload) => payload.activityThematicId
+      ? `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${payload.activityType}&thematicId=${payload.activityThematicId}`
+      : `https://agentseller.temu.com/activity/marketing-activity`,
     apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/scroll/match',
     method: 'POST',
     paginationMode: 'scroll',
@@ -659,8 +664,9 @@ const KIND_TO_FETCH_SPEC = {
     cursorInKey: 'scrollContext',
     buildBody: (payload) => ({
       activityType: payload.activityType,
-      activityThematicId: payload.activityThematicId,
+      ...(payload.activityThematicId ? { activityThematicId: payload.activityThematicId } : {}),
       rowCount: 50,
+      addSite: true,            // Sellfox 顶层活动分支带这个
       filterUnsalableWarning: false,
     }),
     listPath: 'result.matchList',
@@ -836,10 +842,12 @@ async function dispatchMarketingActivity(task, signal) {
 
 // ── scrape:activity-products 专用 wrapper ────────────────────────
 // 任务语义:抓某活动可报商品 SKU 列表(行展开后台 lazy 抓)。
-// payload 必须有:mallId, activityType, activityThematicId, activityId(duoshou uuid 用于 ingester)
+// payload 必须有:mallId, activityType, activityId(duoshou uuid 用于 ingester)
+// payload.activityThematicId 可选 — 顶层活动(官方大促/秒杀/清仓等)无 thematicId,
+//   Sellfox 路径(参 background.js 顶层活动分支)= 同 endpoint 不传 thematicId
 async function dispatchActivityProducts(task, signal) {
   const payload = task.payload ?? {};
-  const required = ['mallId', 'activityType', 'activityThematicId', 'activityId'];
+  const required = ['mallId', 'activityType', 'activityId'];
   for (const k of required) {
     if (payload[k] == null || payload[k] === '') {
       throw Object.assign(
@@ -2358,7 +2366,7 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     let session = await getCachedSession(mallId);
     let freshlyCaptured = false;
     if (!session) {
-      console.log(`[Temu后台] session MISS mall=${mallId} attempt=${attempt} — capturing via tab`);
+      console.log(`三、session 缓存未命中 mall=${mallId} — 开 hidden tab 抓 headers`);
       checkAbort();
       session = await captureSessionViaTab(spec, payload, signal);
       freshlyCaptured = true;
@@ -2366,7 +2374,7 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       //   chrome 登的是别的 mall 时 capture 出来的 headers 跟 task 期望对不上,
       //   写进缓存会污染下次同 mallId 任务(造成 "session HIT" + MALL_MISMATCH 怪象)
     } else {
-      console.log(`[Temu后台] session HIT mall=${mallId} attempt=${attempt} — SW fetch`);
+      console.log(`三、session 缓存命中 mall=${mallId}`);
     }
 
     // ★ 跨店数据污染防御:plugin 打开的 hidden tab 永远是 chrome 当前登录的 mallId,
@@ -2662,17 +2670,13 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
     }
     collected.push(...list);
 
-    // ★ 详显获取的 JSON — 让 SW console 能直观看到每页 Temu 返了啥(可展开树)
-    // 单独打成对象引用,Chrome 会渲染成可点击的可展开节点(比 stringify 字符串更好用)
-    const pageMarker = mode === 'scroll'
-      ? `cursor=${cursor ? String(cursor).slice(0, 24) : 'init'}`
-      : `page=${pageNo}`;
+    // ★ 详显获取的 JSON — Sellfox 风格:第 N 页 listLen=X total=Y,对象引用直接展开
+    const pageLabel = mode === 'scroll'
+      ? `游标第 ${iter + 1} 页`
+      : `第 ${pageNo} 页`;
     try {
-      console.log(
-        `[Temu后台] 📥 ${spec.apiUrlPattern} ${pageMarker} listLen=${list.length}` +
-        (spec.totalPath ? ` total=${getPath(data, spec.totalPath) ?? '?'}` : ''),
-        { rawJson: data, sample: list[0] ?? null },
-      );
+      const totalSuffix = spec.totalPath ? ` total=${getPath(data, spec.totalPath) ?? '?'}` : '';
+      console.log(`  ${pageLabel} listLen=${list.length}${totalSuffix}`, data);
     } catch {}
 
     if (mode === 'scroll') {
@@ -2939,12 +2943,12 @@ export function startAgent() {
     .finally(() => chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_PERIOD_MIN }));
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ALARM_NAME) {
-      pollOnce().catch((e) => console.error(`[Temu后台] ✗ 轮询错误: ${e.message}`));
+      pollOnce().catch((e) => console.error(`轮询错误: ${e.message}`));
     }
   });
   // Service worker 唤醒后立刻拉一次(不必等下个 alarm 周期)
   pollOnce().catch(() => {});
-  console.log(`[Temu后台] ▶ 派单中枢启动 | build=${AGENT_BUILD_ID} | 每 ${POLL_PERIOD_MIN * 60}s 轮询一次`);
+  console.log(`▶ 派单中枢启动 build=${AGENT_BUILD_ID} 每 ${POLL_PERIOD_MIN * 60}s 轮询一次`);
 }
 
 // 让 popup 通过 message 强制立刻拉一次
