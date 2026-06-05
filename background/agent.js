@@ -38,7 +38,23 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-mallcache-fix-20260519d';
+const AGENT_BUILD_ID   = 'agent-popuplog-20260604c';
+
+// plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
+// 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
+const SUPPORTED_KINDS = [
+  'scrape:marketing-activity',
+  'scrape:activity-products',
+  'scrape:sales-30d',
+  'scrape:activity-data',
+  'scrape:declared-price',
+  'scrape:lifecycle-management',
+  'scrape:flux-analysis',
+  'scrape:flux-analysis-detail',
+  'scrape:settlement',
+  'submit:price-confirm',
+  'submit:activity-enroll',
+];
 
 // 全托管流量分析按地区分 3 个 tab,Temu 后端用 siteId 区分。具体数字暂占位
 // (TODO:实测全球/美国/欧洲页面的请求 body 后修正)。Frontend 也可以传明确
@@ -104,6 +120,357 @@ function regionKeyFromPageUrl(pageUrl) {
   }
 }
 
+// 等 tab 加载完成(complete 状态)。timeout 触发抛 TAB_LOAD_TIMEOUT。
+export async function waitTabComplete(tabId, signal, timeoutMs = 30_000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const onUpdated = (uTabId, changeInfo) => {
+      if (uTabId === tabId && changeInfo.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        clearInterval(poll);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    const poll = setInterval(async () => {
+      if (signal?.aborted) {
+        clearInterval(poll);
+        try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+        reject(Object.assign(new Error('aborted'), { code: 'ABORTED' }));
+        return;
+      }
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t?.status === 'complete') {
+          clearInterval(poll);
+          try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+          resolve();
+          return;
+        }
+      } catch (e) {
+        clearInterval(poll);
+        try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+        reject(e);
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(poll);
+        try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+        reject(Object.assign(new Error('TAB_LOAD_TIMEOUT'), { code: 'TAB_LOAD_TIMEOUT' }));
+      }
+    }, 500);
+  });
+}
+
+// ── 登录流转 URL 识别 ────────────────────────────────────────────
+// 子域 token 过期后 Temu 把 tab 跳到:
+//  - agentseller(-eu/-us).temu.com/auth/authentication?redirectUrl=…  — portal(图1)
+//  - seller.kuajingmaihuo.com/settle/seller-login?redirectUrl=…       — kjmh SSO 中转 / 登陆表单(图2)
+//  - 其它子域 /login /sign-in 路径(少见)
+// ★ kjmh /main 是 user dashboard 主页(已登 kjmh 时正常),不能视为 login flow,
+//   否则 handleRecheckLogin 第一步 nav kjmh/main 就被当 expired。
+export function isLoginFlowUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  // 明确的认证 path
+  if (/\/(seller-login|sign-?in|authentication)/i.test(url)) return true;
+  if (/\/login(\b|\?|\/)/i.test(url)) return true;
+  return false;
+}
+
+// ── 自动登陆 v2:SSO via kjmh userInfo(2026-05-26)──────────────
+// 机制:Sellfox 实测验证 — kjmh `userInfo` API 返回的 `userId` 等价于 SSO `validateid`,
+// 跨 3 个子域(global / eu / us)同一个值。流程:
+//   1. SW fetch kjmh `/bg/quiet/api/mms/userInfo` 拿 userId(依赖 kjmh 主域 cookies)
+//   2. 根据当前 tab URL 推断要登的子域(global=1 / eu=2 / us=3)
+//   3. chrome.tabs.update 到 `https://agentseller-<region>.temu.com/settle/seller-login?validateid=<userId>&region=<N>`
+//   4. 子域 server 用 validateid 完成 SSO,自动 302 回业务页
+// 整个流程 < 3s,无任何 DOM click。kjmh 主域 token 也过期才会 fail(此时只能 user 手动登)。
+
+// region 编号 ←→ host 映射。验证来源:
+//   - Sellfox 实测:agentseller.temu.com → region=1
+//   - User 实测:agentseller-eu.temu.com → region=2
+//   - 推测:agentseller-us.temu.com → region=3(待 user 验证)
+const REGION_SSO_MAP = {
+  global: { host: 'agentseller.temu.com',    regionNum: 1 },
+  eu:     { host: 'agentseller-eu.temu.com', regionNum: 2 },
+  us:     { host: 'agentseller-us.temu.com', regionNum: 3 },
+};
+
+// 解析"当前 tab URL"该属于哪个子域。
+// 优先看 hostname,然后看 portal URL 里 redirectUrl 参数指向哪个子域。
+function inferRegionKeyForSSO(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    const directMap = {
+      'agentseller.temu.com':    'global',
+      'agentseller-eu.temu.com': 'eu',
+      'agentseller-us.temu.com': 'us',
+    };
+    if (directMap[u.hostname]) return directMap[u.hostname];
+    // portal URL: `?redirectUrl=https%3A%2F%2Fagentseller-X.temu.com%2F...`
+    const m = url.match(/[?&]redirectUrl=([^&]+)/);
+    if (m) {
+      const decoded = decodeURIComponent(m[1]);
+      const ru = new URL(decoded);
+      if (directMap[ru.hostname]) return directMap[ru.hostname];
+    }
+  } catch {}
+  return null;
+}
+
+// userId 5 分钟缓存,避免重复 fetch
+const _userIdCache = { value: null, mallId: null, expiresAt: 0 };
+
+// ★ 在指定 tab(必须已在 kjmh 主域 page context 上)拿 userId + mallId。
+//   返回 { userId, mallId } 或 { error }。
+//   mallId 是 SSO URL 必需参数(Sellfox URL pattern: ?init=true&mallId&uId&validateid)。
+export async function fetchKjmhUserIdInTab(tabId, signal) {
+  if (_userIdCache.value && _userIdCache.mallId && Date.now() < _userIdCache.expiresAt) {
+    return { userId: _userIdCache.value, mallId: _userIdCache.mallId, fromCache: true };
+  }
+  if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: async () => {
+        try {
+          const resp = await fetch('/bg/quiet/api/mms/userInfo', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+          });
+          if (!resp.ok) return { error: `http-${resp.status}` };
+          const data = await resp.json();
+          if (!data?.success) return { error: `api-failed: ${data?.errorCode}/${data?.errorMsg}` };
+          const userId = data?.result?.userId;
+          if (userId == null) return { error: 'userid-missing' };
+          // mallId:companyList[0].malInfoList[0].mallId(跟 Sellfox 取法一致)
+          const mallId = data?.result?.companyList?.[0]?.malInfoList?.[0]?.mallId;
+          return { userId: String(userId), mallId: mallId != null ? String(mallId) : '' };
+        } catch (e) {
+          return { error: `fetch: ${e?.message}` };
+        }
+      },
+    });
+    const result = r?.result || { error: 'no-result' };
+    if (result.userId) {
+      _userIdCache.value = result.userId;
+      _userIdCache.mallId = result.mallId || '';
+      _userIdCache.expiresAt = Date.now() + 5 * 60_000;
+    }
+    return result;
+  } catch (e) {
+    return { error: `exec: ${e?.message}` };
+  }
+}
+
+// (清理:waitSsoComplete 已删除 — Sellfox SSO 流程无 dialog click)
+
+// ★ Sellfox 实测路径:调 kjmh `/bg/quiet/api/auth/obtainCode` API 预授权 server-side state,
+//   然后直接 navigate 同 tab 到子域 `/?validateid=<userId>` —— server 看预授权状态接受 SSO,
+//   不弹 confirm dialog,不需要任何 click。
+// 子域中文显示名
+const REGION_DISPLAY_NAME = { global: '全球', us: '美区', eu: '欧区' };
+
+export async function runSsoForRegion(tabId, regionKey, userId, signal, mallId = '') {
+  const region = REGION_SSO_MAP[regionKey];
+  const regionName = REGION_DISPLAY_NAME[regionKey] || regionKey;
+  const actions = [];
+  const log = (msg) => console.log(`[Temu授权] ${msg}`);
+  const step = (msg) => { actions.push(msg); log(`  ${msg}`); };
+
+  if (!region) {
+    step(`✗ 未知区域: ${regionKey}`);
+    return { ok: false, reason: 'unknown-region', actions };
+  }
+  const baseUrl = `https://${region.host}`;
+  log(`—— 区域: ${regionName} (${region.host}) ——`);
+
+  // 1. 同 tab nav kjmh main
+  step('1. 跳转商家中心建立 referrer');
+  try {
+    await chrome.tabs.update(tabId, { url: 'https://seller.kuajingmaihuo.com/main' });
+    await waitTabComplete(tabId, signal, 15_000);
+  } catch (e) {
+    step(`✗ 跳转商家中心失败: ${e?.message}`);
+    return { ok: false, reason: 'kjmh-nav-failed', actions };
+  }
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      step('✗ 商家中心登录态失效');
+      return { ok: false, reason: 'kjmh-not-logged-in', actions };
+    }
+  } catch {}
+  await sleep(500, signal);
+
+  // 2. obtainCode 预授权
+  step('2. 调用 obtainCode 预授权');
+  let codeResult;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: async (redirectUrl) => {
+        try {
+          const resp = await fetch('/bg/quiet/api/auth/obtainCode', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ redirectUrl }),
+          });
+          if (!resp.ok) return { error: `http-${resp.status}` };
+          const data = await resp.json();
+          if (data?.result?.code) return { code: data.result.code, success: data.success };
+          return { error: `no-code: errorCode=${data?.errorCode} errorMsg=${data?.errorMsg}` };
+        } catch (e) {
+          return { error: `fetch: ${e?.message}` };
+        }
+      },
+      args: [`${baseUrl}/main/authentication`],
+    });
+    codeResult = r?.result;
+  } catch (e) {
+    step(`✗ obtainCode 调用失败(执行错误): ${e?.message}`);
+    return { ok: false, reason: 'obtainCode-exec-error', actions };
+  }
+  if (!codeResult?.code) {
+    step(`✗ obtainCode 调用失败: ${codeResult?.error || 'unknown'}`);
+    return { ok: false, reason: `obtainCode-failed-${codeResult?.error || 'unknown'}`, actions };
+  }
+  step(`   ↳ 授权码 ${codeResult.code.slice(0, 24)}…(共 ${codeResult.code.length} 字符)`);
+
+  // 3. nav tab 到子域 (即使被 redirect 到子域 portal,page origin = 子域,后续 fetch loginByCode 同源)
+  //    Sellfox 走法:content script 注入到所有子域,所以子域 page 上调用 loginByCode 是同源,不会被 CORS 拦。
+  step('3. 跳转子域(切换 page origin 为 ' + region.host + ')');
+  try {
+    await chrome.tabs.update(tabId, { url: `${baseUrl}/labor/bill` });
+    await waitTabComplete(tabId, signal, 15_000);
+  } catch (e) {
+    step(`✗ 跳转子域失败: ${e?.message}`);
+    return { ok: false, reason: 'subdomain-nav-failed', actions };
+  }
+  await sleep(500, signal);
+
+  // 4. 在子域 page context (same origin) fetch loginByCode
+  step('4. 调用子域 loginByCode 完成登录');
+  let loginResult;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: async (body) => {
+        try {
+          const resp = await fetch('/api/seller/auth/loginByCode', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json().catch(() => null);
+          return { ok: resp.ok, status: resp.status, success: data?.success, errorMsg: data?.errorMsg, errorCode: data?.errorCode };
+        } catch (e) {
+          return { error: e?.message };
+        }
+      },
+      args: [{ code: codeResult.code, confirm: true, targetMallId: mallId ? Number(mallId) : undefined }],
+    });
+    loginResult = r?.result;
+  } catch (e) {
+    step(`✗ loginByCode 执行错误: ${e?.message}`);
+    return { ok: false, reason: 'loginByCode-exec-error', actions };
+  }
+  if (!loginResult || loginResult.error) {
+    step(`✗ loginByCode 网络错误: ${loginResult?.error}`);
+    return { ok: false, reason: 'loginByCode-network-error', actions };
+  }
+  if (!loginResult.ok) {
+    step(`✗ loginByCode HTTP ${loginResult.status}`);
+    return { ok: false, reason: `loginByCode-http-${loginResult.status}`, actions };
+  }
+  if (loginResult.success === false) {
+    step(`✗ loginByCode 业务失败: ${loginResult.errorCode}/${loginResult.errorMsg}`);
+    return { ok: false, reason: `loginByCode-biz-${loginResult.errorCode}`, actions };
+  }
+  step(`✓ ${regionName} 授权完成 (子域 cookies 已写入)`);
+  return { ok: true, finalUrl: null, actions };
+}
+
+// 单个 task 流程(captureSessionViaTab 等)中检测到 login redirect 调用。
+// 用调用方提供的 tab(原本在 agentseller 子域上),先 nav 它去 kjmh main 拿 userId + 建 referrer,
+// 然后 nav SSO URL → 等完成。调用方负责 SSO 完事后把 tab navigate 回任务页。
+export async function attemptAutoLogin(tabId, signal) {
+  const actions = [];
+  const log = (msg) => console.log(`[Temu授权] ${msg}`);
+  const step = (msg) => { actions.push(msg); log(`  ${msg}`); };
+
+  log('▶ 任务流程触发自动授权');
+
+  // 0. 已不在 login flow 了 → 直接 ok
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && !isLoginFlowUrl(t.url)) {
+      step(`✓ 当前 URL 不在登录流程,无需操作`);
+      return { ok: true, finalUrl: t.url, actions };
+    }
+  } catch {}
+
+  // 1. 推断 region(从当前 URL)
+  let initialUrl = null;
+  try { const t = await chrome.tabs.get(tabId); initialUrl = t?.url || ''; } catch {}
+  const regionKey = inferRegionKeyForSSO(initialUrl);
+  if (!regionKey) {
+    step(`✗ 无法识别区域(当前 URL: ${(initialUrl || '').slice(0, 80)})`);
+    return { ok: false, reason: 'region-unknown', actions };
+  }
+  const regionName = REGION_DISPLAY_NAME[regionKey] || regionKey;
+  step(`识别区域: ${regionName} (${regionKey})`);
+
+  // 2. 拿 userId(cache 优先)
+  let userId = null;
+  if (_userIdCache.value && Date.now() < _userIdCache.expiresAt) {
+    userId = _userIdCache.value;
+    step(`使用缓存的 userId = ${userId}`);
+  } else {
+    step('跳转商家中心获取 userId');
+    try {
+      await chrome.tabs.update(tabId, { url: 'https://seller.kuajingmaihuo.com/main' });
+      await waitTabComplete(tabId, signal, 15_000);
+    } catch (e) {
+      step(`✗ 跳转商家中心失败: ${e?.message}`);
+      return { ok: false, reason: 'kjmh-nav-failed', actions };
+    }
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t?.url && isLoginFlowUrl(t.url)) {
+        step('✗ 商家中心登录态失效,需手动登录');
+        return { ok: false, reason: 'kjmh-not-logged-in', actions };
+      }
+    } catch {}
+    await sleep(800, signal);
+    const res = await fetchKjmhUserIdInTab(tabId, signal);
+    if (!res?.userId) {
+      step(`✗ 获取 userId 失败: ${res?.error}`);
+      return { ok: false, reason: `userid-failed-${res?.error || 'unknown'}`, actions };
+    }
+    userId = res.userId;
+    step(`✓ 获取 userId = ${userId}${res.mallId ? ` | mallId = ${res.mallId}` : ''}`);
+  }
+  const mallId = _userIdCache.mallId || '';
+
+  // 3. 跑 SSO
+  const r = await runSsoForRegion(tabId, regionKey, userId, signal, mallId);
+  actions.push(...r.actions);
+  return { ok: r.ok, finalUrl: r.finalUrl, reason: r.reason, actions };
+}
+
+// (清理:clickSsoConfirmDialog 已删除)
+// DEPRECATED placeholder — 老 form-click 路径已废除,保留空 export 防止 import 失败。
+
 // ★ 从 captured headers 抽 Temu 当前登录的 mallId。Temu agentseller 用 lowercase 'mallid' header,
 // 部分接口经 cookies 出现 mall_id_cookies 等变种 — 这里尽量宽容多 alias。
 function extractMallIdFromHeaders(headers) {
@@ -124,7 +491,7 @@ async function updateLoginHealth(regionKey, status, reason = null) {
     cur[regionKey] = { status, reason, updatedAt: Date.now() };
     await chrome.storage.local.set({ [LOGIN_HEALTH_KEY]: cur });
   } catch (e) {
-    console.warn(`[agent] updateLoginHealth(${regionKey}=${status}) failed:`, e?.message);
+    console.warn(`[Temu后台] updateLoginHealth(${regionKey}=${status}) failed:`, e?.message);
   }
 }
 
@@ -140,7 +507,7 @@ async function ensurePluginInstanceId() {
   if (pluginInstanceId) return pluginInstanceId;
   const id = 'pi-' + (crypto.randomUUID?.() || (Date.now() + '-' + Math.random().toString(36).slice(2)));
   await chrome.storage.local.set({ pluginInstanceId: id });
-  console.log('[agent] generated pluginInstanceId:', id);
+  console.log('[Temu后台] generated pluginInstanceId:', id);
   return id;
 }
 
@@ -179,20 +546,41 @@ export async function pollOnce() {
       body: JSON.stringify({
         pluginInstanceId,
         shopIds: cfg.selectedShopIds && cfg.selectedShopIds.length > 0 ? cfg.selectedShopIds : undefined,
+        kinds: SUPPORTED_KINDS,                    // capability dispatch — server 只派我会的 kind
+        buildId: AGENT_BUILD_ID,
+        extensionId: chrome.runtime?.id,
+        manifestVersion: chrome.runtime?.getManifest?.()?.version,
         limit: CLAIM_LIMIT,
         leaseSeconds: LEASE_SECONDS,
       }),
     });
   } catch (e) {
-    console.warn('[agent] claim 失败:', e.message);
+    console.warn(`[Temu后台] ✗ 领取任务失败: ${e.message}`);
     return;
   }
 
   const tasks = resp?.tasks || [];
   if (tasks.length === 0) return;
-  console.log(`[agent] 领取 ${tasks.length} 个任务`);
+  console.log(`[Temu后台] 领取 ${tasks.length} 个任务 | ${tasks.map((t) => taskKindLabel(t.kind)).join(' / ')}`);
   for (const t of tasks) executeTask(t, pluginInstanceId);
 }
+
+// kind → 中文展示名
+const KIND_LABELS = {
+  'scrape:marketing-activity': '营销活动',
+  'scrape:activity-products':  '活动可报商品',
+  'scrape:sales-30d':          '近30天销量',
+  'scrape:activity-data':      '活动报名记录',
+  'scrape:declared-price':     '申报价确认',
+  'scrape:lifecycle-management': '商品生命周期',
+  'scrape:flux-analysis':      '流量分析',
+  'scrape:flux-analysis-detail': '流量分析详情',
+  'scrape:settlement':         '结算账单',
+  'submit:price-confirm':      '核价确认',
+  'submit:price-reject':       '核价驳回',
+  'submit:activity-enroll':    '活动报名',
+};
+function taskKindLabel(kind) { return KIND_LABELS[kind] || kind; }
 
 // ── 任务执行 ────────────────────────────────────────────────────
 async function executeTask(task, pluginInstanceId) {
@@ -201,24 +589,27 @@ async function executeTask(task, pluginInstanceId) {
   const abort = new AbortController();
   const heartbeatTimer = setInterval(() => {
     sendHeartbeat(task.id, pluginInstanceId).catch((e) =>
-      console.warn(`[agent] heartbeat ${task.id} fail:`, e.message),
+      console.warn(`[Temu后台] heartbeat ${task.id.slice(0, 8)} 失败: ${e.message}`),
     );
   }, HEARTBEAT_PERIOD);
   _running.set(task.id, { abort, heartbeatTimer });
 
-  console.log(`[agent] ▶ ${task.id.slice(0, 8)} kind=${task.kind}`);
+  const tid = task.id.slice(0, 8);
+  const label = taskKindLabel(task.kind);
+  console.log(`[Temu后台] ▶ [${tid}] 开始执行: ${label}`);
 
   try {
-    const result = await dispatch(task, abort.signal);
+    const onProgress = (partial) => reportProgress(task.id, pluginInstanceId, partial);
+    const result = await dispatch(task, abort.signal, onProgress);
     await reportResult(task.id, pluginInstanceId, { status: 'success', result });
-    console.log(`[agent] ✓ ${task.id.slice(0, 8)}`);
+    console.log(`[Temu后台] ✓ [${tid}] ${label} 完成`);
   } catch (e) {
     await reportResult(task.id, pluginInstanceId, {
       status: 'failed',
       errorCode: e.code || 'UNKNOWN',
       errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
     });
-    console.error(`[agent] ✗ ${task.id.slice(0, 8)}:`, e.message);
+    console.error(`[Temu后台] ✗ [${tid}] ${label} 失败: ${e.message}`);
   } finally {
     clearInterval(heartbeatTimer);
     _running.delete(task.id);
@@ -395,69 +786,29 @@ const KIND_TO_FETCH_SPEC = {
 // ── kind → 实际执行的派发表 ───────────────────────────────────────
 // scrape:marketing-activity + scrape:activity-products 走实际 dispatch,
 // 其他 5 个 scrape:* 暂时 stub。submit:* 留到第三阶段。
-async function dispatch(task, signal) {
-  console.log(`[agent ${AGENT_BUILD_ID}] dispatch(kind=${task.kind}) url=${AGENT_IMPORT_URL}`);
+async function dispatch(task, signal, onProgress) {
   switch (task.kind) {
-    case 'scrape:marketing-activity':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchMarketingActivity (REAL path)`);
-      return dispatchMarketingActivity(task, signal);
-
-    case 'scrape:activity-products':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityProducts (REAL path)`);
-      return dispatchActivityProducts(task, signal);
-
-    case 'scrape:sales-30d':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchSales30d (REAL path)`);
-      return dispatchSales30d(task, signal);
-
-    case 'scrape:activity-data':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityData (REAL path)`);
-      return dispatchActivityData(task, signal);
-
-    case 'scrape:declared-price':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchDeclaredPrice (REAL path)`);
-      return dispatchDeclaredPrice(task, signal);
-
-    case 'scrape:lifecycle-management':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchLifecycleManagement (REAL path)`);
-      return dispatchLifecycleManagement(task, signal);
-
-    case 'submit:price-confirm':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchPriceConfirm (REAL path)`);
-      return dispatchPriceConfirm(task, signal);
-
-    case 'scrape:flux-analysis':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysis (REAL path)`);
-      return dispatchFluxAnalysis(task, signal);
-
-    case 'scrape:flux-analysis-detail':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchFluxAnalysisDetail (REAL path)`);
-      return dispatchFluxAnalysisDetail(task, signal);
-
-    // 其他 scrape:* kinds 暂时仍 stub, 后续 plan 接入
-    case 'scrape:settlement':
-    case 'scrape:promo': {
-      console.log(`[agent ${AGENT_BUILD_ID}] → 走 stub branch`);
-      // TODO[wire]: 接到现有 background/service_worker.js 里的 handleStartCollection
-      // 暂时返回 stub 结果，让端到端环路先通
-      await sleep(2000 + Math.random() * 3000, signal);
-      return {
-        stub: true,
-        kind: task.kind,
-        shopId: task.shop_id,
-        payload: task.payload,
-        completedAt: new Date().toISOString(),
-        agent: agentDiag(),
-      };
-    }
-    case 'submit:activity-enroll':
-      console.log(`[agent ${AGENT_BUILD_ID}] → 进入 dispatchActivityEnroll (REAL path)`);
-      return dispatchActivityEnroll(task, signal);
+    case 'scrape:marketing-activity':   return dispatchMarketingActivity(task, signal);
+    case 'scrape:activity-products':    return dispatchActivityProducts(task, signal);
+    case 'scrape:sales-30d':            return dispatchSales30d(task, signal);
+    case 'scrape:activity-data':        return dispatchActivityData(task, signal);
+    case 'scrape:declared-price':       return dispatchDeclaredPrice(task, signal);
+    case 'scrape:lifecycle-management': return dispatchLifecycleManagement(task, signal);
+    case 'scrape:flux-analysis':        return dispatchFluxAnalysis(task, signal);
+    case 'scrape:flux-analysis-detail': return dispatchFluxAnalysisDetail(task, signal);
+    case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
+    case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
+    case 'submit:activity-enroll':      return dispatchActivityEnroll(task, signal);
 
     case 'submit:price-reject':
       throw Object.assign(new Error('写操作还没接，第三阶段做'), { code: 'NOT_IMPLEMENTED' });
     default:
-      throw Object.assign(new Error(`未知 kind: ${task.kind}`), { code: 'UNKNOWN_KIND' });
+      // 不再 stub — 服务端会按 SUPPORTED_KINDS 过滤,理论上不会派不认识的 kind 给我们;
+      // 真到了 default 说明 server-side 派单逻辑或 SUPPORTED_KINDS 没同步,fail-fast
+      throw Object.assign(
+        new Error(`UNSUPPORTED_KIND: plugin build=${AGENT_BUILD_ID} 不支持 kind=${task.kind};请升级插件或更新 SUPPORTED_KINDS`),
+        { code: 'UNSUPPORTED_KIND' },
+      );
   }
 }
 
@@ -591,7 +942,7 @@ async function dispatchFluxAnalysis(task, signal) {
   let detailRows = [];
   let detailStats = { candidates: 0, success: 0, failed: 0, skipped: 0 };
   if (!session) {
-    console.warn(`[agent ${AGENT_BUILD_ID}] flux-analysis: list 完成但 session 丢失(罕见),跳过 detail`);
+    console.warn(`[Temu后台] flux-analysis: list 完成但 session 丢失(罕见),跳过 detail`);
   } else {
     const candidates = listRows.filter((r) => Number(r?.exposureNum ?? 0) > 0 && r?.platformProductId);
     detailStats.candidates = candidates.length;
@@ -653,18 +1004,18 @@ async function dispatchFluxAnalysis(task, signal) {
         } catch (e) {
           if (e?.code === 'RATE_LIMITED') {
             // 限流时直接停止其余 detail fetch — list 仍正常返回,detail 部分留给下次任务
-            console.warn(`[agent ${AGENT_BUILD_ID}] detail rate-limited at SPU ${i + 1}/${candidates.length},停止 detail batch`);
+            console.warn(`[Temu后台] detail rate-limited at SPU ${i + 1}/${candidates.length},停止 detail batch`);
             idx = candidates.length;       // 让其他 worker 也退出
             detailStats.failed++;
             return;
           }
-          console.warn(`[agent ${AGENT_BUILD_ID}] detail fetch fail spu=${r.platformProductId}: ${e.message}`);
+          console.warn(`[Temu后台] detail fetch fail spu=${r.platformProductId}: ${e.message}`);
           detailStats.failed++;
         }
       }
     }
     await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-    console.log(`[agent ${AGENT_BUILD_ID}] flux-analysis detail batch: ` +
+    console.log(`[Temu后台] flux-analysis detail batch: ` +
       `${detailStats.success}/${detailStats.candidates} ok, ${detailStats.failed} failed, ` +
       `${detailStats.skipped} no-goodsId — ${detailRows.length} day-rows`);
   }
@@ -754,7 +1105,7 @@ async function dispatchPriceConfirm(task, signal) {
   let session = await getCachedSession(mallId);
   let freshlyCaptured = false;
   if (!session) {
-    console.log(`[agent ${AGENT_BUILD_ID}] submit session MISS mall=${mallId} — capturing`);
+    console.log(`[Temu后台] submit session MISS mall=${mallId} — capturing`);
     if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
     session = await captureSessionViaTab(captureSpec, payload, signal);
     freshlyCaptured = true;
@@ -864,7 +1215,7 @@ async function dispatchActivityEnroll(task, signal) {
   const mallId = payload.mallId;
   // ★ NOT 走 getCachedSession — submit 必须每次 fresh capture 在 detail-new 页上下文,
   //   再用一遍 list-page cached session 会让 Temu 服务端"忘了"当前正在哪个 thematic 上。
-  console.log(`[agent ${AGENT_BUILD_ID}] enroll always fresh-capture (detail-new) thematic=${payload.thematicId}`);
+  console.log(`[Temu后台] enroll always fresh-capture (detail-new) thematic=${payload.thematicId}`);
   if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
   const session = await captureSessionViaTab(captureSpec, payload, signal);
   // MALL_MISMATCH 防御
@@ -966,6 +1317,829 @@ async function dispatchActivityEnroll(task, signal) {
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
+}
+
+// ── scrape:settlement 专用 wrapper(2026-05-24c: 多 variant)──────────
+// 4 个 variant 各自在自己的域 create + poll + download(独立),不依赖跨域 id 翻译
+//   - drIndex=0 (卖家中心): seller.kuajingmaihuo.com, taskType=19
+//   - drIndex=1 (全球):    agentseller.temu.com,     taskType=31
+//   - drIndex=2 (欧洲):    agentseller-eu.temu.com,  taskType=31
+//   - drIndex=3 (美国):    agentseller-us.temu.com,  taskType=31
+// payload.drIndex 指定单个 → 只跑那一个;否则跑所有 4 个,partial fail 不影响其他
+// 任一 variant 失败不会抛 — 在 variants[i] 里返回 ok=false + error
+// region 用 popup 同款短 key('global'/'eu'/'us'/'kjmh'),保证 updateLoginHealth() 写的
+// key 跟 popup 读的 key 一致(否则实测结果永远显示不出来)
+const SETTLEMENT_VARIANTS = [
+  { drIndex: 0, name: '卖家中心', origin: 'https://seller.kuajingmaihuo.com', pageUrl: 'https://seller.kuajingmaihuo.com/labor/bill', taskType: 19, region: 'kjmh' },
+  { drIndex: 1, name: '全球',     origin: 'https://agentseller.temu.com',    pageUrl: 'https://agentseller.temu.com/labor/bill',    taskType: 31, region: 'global' },
+  { drIndex: 2, name: '欧洲',     origin: 'https://agentseller-eu.temu.com', pageUrl: 'https://agentseller-eu.temu.com/labor/bill', taskType: 31, region: 'eu' },
+  { drIndex: 3, name: '美国',     origin: 'https://agentseller-us.temu.com', pageUrl: 'https://agentseller-us.temu.com/labor/bill', taskType: 31, region: 'us' },
+];
+
+async function dispatchSettlement(task, signal, onProgress) {
+  const payload = task.payload ?? {};
+  if (!payload.dateFrom || !payload.dateTo) {
+    throw Object.assign(
+      new Error('payload.dateFrom/dateTo missing for scrape:settlement'),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  // 必须显式加 +08:00 时区!Chrome SW context 对无 TZ 后缀的 date-time string
+  // 解析为 UTC(不是 user 浏览器 local +08),会让 endTime 跨日导致跟 Temu history
+  // row 的 day 比对差 1 天,Step 1 永远 miss
+  const beginTime = new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime();
+  const endTime = new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime();
+  if (!Number.isFinite(beginTime) || !Number.isFinite(endTime)) {
+    throw Object.assign(new Error('invalid dateFrom/dateTo'), { code: 'BAD_PAYLOAD' });
+  }
+  const mallIdToSend = payload.mallId ? String(payload.mallId) : null;
+  if (!mallIdToSend) {
+    throw Object.assign(
+      new Error('payload.mallId missing for scrape:settlement (server requires mallid header)'),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+
+  // 架构(2026-05-24h 重构):
+  //   1. 在 kjmh 上 create + poll + 下载 drIndex=0(卖家中心)— 唯一的 create
+  //   2. kjmh exportRow 含 agentSellerExportParams + agentSellerExportSign(跨域票据)
+  //   3. 对 drIndex 1/2/3:打开 agentseller-{region}.temu.com/labor/bill-download-with-detail?params=&sign=
+  //      让页面 mount → MAIN world hook fetch 收集 XHR → 找到 fileUrl 或返回诊断
+  // 注:暂不支持 payload.drIndex(因为 agentseller 依赖 kjmh row 的票据,必须先跑 kjmh)
+  const kjmhVariant = SETTLEMENT_VARIANTS[0];
+  const agentVariants = SETTLEMENT_VARIANTS.slice(1);
+
+  console.log(`[Temu后台] settlement: kjmh + ${agentVariants.length} agentseller variants, mall=${mallIdToSend}`);
+
+  const variants = [];
+  let kjmhRow = null;
+
+  // push 当前 variants 快照到 server,前端轮询能看见进度。失败静默(不阻塞主流程)
+  const push = (extra = {}) => {
+    if (!onProgress) return;
+    onProgress({
+      variants,
+      okCount: variants.filter(v => v.ok).length,
+      totalCount: 1 + agentVariants.length,
+      currentlyRunning: extra.runningName ?? null,
+      phase: extra.phase ?? 'running',
+      dateFrom: payload.dateFrom,
+      dateTo: payload.dateTo,
+      agent: agentDiag(),
+    });
+  };
+
+  // ── Phase 1: kjmh ─────────────────────────────────────────────────
+  push({ runningName: kjmhVariant.name, phase: 'phase1' });
+  try {
+    const r = await runOneSettlementVariant(kjmhVariant, { beginTime, endTime, mallId: mallIdToSend }, signal);
+    const entry = { drIndex: kjmhVariant.drIndex, name: kjmhVariant.name, region: kjmhVariant.region, taskType: kjmhVariant.taskType, ...r };
+    // 不把 exportRow 整个塞进 result(体积大),只挑关键字段
+    if (entry.exportRow) {
+      kjmhRow = entry.exportRow;
+      entry.exportRowKeys = Object.keys(kjmhRow);
+      delete entry.exportRow;
+    }
+    variants.push(entry);
+    if (r.ok) {
+      console.log(`[Temu后台] settlement[卖家中心]: ✓ ok bytes=${r.fileBytes} polls=${r.polls}`);
+      console.log(`[Temu后台] settlement[卖家中心]: kjmh row keys=${entry.exportRowKeys?.join(',')}`);
+    } else {
+      console.warn(`[Temu后台] settlement[卖家中心]: ✗ phase=${r.phase} code=${r.code} error=${String(r.error ?? '').slice(0, 250)}`);
+    }
+  } catch (e) {
+    variants.push({
+      drIndex: 0, name: '卖家中心', region: kjmhVariant.region, taskType: kjmhVariant.taskType,
+      ok: false, code: e?.code ?? 'VARIANT_FAILED', error: String(e?.message ?? e),
+    });
+    console.warn(`[Temu后台] settlement[卖家中心]: ✗ throw ${e?.message ?? e}`);
+  }
+  push();  // kjmh 完成,推一次
+
+  // ── Phase 2: agentseller 3 个(需要 kjmh 的跨域票据)──────────────────
+  // 字段名候选:agentSellerExportParams / agentSellerExportSign 是我从 download-with-detail
+  // 页面的 query string 反推的。如果实际 row 字段名不同(从 kjmh row keys log 可看),
+  // 后面我再加映射。
+  const agentParams = kjmhRow?.agentSellerExportParams;
+  const agentSign   = kjmhRow?.agentSellerExportSign;
+
+  const runAgent = async (variant) => {
+    const r = await runAgentsellerVariantDiag(variant, { params: agentParams, sign: agentSign, mallId: mallIdToSend }, signal);
+    return { drIndex: variant.drIndex, name: variant.name, region: variant.region, taskType: variant.taskType, ...r };
+  };
+
+  for (const variant of agentVariants) {
+    if (signal?.aborted) {
+      variants.push({ drIndex: variant.drIndex, name: variant.name, region: variant.region, taskType: variant.taskType, ok: false, code: 'ABORTED', error: 'task aborted' });
+      push();
+      continue;
+    }
+    if (!agentParams || !agentSign) {
+      variants.push({
+        drIndex: variant.drIndex, name: variant.name, region: variant.region, taskType: variant.taskType,
+        ok: false, code: 'NO_KJMH_TICKET',
+        error: `kjmh row 缺 agentSellerExportParams/Sign(kjmh row keys=${kjmhRow ? Object.keys(kjmhRow).join(',') : 'no-row'})`,
+      });
+      push();
+      continue;
+    }
+    push({ runningName: variant.name, phase: 'phase2' });
+    try {
+      const r = await runAgent(variant);
+      variants.push(r);
+      console.log(`[Temu后台] settlement[${variant.name}]: ${r.ok ? '✓ ok' : '✗ fail'} code=${r.code ?? 'OK'} bytes=${r.fileBytes ?? 0}`);
+    } catch (e) {
+      variants.push({
+        drIndex: variant.drIndex, name: variant.name, region: variant.region, taskType: variant.taskType,
+        ok: false, code: e?.code ?? 'VARIANT_FAILED', error: String(e?.message ?? e),
+      });
+      console.warn(`[Temu后台] settlement[${variant.name}]: ✗ throw ${e?.message ?? e}`);
+    }
+    push();  // 每个 variant 完成,推一次
+  }
+
+  // ── Phase 3: 重试失败的 agentseller variants(最多 2 轮)──────────
+  // 常见失败:NO_FILEURL(欧洲表大,首次 60s 不够);LOGIN_REQUIRED 不重试
+  const RETRY_MAX = 2;
+  // LOGIN_REQUIRED 也允许 retry(retry 之间 60+90s sleep,给 user 时间打开 agentseller-eu/us 登录页)
+  // 真不登的话 retry 也 fail,只多浪费 30s × 2 = 1 分钟
+  const NO_RETRY_CODES = new Set(['NO_KJMH_TICKET', 'ABORTED']);
+  for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
+    const toRetry = variants.filter(v =>
+      !v.ok && v.drIndex !== 0 && !NO_RETRY_CODES.has(v.code)
+    );
+    if (toRetry.length === 0) break;
+    // 给 server 时间继续生成 xlsx(欧洲大表常 NO_FILEURL 是 server 还在生成)
+    // 第 1 次 retry 前 sleep 60s,第 2 次 90s
+    const sleepBefore = attempt === 1 ? 60_000 : 90_000;
+    console.log(`[Temu后台] settlement retry #${attempt}: ${toRetry.length} variant(s) (${toRetry.map(v => v.name).join(',')}) — 先 sleep ${sleepBefore/1000}s 给 server 时间生成`);
+    await sleep(sleepBefore, signal);
+    for (const failed of toRetry) {
+      if (signal?.aborted) break;
+      const variant = agentVariants.find(v => v.drIndex === failed.drIndex);
+      if (!variant) continue;
+      try {
+        const r = await runAgent(variant);
+        // 替换原 failed entry
+        const idx = variants.indexOf(failed);
+        if (idx >= 0) variants[idx] = r;
+        console.log(`[Temu后台] settlement[${variant.name}] retry #${attempt}: ${r.ok ? '✓ ok' : '✗ fail'} code=${r.code ?? 'OK'} bytes=${r.fileBytes ?? 0}`);
+      } catch (e) {
+        console.warn(`[Temu后台] settlement[${variant.name}] retry #${attempt}: ✗ throw ${e?.message ?? e}`);
+      }
+    }
+  }
+
+  const okCount = variants.filter(v => v.ok).length;
+  console.log(`[Temu后台] settlement: done ${okCount}/${variants.length} variant(s) ok`);
+
+  return {
+    variants,
+    okCount,
+    totalCount: variants.length,
+    dateFrom: payload.dateFrom,
+    dateTo: payload.dateTo,
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// 跑一个 variant — 开 tab → 等加载 → 登录检测 → executeScript → 关 tab
+// 返回 { ok, xlsxBase64?, filename?, fileBytes?, exportRowId?, polls?, phase?, code?, error? }
+async function runOneSettlementVariant(variant, { beginTime, endTime, mallId }, signal) {
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 6 * 60_000;
+
+  let tabId = null;
+  let onUpdatedListener = null;
+  const cleanup = async () => {
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+    if (tabId != null) {
+      try { await chrome.tabs.remove(tabId); } catch {}
+      tabId = null;
+    }
+  };
+
+  try {
+    const tab = await chrome.tabs.create({ url: variant.pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${variant.pageUrl}`);
+
+    await new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      onUpdatedListener = (uTabId, changeInfo) => {
+        if (uTabId === tabId && changeInfo.status === 'complete') resolve();
+      };
+      chrome.tabs.onUpdated.addListener(onUpdatedListener);
+      const poll = setInterval(async () => {
+        if (signal?.aborted) { clearInterval(poll); reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })); return; }
+        try {
+          const t = await chrome.tabs.get(tabId);
+          if (t?.status === 'complete') { clearInterval(poll); resolve(); return; }
+        } catch (e) { clearInterval(poll); reject(e); return; }
+        if (Date.now() - startedAt > TAB_LOAD_TIMEOUT_MS) {
+          clearInterval(poll);
+          reject(Object.assign(new Error('TAB_LOAD_TIMEOUT'), { code: 'TAB_LOAD_TIMEOUT' }));
+        }
+      }, 500);
+    });
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+
+    let t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      console.log(`[Temu后台] settlement[${variant.name}]: login redirect (${t.url.slice(0,120)}) → 尝试自动登陆`);
+      const loginResult = await attemptAutoLogin(tabId, signal);
+      console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
+      if (!loginResult.ok) {
+        await updateLoginHealth(variant.region, 'expired', `auto-login failed: ${loginResult.reason}`);
+        return { ok: false, phase: 'login', code: 'LOGIN_REQUIRED', error: `${variant.region} auto-login ${loginResult.reason} (last actions: ${loginResult.actions.slice(-3).map(a => a.action).join(',')})` };
+      }
+      // 登陆成功后 redirectUrl 可能不指向 variant.pageUrl,强制 navigate 回任务页
+      await chrome.tabs.update(tabId, { url: variant.pageUrl });
+      await waitTabComplete(tabId, signal, 30_000);
+      t = await chrome.tabs.get(tabId);
+      if (t?.url && isLoginFlowUrl(t.url)) {
+        await updateLoginHealth(variant.region, 'expired', `re-redirect after auto-login: ${t.url}`);
+        return { ok: false, phase: 'login', code: 'LOGIN_REQUIRED', error: `${variant.region} auto-login 后仍跳登录` };
+      }
+      await updateLoginHealth(variant.region, 'ok', 'auto-login restored');
+    }
+    await sleep(2000, signal);
+
+    console.log(`[Temu后台] settlement[${variant.name}]: executeScript (taskType=${variant.taskType}, mall=${mallId})`);
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runSettlementInTab,
+      args: [{
+        taskType: variant.taskType,
+        beginTime, endTime,
+        mallId,
+        drIndex: variant.drIndex,
+        pollIntervalMs: 5000,
+        maxPolls: 60,
+      }],
+    });
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(
+        () => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })),
+        SCRIPT_TIMEOUT_MS,
+      )),
+    ]);
+
+    if (!result) return { ok: false, phase: 'script', code: 'NO_RESULT', error: 'executeScript returned no result' };
+    // 成功路径写 loginHealth(ok) — popup 会显示"实测在线"
+    if (result.ok) await updateLoginHealth(variant.region, 'ok', null);
+    return result; // {ok, xlsxBase64, filename, ...} or {ok:false, phase, code, error}
+  } finally {
+    await cleanup();
+  }
+}
+
+// ── agentseller-{region} 跨域 download 诊断版本(2026-05-24h)──────
+// 用 kjmh row 拿到的 params + sign 拼 /labor/bill-download-with-detail URL
+// 打开 hidden tab → MAIN world hook fetch → 等 15s 让 page mount + 自动调 XHR
+// 返回:{ ok: false, code: 'DIAG_COLLECTED', captured: [...] }
+// 后续根据 captured 内容知道 fileUrl 哪儿来,再升级到真实下载
+async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, signal) {
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const downloadUrl = `${variant.origin}/labor/bill-download-with-detail?params=${encodeURIComponent(params)}&sign=${encodeURIComponent(sign)}`;
+
+  let tabId = null;
+  let onUpdatedListener = null;
+  const cleanup = async () => {
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+    if (tabId != null) {
+      try { await chrome.tabs.remove(tabId); } catch {}
+      tabId = null;
+    }
+  };
+
+  try {
+    const tab = await chrome.tabs.create({ url: downloadUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${downloadUrl.slice(0, 150)}`);
+
+    await new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      onUpdatedListener = (uTabId, changeInfo) => {
+        if (uTabId === tabId && changeInfo.status === 'complete') resolve();
+      };
+      chrome.tabs.onUpdated.addListener(onUpdatedListener);
+      const poll = setInterval(async () => {
+        if (signal?.aborted) { clearInterval(poll); reject(Object.assign(new Error('aborted'), { code: 'ABORTED' })); return; }
+        try {
+          const t = await chrome.tabs.get(tabId);
+          if (t?.status === 'complete') { clearInterval(poll); resolve(); return; }
+        } catch (e) { clearInterval(poll); reject(e); return; }
+        if (Date.now() - startedAt > TAB_LOAD_TIMEOUT_MS) {
+          clearInterval(poll);
+          reject(Object.assign(new Error('TAB_LOAD_TIMEOUT'), { code: 'TAB_LOAD_TIMEOUT' }));
+        }
+      }, 500);
+    });
+    if (onUpdatedListener) {
+      try { chrome.tabs.onUpdated.removeListener(onUpdatedListener); } catch {}
+      onUpdatedListener = null;
+    }
+
+    let t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      console.log(`[Temu后台] diag[${variant.name}]: login redirect (${t.url.slice(0,120)}) → 尝试自动登陆`);
+      const loginResult = await attemptAutoLogin(tabId, signal);
+      console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
+      if (!loginResult.ok) {
+        await updateLoginHealth(variant.region, 'expired', `auto-login failed: ${loginResult.reason}`);
+        return { ok: false, phase: 'login', code: 'LOGIN_REQUIRED', error: `${variant.region} auto-login ${loginResult.reason}` };
+      }
+      // download tab 跳回的 redirectUrl 是任务 download URL,这里直接 navigate 回去触发 fetch
+      await chrome.tabs.update(tabId, { url: downloadUrl });
+      await waitTabComplete(tabId, signal, 30_000);
+      t = await chrome.tabs.get(tabId);
+      if (t?.url && isLoginFlowUrl(t.url)) {
+        await updateLoginHealth(variant.region, 'expired', `re-redirect after auto-login: ${t.url}`);
+        return { ok: false, phase: 'login', code: 'LOGIN_REQUIRED', error: `${variant.region} auto-login 后仍跳登录` };
+      }
+      await updateLoginHealth(variant.region, 'ok', 'auto-login restored');
+    }
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: hookAndDownloadXlsx,
+      args: [{ waitMs: 120_000 }],  // 欧洲一个月 25k 行,server 生成可能 1-3 min;给 page 2 min 等 fileUrl
+    });
+    const SCRIPT_TIMEOUT_MS_INNER = 6 * 60_000; // 总外层 6 分钟覆盖 wait + xlsx download
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(
+        () => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })),
+        SCRIPT_TIMEOUT_MS_INNER,
+      )),
+    ]);
+    if (!result) return { ok: false, phase: 'script', code: 'NO_RESULT', error: 'executeScript returned no result' };
+    // 成功 download 也写 loginHealth(ok) — popup 实测"在线"
+    if (result.ok) await updateLoginHealth(variant.region, 'ok', null);
+    return result; // {ok, xlsxBase64, ...} 或 {ok:false, phase, code, error}
+  } finally {
+    await cleanup();
+  }
+}
+
+// MAIN world:hook fetch,拦截 /file/export/download 的响应拿 fileUrl → fetch xlsx → base64
+// 必须是纯函数(executeScript 序列化)
+function hookAndDownloadXlsx(args) {
+  return (async () => {
+    const { waitMs } = args;
+    try {
+      let fileUrl = null;
+      let downloadResp = null;
+
+      const origFetch = window.fetch;
+      window.fetch = async function (...callArgs) {
+        const req = callArgs[0];
+        const url = typeof req === 'string' ? req : (req?.url ?? '');
+        const resp = await origFetch.apply(this, callArgs);
+        // 拦截 /file/export/download:取 fileUrl 给我们自己用,
+        // 同时返回一个把 fileUrl 抹空的 Response 给页面 — 防止页面用 <a download> 触发本地下载
+        if (/\/api\/merchant\/file\/export\/download/.test(url)) {
+          try {
+            const clone = resp.clone();
+            const json = await clone.json();
+            if (json?.result?.fileUrl) {
+              if (!fileUrl) {
+                fileUrl = json.result.fileUrl;
+                downloadResp = json;
+              }
+              // 篡改 response — 把 fileUrl 抹空,让页面拿到的是空 URL,无法触发本地下载
+              const mutated = { ...json, result: { ...json.result, fileUrl: '' } };
+              return new Response(JSON.stringify(mutated), {
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: resp.headers,
+              });
+            }
+          } catch {}
+        }
+        return resp;
+      };
+
+      // 轮询等 fileUrl 出现(或 waitMs 超时)
+      const startedAt = Date.now();
+      while (!fileUrl && Date.now() - startedAt < waitMs) {
+        await new Promise(r => setTimeout(r, 250));
+      }
+      if (!fileUrl) {
+        return { ok: false, phase: 'wait', code: 'NO_FILEURL', error: `${waitMs}ms 内页面没发出 /download response` };
+      }
+
+      // 拿到 fileUrl → fetch xlsx 二进制
+      const blobResp = await fetch(fileUrl, { method: 'GET', credentials: 'include' });
+      if (!blobResp.ok) {
+        return { ok: false, phase: 'blob', code: 'BLOB_FAILED', error: `HTTP ${blobResp.status}` };
+      }
+      const contentType = blobResp.headers.get('content-type') || '';
+      const buf = await blobResp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const isXlsx = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+      if (!isXlsx) {
+        const preview = String.fromCharCode.apply(null, bytes.subarray(0, Math.min(200, bytes.length)));
+        return { ok: false, phase: 'blob', code: 'NOT_XLSX', error: `non-xlsx (ct=${contentType}, bytes=${bytes.length}): ${preview.slice(0, 150)}` };
+      }
+      const CHUNK = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      const xlsxBase64 = btoa(binary);
+      const filenameMatch = fileUrl.match(/\/([^/?]+\.xlsx)/);
+      const filename = filenameMatch ? filenameMatch[1] : `agentseller-${Date.now()}.xlsx`;
+      return { ok: true, xlsxBase64, filename, fileBytes: buf.byteLength, fileUrl };
+    } catch (e) {
+      return { ok: false, phase: 'unexpected', code: 'UNEXPECTED', error: String(e?.message ?? e) };
+    }
+  })();
+}
+
+// MAIN world(诊断版本,保留备用):hook fetch + XMLHttpRequest,收集 waitMs 内所有调用
+// 必须是纯函数(executeScript 序列化)
+function hookFetchAndCollect(args) {
+  return (async () => {
+    const { waitMs } = args;
+    const captured = [];
+    const MAX_BODY_LEN = 800;
+    const trim = (s) => typeof s === 'string' && s.length > MAX_BODY_LEN ? s.slice(0, MAX_BODY_LEN) + '…' : s;
+
+    try {
+      const origFetch = window.fetch;
+      window.fetch = async function (...callArgs) {
+        const req = callArgs[0];
+        const init = callArgs[1] ?? {};
+        const url = typeof req === 'string' ? req : req?.url;
+        const method = init?.method ?? (typeof req === 'object' ? req?.method : 'GET') ?? 'GET';
+        const reqBody = init?.body != null ? String(init.body) : null;
+        const startedAt = Date.now();
+        const entry = { src: 'fetch', method, url: trim(String(url)), reqBody: trim(reqBody), startedAt };
+        captured.push(entry);
+        try {
+          const resp = await origFetch.apply(this, callArgs);
+          entry.status = resp.status;
+          // 克隆 response 偷一份 body
+          try {
+            const clone = resp.clone();
+            const ct = clone.headers.get('content-type') || '';
+            if (/json|text|xml/i.test(ct)) {
+              const txt = await clone.text();
+              entry.respBody = trim(txt);
+            } else {
+              entry.respBody = `[non-text content-type=${ct}]`;
+            }
+          } catch (e) { entry.respBodyErr = String(e?.message ?? e); }
+          return resp;
+        } catch (e) {
+          entry.error = String(e?.message ?? e);
+          throw e;
+        }
+      };
+
+      // XHR hook(同样收集)
+      const OrigXHR = window.XMLHttpRequest;
+      function XHRProxy() {
+        const xhr = new OrigXHR();
+        const entry = { src: 'xhr', startedAt: Date.now() };
+        captured.push(entry);
+        const origOpen = xhr.open;
+        xhr.open = function (method, url, ...rest) {
+          entry.method = method; entry.url = trim(String(url));
+          return origOpen.call(this, method, url, ...rest);
+        };
+        const origSend = xhr.send;
+        xhr.send = function (body) {
+          entry.reqBody = trim(body != null ? String(body) : null);
+          xhr.addEventListener('loadend', () => {
+            entry.status = xhr.status;
+            try {
+              const ct = xhr.getResponseHeader('content-type') || '';
+              if (/json|text|xml/i.test(ct)) entry.respBody = trim(xhr.responseText);
+              else entry.respBody = `[non-text ct=${ct}]`;
+            } catch {}
+          });
+          return origSend.call(this, body);
+        };
+        return xhr;
+      }
+      XHRProxy.prototype = OrigXHR.prototype;
+      window.XMLHttpRequest = XHRProxy;
+
+      // 等 page mount + 自动 XHR
+      await new Promise(r => setTimeout(r, waitMs));
+
+      // 取一下 body 文本 snippet 帮助判断页面是否正常 mount
+      const docTextSnippet = String(document.body?.innerText ?? '').slice(0, 300);
+      return { captured, docTextSnippet };
+    } catch (e) {
+      return { captured, error: String(e?.message ?? e) };
+    }
+  })();
+}
+
+// MAIN world 注入函数:在页面上下文内跑整套 settlement(派任务 + 轮询 + 下载 + base64)
+// 必须是纯函数(executeScript 会序列化它),不能引用外部变量
+function runSettlementInTab(args) {
+  return (async () => {
+    try {
+      const { taskType, beginTime, endTime, mallId, drIndex, pollIntervalMs, maxPolls } = args;
+
+      // 关键 header:
+      // - content-type:application/json
+      // - mallid:server 用来路由 + 判权限,缺这条 → "没权限访问"
+      // - anti-content 由页面 WAF SDK 自动注入(我们裸 fetch 也会触发 Request 构造器代理)
+      const headers = {
+        'content-type': 'application/json',
+        'mallid': String(mallId),
+      };
+      const post = (path, body) => fetch(path, {
+        method: 'POST',
+        credentials: 'include',
+        headers,
+        body: JSON.stringify(body),
+      });
+      const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+      // 翻 5 页 × 50 条找匹配 row —— 在 create 之前先用 + create 失败兜底也用
+      // 用"日历日"比较(+08 时区下的 YYYY-MM-DD)而不是 epoch ms,容忍服务端时区偏移
+      // 例如 plugin 发 endTime epoch 跟 history 里 searchExportTimeEnd 可能差 8-9 小时,但同一天
+      const epochToCnDay = (e) => {
+        if (e == null) return '';
+        const d = new Date(Number(e) + 8 * 3600 * 1000);
+        return d.toISOString().slice(0, 10);  // YYYY-MM-DD 在 +08 时区下
+      };
+      const beginDay = epochToCnDay(beginTime);
+      const endDay   = epochToCnDay(endTime);
+      const matchesRangeStrict = (row, _endT) => row
+        && epochToCnDay(row.searchExportTimeBegin) === beginDay
+        && epochToCnDay(row.searchExportTimeEnd)   === endDay;
+      async function fetchAllHistoryPages() {
+        const all = [];
+        for (let pg = 1; pg <= 5; pg++) {
+          try {
+            const resp = await post('/api/merchant/file/export/history/page', { taskType, pageSize: 50, pageNum: pg });
+            if (!resp.ok) break;
+            const json = await resp.json();
+            const list = json?.result?.merchantMerchantFileExportHistoryList ?? [];
+            if (list.length === 0) break;
+            all.push(...list);
+            if (list.length < 50) break;
+          } catch { break; }
+        }
+        return all;
+      }
+
+      // ── Step 1:先看 history 有没有现成匹配 row,有就跳过 create(节省 quota + 更快)──
+      let exportRow = null;
+      let skippedCreate = false;
+      let pollCount = 0;
+      const step1Diag = { expectedBegin: beginDay, expectedEnd: endDay, historyCount: 0, sampleRows: [], fetchError: null };
+      try {
+        const existing = await fetchAllHistoryPages();
+        step1Diag.historyCount = existing.length;
+        step1Diag.sampleRows = existing.slice(0, 8).map(r => ({
+          id: r?.id,
+          beginEpoch: r?.searchExportTimeBegin,
+          endEpoch: r?.searchExportTimeEnd,
+          beginDay: epochToCnDay(r?.searchExportTimeBegin),
+          endDay: epochToCnDay(r?.searchExportTimeEnd),
+          status: r?.status,
+          keys: r ? Object.keys(r).slice(0, 20) : [],
+        }));
+        exportRow = existing.find(r => r?.status === 2 && matchesRangeStrict(r, endTime));
+        if (exportRow) {
+          skippedCreate = true;
+        }
+      } catch (e) {
+        step1Diag.fetchError = String(e?.message ?? e);
+      }
+
+      // snap baseline createTime(给 create 后轮询新 row 用)
+      let beforeMaxCreate = 0;
+      try {
+        const r = await post('/api/merchant/file/export/history/page', { taskType, pageSize: 10, pageNum: 1 });
+        if (r.ok) {
+          const j = await r.json();
+          const list = j?.result?.merchantMerchantFileExportHistoryList ?? [];
+          for (const row of list) if (row?.createTime > beforeMaxCreate) beforeMaxCreate = row.createTime;
+        }
+      } catch {}
+
+      // 2. POST /export 派任务(已有 ready row 跳过这步)
+      let createBody = {
+        fundDetailExport: true,
+        taskType,
+        beginTime,
+        endTime,
+        mallId: Number(mallId),
+        drList: drIndex != null ? [drIndex] : [0, 1, 2, 3],
+      };
+      let createOk = false;
+      let dupCreate = false;
+      let lastCreateErr = '';
+
+      // 关键 optimization:如果上面 Step 1 已经找到 ready row,直接跳过 create + 轮询
+      if (skippedCreate) {
+        // exportRow 已设,跳到 download
+      } else {
+
+      // 平台限制类错误的 errorMsg 关键词识别(不分 errorCode,服务端时不时变)
+      // - "当前创建的导出任务过多,请明日再来" → 每日配额耗尽
+      // - "请稍后再试" / "频繁" → 短期限流
+      const RATE_LIMIT_PATTERNS = [
+        /导出任务过多/, /明日再来/, /明天再试/,
+        /频繁/, /频次/, /稍后再试/,
+        /限流/, /配额/, /quota/i, /too many/i, /rate.?limit/i,
+      ];
+
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        const resp = await post('/api/merchant/file/export', createBody);
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          return { ok: false, phase: 'create', code: 'CREATE_FAILED', error: `HTTP ${resp.status}: ${txt.slice(0, 200)}` };
+        }
+        const j = await resp.json();
+        if (j?.success === true) { createOk = true; break; }
+        const msg = String(j?.errorMsg ?? '');
+        // 平台配额限制 → fail-fast,不走 dup 兜底(因为根本没创建)
+        if (RATE_LIMIT_PATTERNS.some(p => p.test(msg))) {
+          console.warn(`[runSettlementInTab] EXPORT_RATE_LIMITED: ${msg} (code=${j?.errorCode})`);
+          return {
+            ok: false, phase: 'create', code: 'EXPORT_RATE_LIMITED',
+            error: `Temu 平台导出配额已用尽:"${msg}"。每个店铺每天可导出次数有限,明日再试 或者 改其他店铺`,
+            step1Diag,
+          };
+        }
+        if (Number(j?.errorCode) !== 2000000) {
+          // 其他非 dup 错误,fail-fast
+          const dump = JSON.stringify(j).slice(0, 400);
+          console.warn(`[runSettlementInTab] CREATE_FAILED: ${dump}`);
+          return { ok: false, phase: 'create', code: 'CREATE_FAILED', error: `${j?.errorMsg ?? 'unknown'} (errorCode=${j?.errorCode})` };
+        }
+        // dup
+        lastCreateErr = msg ?? 'dup';
+        if (attempt < 3) {
+          createBody = { ...createBody, endTime: createBody.endTime - (attempt + 1) };  // -1, -2, -3 ms
+          console.log(`[runSettlementInTab] dup #${attempt + 1},微调 endTime=${createBody.endTime} 重试`);
+          await sleepMs(500);
+        } else {
+          dupCreate = true;  // 3 次都 dup,认了
+          console.warn(`[runSettlementInTab] 3 次微调都 dup,转入 polling 兜底:${lastCreateErr}`);
+        }
+      }
+
+      // 3. 轮询 history 找 status=2 的 row
+      // 正常路径:看 createTime > baseline 的新 row(确保是本次 create 的产物)
+      // dupCreate 路径:服务端说"已创建,请勿重复" → 取最近一条 status=2 的 row(不按 filter 匹配,
+      // 因为 row 字段名/类型未知;dup 窗口短,最近一条几乎必然就是用户/我们刚创建的)
+      // dup 时按 row.searchExportTimeBegin / searchExportTimeEnd **严格匹配**当前 task 的日期范围
+      // 注意:如果上面 dup retry 微调过 endTime,要用最终发出去的(createBody.endTime),
+      // 不能用 outer endTime —— history 里 row 的 searchExportTimeEnd 是我们 actually sent 的值
+      const matchEndTime = createBody.endTime;
+      const matchesRange = (row) => row
+        && Number(row.searchExportTimeBegin) === Number(beginTime)
+        && Number(row.searchExportTimeEnd)   === Number(matchEndTime);
+
+      // 翻 5 页 × 50 条 = 250 条 history,在多页中找匹配 row(server 长尾 dedup 可能在后页)
+      async function fetchAllHistoryPages() {
+        const all = [];
+        for (let pg = 1; pg <= 5; pg++) {
+          try {
+            const resp = await post('/api/merchant/file/export/history/page', { taskType, pageSize: 50, pageNum: pg });
+            if (!resp.ok) break;
+            const json = await resp.json();
+            const list = json?.result?.merchantMerchantFileExportHistoryList ?? [];
+            if (list.length === 0) break;
+            all.push(...list);
+            if (list.length < 50) break;  // 不足 50 条说明已到底
+          } catch { break; }
+        }
+        return all;
+      }
+
+      if (dupCreate) {
+        try {
+          const allRows = await fetchAllHistoryPages();
+          if (allRows[0]) {
+            console.log(`[runSettlementInTab] dupCreate 共 ${allRows.length} 条 history row,row[0] keys=${Object.keys(allRows[0]).join(',')}`);
+          }
+          exportRow = allRows.find(r => r?.status === 2 && matchesRange(r));
+          if (exportRow) {
+            console.log(`[runSettlementInTab] dupCreate ✓ 匹配 row id=${exportRow.id} begin=${exportRow.searchExportTimeBegin} end=${exportRow.searchExportTimeEnd}`);
+          } else {
+            const sample = allRows.slice(0, 3).map(r => `(${r.searchExportTimeBegin}→${r.searchExportTimeEnd} status=${r.status})`).join(', ');
+            console.warn(`[runSettlementInTab] dupCreate ✗ 共扫 ${allRows.length} 条没找匹配,开头 3 条:${sample}`);
+          }
+        } catch (e) {
+          console.warn(`[runSettlementInTab] dupCreate fetch fail: ${e.message}`);
+        }
+      }
+      if (!exportRow) {
+        const polls = dupCreate ? Math.min(6, maxPolls) : maxPolls;
+        for (let i = 0; i < polls; i++) {
+          await sleepMs(pollIntervalMs);
+          pollCount++;
+          try {
+            const all = await fetchAllHistoryPages();
+            const candidates = dupCreate
+              ? all.filter(matchesRange)
+              : all.filter(r => r?.createTime > beforeMaxCreate && matchesRange(r));
+            if (candidates.length === 0) continue;
+            const ready = candidates.find(r => r?.status === 2);
+            if (ready) { exportRow = ready; break; }
+            if (!dupCreate) {
+              const failed = candidates.find(r => r?.status !== 1 && r?.status !== 2);
+              if (failed) {
+                return { ok: false, phase: 'poll', code: 'EXPORT_FAILED', error: `new row status=${failed.status} (id=${failed.id})`, polls: pollCount };
+              }
+            }
+          } catch (e) { /* 继续轮询 */ }
+        }
+        if (!exportRow && dupCreate) {
+          return {
+            ok: false, phase: 'poll', code: 'DUP_NO_MATCH',
+            error: `服务端 dedup 但翻 history 5 页都没找匹配 row。30 min 后再试 / 改日期范围 / 在 Temu UI 手动点导出再让 plugin 抓`,
+            polls: pollCount,
+          };
+        }
+      }
+      if (!exportRow) {
+        return { ok: false, phase: 'poll', code: 'EXPORT_TIMEOUT', error: `${maxPolls * pollIntervalMs / 1000}s 内未就绪 (dup=${dupCreate})`, polls: pollCount };
+      }
+      }  // end of `else { create + poll }`
+
+      // 4. POST /download 拿 signed URL
+      const dlResp = await post('/api/merchant/file/export/download', { id: exportRow.id, taskType });
+      if (!dlResp.ok) {
+        const txt = await dlResp.text().catch(() => '');
+        return { ok: false, phase: 'download', code: 'DOWNLOAD_FAILED', error: `HTTP ${dlResp.status}: ${txt.slice(0, 200)}` };
+      }
+      const dlJson = await dlResp.json();
+      const fileUrl = dlJson?.result?.fileUrl;
+      if (!fileUrl) {
+        return { ok: false, phase: 'download', code: 'DOWNLOAD_NO_URL', error: JSON.stringify(dlJson).slice(0, 300) };
+      }
+
+      // 5. fetch signed URL 拿 xlsx 二进制
+      // 文件托管在 seller.kuajingmaihuo.com/mall-finance-files/*,看似有 COS 签名其实
+      // 同域 path,server 前置 session 检查 → 必须带 cookie('include')否则被重定向到登录页
+      // 返回 HTML 而不是 xlsx
+      const blobResp = await fetch(fileUrl, { method: 'GET', credentials: 'include' });
+      if (!blobResp.ok) {
+        return { ok: false, phase: 'blob', code: 'BLOB_FAILED', error: `HTTP ${blobResp.status}` };
+      }
+      const contentType = blobResp.headers.get('content-type') || '';
+      const buf = await blobResp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      // xlsx magic bytes:`PK\x03\x04`(ZIP signature),验证不是 HTML / JSON 错误页
+      const isXlsx = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+      if (!isXlsx) {
+        // 不是 xlsx — 多半是登录重定向页或错误页,取前 200 字符给出 clue
+        const preview = String.fromCharCode.apply(null, bytes.subarray(0, Math.min(200, bytes.length)));
+        return {
+          ok: false, phase: 'blob', code: 'NOT_XLSX',
+          error: `fileUrl returned non-xlsx (content-type=${contentType}, bytes=${bytes.length}): ${preview.slice(0, 150)}`,
+        };
+      }
+      const CHUNK = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      const xlsxBase64 = btoa(binary);
+
+      const filenameMatch = fileUrl.match(/\/([^/?]+\.xlsx)/);
+      const filename = filenameMatch ? filenameMatch[1] : `settlement-${taskType}-${Date.now()}.xlsx`;
+
+      return {
+        ok: true,
+        xlsxBase64,
+        filename,
+        fileBytes: buf.byteLength,
+        exportRowId: exportRow.id,
+        exportRow,  // 整行回传 — SW 用 row.agentSellerExportParams + row.agentSellerExportSign 走跨域 download
+        polls: pollCount,
+      };
+    } catch (e) {
+      return { ok: false, phase: 'unexpected', code: 'UNEXPECTED', error: String(e?.message ?? e) };
+    }
+  })();
 }
 
 // ── scrape:lifecycle-management 专用 wrapper ─────────────────────
@@ -1085,9 +2259,9 @@ async function setMallCooldown(mallId, retryAfterMs, reason) {
   const entry = { untilMs: Date.now() + dur, durationMs: dur, reason };
   try {
     await chrome.storage.session.set({ [COOLDOWN_KEY(mallId)]: entry });
-    console.warn(`[agent ${AGENT_BUILD_ID}] cooldown SET mall=${mallId} for ${(dur/1000).toFixed(0)}s — ${reason}`);
+    console.warn(`[Temu后台] cooldown SET mall=${mallId} for ${(dur/1000).toFixed(0)}s — ${reason}`);
   } catch (e) {
-    console.warn('[agent] cooldown set failed:', e?.message);
+    console.warn('[Temu后台] cooldown set failed:', e?.message);
   }
   return entry;
 }
@@ -1126,7 +2300,7 @@ async function getCachedSession(mallId) {
       await chrome.storage.session.remove(key).catch(() => {});
     }
   } catch (e) {
-    console.warn('[agent] storage.session get failed:', e?.message);
+    console.warn('[Temu后台] storage.session get failed:', e?.message);
   }
   return null;
 }
@@ -1138,7 +2312,7 @@ async function setCachedSession(mallId, headers, origin, capturedMallId = null) 
   try {
     await chrome.storage.session.set({ [SESSION_KEY(mallId)]: entry });
   } catch (e) {
-    console.warn('[agent] storage.session set failed:', e?.message);
+    console.warn('[Temu后台] storage.session set failed:', e?.message);
   }
 }
 
@@ -1174,7 +2348,7 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     if (attempt > 0) {
       const delayMs = RATE_LIMIT_RETRY_DELAYS_MS[attempt - 1];
       console.warn(
-        `[agent ${AGENT_BUILD_ID}] rate-limit retry ${attempt}/${RATE_LIMIT_RETRY_DELAYS_MS.length} ` +
+        `[Temu后台] rate-limit retry ${attempt}/${RATE_LIMIT_RETRY_DELAYS_MS.length} ` +
         `mall=${mallId} — sleeping ${delayMs/1000}s + invalidating session (will re-capture)`,
       );
       await sleep(delayMs, signal);
@@ -1184,7 +2358,7 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
     let session = await getCachedSession(mallId);
     let freshlyCaptured = false;
     if (!session) {
-      console.log(`[agent ${AGENT_BUILD_ID}] session MISS mall=${mallId} attempt=${attempt} — capturing via tab`);
+      console.log(`[Temu后台] session MISS mall=${mallId} attempt=${attempt} — capturing via tab`);
       checkAbort();
       session = await captureSessionViaTab(spec, payload, signal);
       freshlyCaptured = true;
@@ -1192,7 +2366,7 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       //   chrome 登的是别的 mall 时 capture 出来的 headers 跟 task 期望对不上,
       //   写进缓存会污染下次同 mallId 任务(造成 "session HIT" + MALL_MISMATCH 怪象)
     } else {
-      console.log(`[agent ${AGENT_BUILD_ID}] session HIT mall=${mallId} attempt=${attempt} — SW fetch`);
+      console.log(`[Temu后台] session HIT mall=${mallId} attempt=${attempt} — SW fetch`);
     }
 
     // ★ 跨店数据污染防御:plugin 打开的 hidden tab 永远是 chrome 当前登录的 mallId,
@@ -1228,6 +2402,22 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
         }
         // 最后一次也限流 → 写短冷却 + 上抛
         await setMallCooldown(mallId, e.retryAfterMs, `after ${RATE_LIMIT_RETRY_DELAYS_MS.length} inline retries: ` + (e.message?.slice(0, 160) ?? ''));
+        throw e;
+      }
+      // ★ Temu 5xx:同样 transient,重试时 invalidate session 让下次 re-capture anti-content
+      //    经验上 HTTP 500 常因 anti-content header 时效(几分钟)失效引起。
+      if (e?.code === 'TEMU_SERVER_ERROR') {
+        lastErr = e;
+        // 完整诊断 log:body + payload,帮排查是哪种 5xx(server bug / activity 不存在 / 等)
+        console.warn(
+          `[Temu后台] HTTP ${e.httpStatus} attempt=${attempt} kind=${spec.kind} ` +
+          `payload=${JSON.stringify(payload).slice(0, 300)} body=${(e.message || '').slice(0, 300)}`,
+        );
+        if (attempt < RATE_LIMIT_RETRY_DELAYS_MS.length) {
+          console.warn(`[Temu后台] → invalidate session + retry (attempt ${attempt+1}/${RATE_LIMIT_RETRY_DELAYS_MS.length})`);
+          continue;
+        }
+        // 多次 5xx 还失败 → 不再 retry,上抛
         throw e;
       }
       // 非限流错误:直接上抛,不重试
@@ -1297,41 +2487,85 @@ async function captureSessionViaTab(spec, payload, signal) {
     // ★ captureApiUrlPattern 优先:detail 接口页面不会主动发,要等 list 请求来捕 mallId/anti-content
     //   headers(同 mallId session 跨 path 通用),fetch 时仍走原 spec.apiUrlPattern。
     const captureUrlPattern = spec.captureApiUrlPattern ?? spec.apiUrlPattern;
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: captureHeadersInTab,
-      args: [{
-        apiUrlPattern: captureUrlPattern,
-        captureTimeoutMs: CAPTURE_TIMEOUT_MS,
-      }],
-    });
+    const captureRegionKey = regionKeyFromPageUrl(resolvedPageUrl);
+
+    const runCapture = async () => {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: captureHeadersInTab,
+        args: [{
+          apiUrlPattern: captureUrlPattern,
+          captureTimeoutMs: CAPTURE_TIMEOUT_MS,
+        }],
+      });
+      return r?.result;
+    };
+
+    // ★ short-circuit:tab load 完成后 URL 已经是 login flow → 跳过 capture(白等 30s),直接 auto-login
+    let result;
+    let earlyLoginUrl = null;
+    try { const t = await chrome.tabs.get(tabId); earlyLoginUrl = (t?.url && isLoginFlowUrl(t.url)) ? t.url : null; } catch {}
+    if (earlyLoginUrl) {
+      console.log(`[Temu后台] capture[${spec.kind}]: 早期检测 login redirect (${earlyLoginUrl.slice(0,120)}) → 跳过 capture 直接 auto-login`);
+      result = { ok: false, phase: 'pre-capture', error: 'login redirect detected before capture' };
+    } else {
+      result = await runCapture();
+    }
+
+    // capture 失败 → 看是不是 login redirect → 尝试 auto-login → 重 navigate → 重 capture 一次
     if (!result || result.ok !== true) {
-      // ★ capture 失败时,先看 tab 是不是被 redirect 到登录页 — 这是子域 token 过期
-      // 最常见的症状。识别到了就标 LOGIN_REQUIRED + 更新 loginHealth,popup 实时反映。
-      const regionKey = regionKeyFromPageUrl(resolvedPageUrl);
       let currentUrl = null;
       try {
         const t = await chrome.tabs.get(tabId);
         currentUrl = t?.url || null;
       } catch {}
-      const isLoginRedirect = currentUrl && /\/(login|sign-?in|auth|oauth|seller-login)/i.test(currentUrl);
-      if (isLoginRedirect && regionKey) {
-        await updateLoginHealth(regionKey, 'expired', `redirected to login: ${currentUrl}`);
+      if (currentUrl && isLoginFlowUrl(currentUrl) && captureRegionKey) {
+        console.log(`[Temu后台] capture[${spec.kind}]: login redirect (${currentUrl.slice(0,120)}) → 尝试自动登陆`);
+        const loginResult = await attemptAutoLogin(tabId, signal);
+        console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
+        if (loginResult.ok) {
+          try {
+            await chrome.tabs.update(tabId, { url: resolvedPageUrl });
+            await waitTabComplete(tabId, signal, 30_000);
+            const t2 = await chrome.tabs.get(tabId);
+            if (t2?.url && !isLoginFlowUrl(t2.url)) {
+              await updateLoginHealth(captureRegionKey, 'ok', 'auto-login restored');
+              result = await runCapture(); // 重抓 headers
+            } else {
+              await updateLoginHealth(captureRegionKey, 'expired', `re-redirect after auto-login: ${t2?.url}`);
+            }
+          } catch (e) {
+            await updateLoginHealth(captureRegionKey, 'expired', `post-login navigate failed: ${e?.message}`);
+          }
+        } else {
+          await updateLoginHealth(captureRegionKey, 'expired', `auto-login failed: ${loginResult.reason}`);
+        }
+      }
+    }
+
+    if (!result || result.ok !== true) {
+      let currentUrl = null;
+      try {
+        const t = await chrome.tabs.get(tabId);
+        currentUrl = t?.url || null;
+      } catch {}
+      const isLoginRedirect = currentUrl && isLoginFlowUrl(currentUrl);
+      if (isLoginRedirect && captureRegionKey) {
+        await updateLoginHealth(captureRegionKey, 'expired', `redirected to login: ${currentUrl}`);
         throw Object.assign(
-          new Error(`LOGIN_REQUIRED: ${regionKey} 子域 token 已过期,需要重新登录 (now at ${currentUrl})`),
-          { code: 'LOGIN_REQUIRED', region: regionKey, currentUrl },
+          new Error(`LOGIN_REQUIRED: ${captureRegionKey} 子域 token 已过期,自动登陆未恢复 (now at ${currentUrl})`),
+          { code: 'LOGIN_REQUIRED', region: captureRegionKey, currentUrl },
         );
       }
-      if (regionKey) await updateLoginHealth(regionKey, 'unknown', result?.error ?? 'capture failed');
+      if (captureRegionKey) await updateLoginHealth(captureRegionKey, 'unknown', result?.error ?? 'capture failed');
       throw Object.assign(
         new Error(`CAPTURE_FAILED: ${result?.error ?? 'unknown'} (phase=${result?.phase ?? 'n/a'})`),
         { code: 'CAPTURE_FAILED', detail: result },
       );
     }
     // ★ 成功 — region 已确认登录态有效
-    const okRegionKey = regionKeyFromPageUrl(resolvedPageUrl);
-    if (okRegionKey) await updateLoginHealth(okRegionKey, 'ok', null);
+    if (captureRegionKey) await updateLoginHealth(captureRegionKey, 'ok', null);
     const capturedMallId = extractMallIdFromHeaders(result.headers);
     return { headers: result.headers, origin: result.origin, mallId: capturedMallId };
   } finally {
@@ -1392,6 +2626,13 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
     }
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
+      // 5xx = transient(server 自己挂或 anti-content 失效)→ 标 transient code 让上游 retry
+      if (resp.status >= 500 && resp.status < 600) {
+        throw Object.assign(
+          new Error(`TEMU_SERVER_ERROR: HTTP ${resp.status}: ${txt.slice(0, 300)}`),
+          { code: 'TEMU_SERVER_ERROR', httpStatus: resp.status },
+        );
+      }
       throw Object.assign(
         new Error(`TEMU_FETCH_FAILED: HTTP ${resp.status}: ${txt.slice(0, 300)}`),
         { code: 'TEMU_FETCH_FAILED' },
@@ -1420,6 +2661,19 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       );
     }
     collected.push(...list);
+
+    // ★ 详显获取的 JSON — 让 SW console 能直观看到每页 Temu 返了啥(可展开树)
+    // 单独打成对象引用,Chrome 会渲染成可点击的可展开节点(比 stringify 字符串更好用)
+    const pageMarker = mode === 'scroll'
+      ? `cursor=${cursor ? String(cursor).slice(0, 24) : 'init'}`
+      : `page=${pageNo}`;
+    try {
+      console.log(
+        `[Temu后台] 📥 ${spec.apiUrlPattern} ${pageMarker} listLen=${list.length}` +
+        (spec.totalPath ? ` total=${getPath(data, spec.totalPath) ?? '?'}` : ''),
+        { rawJson: data, sample: list[0] ?? null },
+      );
+    } catch {}
 
     if (mode === 'scroll') {
       if (!getPath(data, spec.hasMorePath)) break;
@@ -1654,7 +2908,7 @@ async function reportResult(taskId, pluginInstanceId, payload) {
       body: JSON.stringify({ pluginInstanceId, ...payload }),
     });
   } catch (e) {
-    console.error(`[agent] result ${taskId} 上报失败:`, e.message);
+    console.error(`[Temu后台] result ${taskId} 上报失败:`, e.message);
   }
 }
 
@@ -1665,6 +2919,19 @@ async function sendHeartbeat(taskId, pluginInstanceId) {
   });
 }
 
+// 中途上报进度 — plugin 完成一个 sub-step 推一次,前端轮询能看见进展
+async function reportProgress(taskId, pluginInstanceId, partialResult) {
+  try {
+    await api(`/api/agent/tasks/${taskId}/progress`, {
+      method: 'POST',
+      body: JSON.stringify({ pluginInstanceId, partialResult, leaseSeconds: LEASE_SECONDS }),
+    });
+  } catch (e) {
+    // 进度上报失败不影响主流程
+    console.warn(`[Temu后台] progress ${taskId} 上报失败:`, e.message);
+  }
+}
+
 // ── 启动 ─────────────────────────────────────────────────────────
 export function startAgent() {
   Promise.resolve(chrome.alarms.clear(ALARM_NAME))
@@ -1672,12 +2939,12 @@ export function startAgent() {
     .finally(() => chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_PERIOD_MIN }));
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ALARM_NAME) {
-      pollOnce().catch((e) => console.error('[agent] poll err:', e));
+      pollOnce().catch((e) => console.error(`[Temu后台] ✗ 轮询错误: ${e.message}`));
     }
   });
-  // Service worker 唤醒后立刻拉一次（不必等下个 alarm 周期）
+  // Service worker 唤醒后立刻拉一次(不必等下个 alarm 周期)
   pollOnce().catch(() => {});
-  console.log(`[agent ${AGENT_BUILD_ID}] 已启动，每 ${POLL_PERIOD_MIN * 60}s 拉一次任务 url=${AGENT_IMPORT_URL}`);
+  console.log(`[Temu后台] ▶ 派单中枢启动 | build=${AGENT_BUILD_ID} | 每 ${POLL_PERIOD_MIN * 60}s 轮询一次`);
 }
 
 // 让 popup 通过 message 强制立刻拉一次

@@ -391,6 +391,13 @@ html, body {
 .task-result.failed { color: #ef4444; }
 .task-result.pending { color: #9ca3af; }
 
+.task-exec-at {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
 .task-retry {
   background: none;
   border: 1px solid #fecaca;

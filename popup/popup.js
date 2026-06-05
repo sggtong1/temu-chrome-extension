@@ -54,16 +54,16 @@ async function apiFetch(path, opts = {}) {
 }
 
 const KIND_LABELS = {
-  'scrape:activity-data':    '活动数据',
-  'scrape:settlement':       '结算数据',
-  'scrape:flux-analysis':    '流量分析',
-  'scrape:sales-30d':        '近30天销量',
-  'scrape:declared-price':   '申报价格',
-  'scrape:marketing-activity': '营销活动',
-  'scrape:promo':            '广告报表',
-  'submit:activity-enroll':  '活动报名',
-  'submit:price-confirm':    '价格确认',
-  'submit:price-reject':     '价格驳回',
+  'scrape:activity-data':    '获取活动数据',
+  'scrape:settlement':       '获取结算数据',
+  'scrape:flux-analysis':    '获取流量分析',
+  'scrape:sales-30d':        '获取近30天销量',
+  'scrape:declared-price':   '获取申报价格',
+  'scrape:marketing-activity': '获取营销活动',
+  'scrape:promo':            '获取广告报表',
+  'submit:activity-enroll':  '提交活动报名',
+  'submit:price-confirm':    '提交价格确认',
+  'submit:price-reject':     '提交价格驳回',
 };
 const STATUS_TO_UI = {
   pending:   { cls: 'pending', label: '待获取' },
@@ -93,6 +93,11 @@ const MODULE_TO_KIND = {
   'promo':          'scrape:promo',
 };
 
+// 反向:kind → module key(给 renderProgress 过滤 + computeModuleCounts 计数用)
+const KIND_TO_MODULE = Object.fromEntries(
+  Object.entries(MODULE_TO_KIND).map(([m, k]) => [k, m])
+);
+
 let _apiShops = [];          // /api/shops 返回
 let _apiTasks = [];          // /api/agent/tasks 返回
 let _connected = false;      // 上次 refreshFromApi 是否成功
@@ -119,6 +124,7 @@ async function refreshFromApi() {
   _connected = shopsR.status === 'fulfilled' || tasksR.status === 'fulfilled';
   if (_connected) {
     shops = buildShopsFromApi();
+    renderModules();    // ★ 左侧计数依赖 _apiTasks/_apiShops,初次拉到后必须重渲染
     renderProgress();
   }
 }
@@ -129,28 +135,50 @@ function buildShopsFromApi() {
   return _apiShops
     .filter((s) => s.platform === 'temu' && s.shopType === wanted)
     .map((s) => {
-      const tasks = _apiTasks
-        .filter((t) => t.shopId === s.id)
-        .slice(0, 30)
-        .map((t) => {
-          const ui = STATUS_TO_UI[t.status] || STATUS_TO_UI.pending;
-          return {
-            taskId: t.id,
-            name: KIND_LABELS[t.kind] || t.kind,
-            region: regionFromTask(t),
-            status: ui.cls,
-            result: ui.label,
-            errorMessage: t.errorMessage,
-          };
-        });
+      // 按 kind 合并:同 kind 多次任务只留最新一条 + 执行时间。
+      // _apiTasks 已按 createdAt desc(后端默认),所以第一遇到的就是最新。
+      const byKind = new Map();
+      for (const t of _apiTasks) {
+        if (t.shopId !== s.id) continue;
+        if (!byKind.has(t.kind)) byKind.set(t.kind, t);
+      }
+      const tasks = Array.from(byKind.values()).map((t) => {
+        const ui = STATUS_TO_UI[t.status] || STATUS_TO_UI.pending;
+        return {
+          taskId: t.id,
+          name: KIND_LABELS[t.kind] || t.kind,
+          region: regionFromTask(t),
+          status: ui.cls,
+          result: ui.label,
+          execAt: t.completedAt || t.claimedAt || t.createdAt || null,
+          errorMessage: t.errorMessage,
+        };
+      });
       return {
         id: s.id,
         name: s.displayName || s.platformShopId || s.id.slice(0, 8),
-        window: s.region ? `region=${s.region}` : '',
+        // 不再显示 region=pa / 12 / 30 这些噪声;详情用 hover tooltip 看
+        window: '',
         expanded: true,
         tasks,
       };
     });
+}
+
+// 时间 → "刚刚 / 几分钟前 / HH:mm" 简短格式,放任务行尾用
+function fmtExecAt(iso) {
+  if (!iso) return '';
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const diffSec = Math.floor((Date.now() - t) / 1000);
+  if (diffSec < 0) return '';
+  if (diffSec < 60) return '刚刚';
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`;
+  // 24h 以上 显示日期 + 时间
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // 'today' | '7d' | '30d' | '90d' → ISO yyyy-mm-dd 对的起止
@@ -235,40 +263,67 @@ function refreshAccountChip() {
 // 2. 模块定义 + Mock 进度
 //    真实数据从 background message 来：{ shops: [...], modules: [...] }
 // ──────────────────────────────────────────────────────────────
+// 模块定义只保留 key + label;count/total 由 computeModuleCounts() 按真实任务算
 const MODULES_BY_CUSTODY = {
   full: [
-    { key: 'account-funds', label: '账号资金结算数据', count: 2, total: 2 },
-    { key: 'sales-30d',     label: '近 30 天历史销量', count: 1, total: 1 },
-    { key: 'settle-report', label: '结算报表',         count: 0, total: 0 },
-    { key: 'declare-price', label: '申报价格',         count: 1, total: 1 },
-    { key: 'activity-data', label: '活动数据',         count: 3, total: 3 },
-    { key: 'marketing-act', label: '营销活动',         count: 1, total: 1 },
-    { key: 'flux-analysis', label: '流量分析',         count: 0, total: 0 },
+    { key: 'account-funds', label: '获取账号资金' },
+    { key: 'sales-30d',     label: '获取近 30 天销量' },
+    { key: 'settle-report', label: '获取结算报表' },
+    { key: 'declare-price', label: '获取申报价格' },
+    { key: 'activity-data', label: '获取活动数据' },
+    { key: 'marketing-act', label: '获取营销活动' },
+    { key: 'flux-analysis', label: '获取流量分析' },
   ],
   semi: [
-    { key: 'sales-30d',     label: '近 30 天历史销量', count: 1, total: 1 },
-    { key: 'declare-price', label: '申报价格',         count: 1, total: 1 },
-    { key: 'orders',        label: '订单数据',         count: 0, total: 0 },
-    { key: 'promo',         label: '促销数据',         count: 0, total: 0 },
+    { key: 'sales-30d',     label: '获取近 30 天销量' },
+    { key: 'declare-price', label: '获取申报价格' },
+    { key: 'orders',        label: '获取订单数据' },
+    { key: 'promo',         label: '获取促销数据' },
   ],
 };
 
-const SELECTED = new Set(['account-funds', 'sales-30d', 'declare-price', 'activity-data', 'marketing-act']);
+// 按 module key → 这一类下 (成功数 / 总数);只统计当前 custody 下的店铺
+function computeModuleCounts() {
+  const wanted = activeCustody === 'full' ? 'full' : 'semi';
+  const shopIds = new Set(
+    _apiShops.filter((s) => s.platform === 'temu' && s.shopType === wanted).map((s) => s.id),
+  );
+  const counts = {};
+  for (const t of _apiTasks) {
+    if (!shopIds.has(t.shopId)) continue;
+    const moduleKey = KIND_TO_MODULE[t.kind];
+    if (!moduleKey) continue;
+    // 按 (shopId, kind) 合并 — 同一 task 多次重试只算 1
+    const bucket = (counts[moduleKey] ||= { keys: new Set(), succ: new Set() });
+    const dedupeKey = `${t.shopId}::${t.kind}`;
+    bucket.keys.add(dedupeKey);
+    if (t.status === 'success') bucket.succ.add(dedupeKey);
+  }
+  return Object.fromEntries(
+    Object.entries(counts).map(([k, v]) => [k, { count: v.succ.size, total: v.keys.size }]),
+  );
+}
+
+// 默认空,逼用户主动勾选,意图明确;chrome.storage 里有记忆值则恢复
+const SELECTED = new Set();
 let activeCustody = 'full';
 let activeModule = null;
 
 function renderModules() {
   const list = MODULES_BY_CUSTODY[activeCustody];
+  const counts = computeModuleCounts();
   const ul = $('#module-list');
   ul.innerHTML = '';
   for (const m of list) {
     const li = document.createElement('li');
     li.className = 'module-item' + (m.key === activeModule ? ' active' : '');
     li.dataset.key = m.key;
+    const c = counts[m.key];
+    const countText = c ? `${c.count}/${c.total}` : '';
     li.innerHTML = `
       <input type="checkbox" ${SELECTED.has(m.key) ? 'checked' : ''} data-key="${m.key}" />
       <span class="module-label">${m.label}</span>
-      <span class="module-count">${m.count}/${m.total}</span>
+      <span class="module-count">${countText}</span>
     `;
     li.addEventListener('click', (e) => {
       if (e.target instanceof HTMLInputElement) return;
@@ -280,8 +335,24 @@ function renderModules() {
     li.querySelector('input').addEventListener('change', (e) => {
       const k = e.target.dataset.key;
       e.target.checked ? SELECTED.add(k) : SELECTED.delete(k);
+      updateFetchButton();
     });
     ul.appendChild(li);
+  }
+  updateFetchButton();
+}
+
+// 手动获取按钮文案 / 状态 — 让用户一眼看清"会派多少类"
+function updateFetchButton() {
+  const btn = document.getElementById('btn-fetch');
+  if (!btn) return;
+  const n = SELECTED.size;
+  if (n === 0) {
+    btn.disabled = true;
+    btn.textContent = '请先勾选模块';
+  } else {
+    btn.disabled = false;
+    btn.textContent = `手动获取 (${n} 项)`;
   }
 }
 
@@ -336,18 +407,20 @@ function mockShops(custody) {
 let shops = mockShops(activeCustody);
 
 function summary(tasks) {
-  let ok = 0, total = tasks.length, hasRunning = false, hasFailed = false;
+  let ok = 0, total = tasks.length, hasRunning = false, failed = 0;
   for (const t of tasks) {
     if (t.status === 'ok') ok++;
     if (t.status === 'running') hasRunning = true;
-    if (t.status === 'failed') hasFailed = true;
+    if (t.status === 'failed') failed++;
   }
   let s;
-  if (hasFailed && !hasRunning && ok < total) s = { cls: 'failed', text: '部分失败' };
-  else if (hasRunning) s = { cls: 'running', text: '获取中' };
-  else if (ok === total && total > 0) s = { cls: 'ok', text: '获取成功' };
-  else s = { cls: 'pending', text: '待获取' };
-  return { ok, total, pct: total ? Math.round((ok / total) * 100) : 0, ...s };
+  if (total === 0)                  s = { cls: 'pending', text: '待获取' };
+  else if (hasRunning)              s = { cls: 'running', text: '获取中' };
+  else if (failed === total)        s = { cls: 'failed',  text: '获取失败' };
+  else if (failed > 0)              s = { cls: 'failed',  text: '部分失败' };
+  else if (ok === total)            s = { cls: 'ok',      text: '获取成功' };
+  else                              s = { cls: 'pending', text: '待获取' };
+  return { ok, total, ...s };
 }
 
 function taskIcon(status) {
@@ -356,11 +429,6 @@ function taskIcon(status) {
   if (status === 'failed')  return { glyph: '✕', cls: 'failed' };
   return { glyph: '⏰', cls: 'pending' };
 }
-
-// MODULE_TO_KIND 反向：kind → module key（点左侧模块时按这个过滤）
-const KIND_TO_MODULE = Object.fromEntries(
-  Object.entries(MODULE_TO_KIND).map(([m, k]) => [k, m])
-);
 
 function renderProgress() {
   const area = $('#progress-area');
@@ -385,29 +453,30 @@ function renderProgress() {
 
     const block = document.createElement('div');
     block.className = 'shop-block';
-    const s = summary(shop.tasks);
+    // ★ 用 tasksToShow 而非 shop.tasks — 否则用户筛选某模块时
+    //   header 状态会汇总全量任务的失败(跟可见行不一致,出现"1 条成功 / 部分失败"的歧义)
+    const s = summary(tasksToShow);
 
     block.innerHTML = `
       <div class="shop-head ${shop.expanded ? 'expanded' : ''}">
         <span class="shop-caret">▶</span>
         <span class="shop-status ${s.cls}">${s.text}</span>
         <span class="shop-name">${shop.name}</span>
-        <span class="shop-meta">(${shop.window})</span>
-        <span class="shop-progress-text">${s.ok} / ${s.total}</span>
-        <div class="shop-progress-bar"><div class="shop-progress-bar-fill" style="width:${s.pct}%"></div></div>
       </div>
       ${shop.expanded ? `
         <div class="task-list">
-          ${tasksToShow.map((t, idx) => {
+          ${tasksToShow.map((t) => {
             const i = taskIcon(t.status);
             const retryBtn = t.status === 'failed'
               ? `<button class="task-retry" data-shop="${shop.id}" data-idx="${shop.tasks.indexOf(t)}" title="重新执行此任务">↻ 重试</button>`
               : '';
+            const ts = fmtExecAt(t.execAt);
             return `
               <div class="task-row">
                 <span class="task-icon ${i.cls}">${i.glyph}</span>
-                <span class="task-name">${t.name}<span class="task-region-tag">${t.region}</span></span>
+                <span class="task-name">${t.name}</span>
                 <span class="task-result ${i.cls}">${t.result}</span>
+                <span class="task-exec-at" title="${t.execAt || ''}">${ts}</span>
                 ${retryBtn}
               </div>
             `;
@@ -497,8 +566,7 @@ $('#btn-fetch').addEventListener('click', async () => {
   } catch (e) {
     alert('派单失败：' + e.message);
   } finally {
-    $('#btn-fetch').disabled = false;
-    $('#btn-fetch').textContent = '手动获取';
+    updateFetchButton();
   }
 });
 
@@ -518,10 +586,26 @@ $('#link-online').addEventListener('click', async (e) => {
 
 $('#online-pop-close').addEventListener('click', () => { $('#online-pop').hidden = true; });
 $('#online-pop-refresh').addEventListener('click', async () => {
-  // 清掉所有 'expired' 标记(用户刚去 Temu 登过了,陈旧的 expired 不该再粘 24h);
-  // 然后让 loadOnlineStatus 重新读 cookies + 剩余 health,如果用户真登录了显示 ok,
-  // 否则下次 task fire 会重新标 expired。
-  await clearExpiredHealth();
+  // 真"实测":让 SW 开 4 个 hidden tab 跑 /labor/bill,看是否跳登录页 → 写 loginHealth
+  // 平均耗时 5-15s,期间按钮 disabled + 加载中
+  const btn = $('#online-pop-refresh');
+  if (!btn) return;
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '检测中…';
+  try {
+    await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'AGENT_RECHECK_LOGIN' }, (r) => {
+        if (chrome.runtime.lastError) { /* SW not active */ }
+        resolve(r);
+      });
+    });
+  } catch (e) {
+    console.warn('[popup] recheck failed', e?.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText || '重新检测';
+  }
   await loadOnlineStatus();
 });
 
