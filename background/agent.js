@@ -56,6 +56,11 @@ const SUPPORTED_KINDS = [
   'submit:activity-enroll',
 ];
 
+// endpoint / 权限 mismatch 错误码集合 —— 命中其中任何一个说明 endpoint 写错了
+// (半托推测 URL 不对)或 token 没绑对应权限包,没有重试意义,直接上报 ENDPOINT_MISMATCH。
+// 40010 = 未知接口;7000020 = access_token invalid;400020037 = 无权限
+const MISMATCH_CODES = new Set([40010, 7000020, 400020037, '40010', '7000020', '400020037']);
+
 // 全托管流量分析按地区分 3 个 tab,Temu 后端用 siteId 区分。具体数字暂占位
 // (TODO:实测全球/美国/欧洲页面的请求 body 后修正)。Frontend 也可以传明确
 // siteId 覆盖这个默认表。
@@ -605,9 +610,11 @@ async function executeTask(task, pluginInstanceId) {
     const count = Array.isArray(result?.rows) ? result.rows.length : '-';
     console.log(`四、✓ 完成 [${tid}] ${label} (${count} 条)`);
   } catch (e) {
+    // mismatch:true → endpoint 写错 / 无权限,让 backend 早退 + 触发防雪崩
+    const errorCode = e.mismatch ? 'ENDPOINT_MISMATCH' : (e.code || 'UNKNOWN');
     await reportResult(task.id, pluginInstanceId, {
       status: 'failed',
-      errorCode: e.code || 'UNKNOWN',
+      errorCode,
       errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
     });
     console.error(`四、✗ 失败 [${tid}] ${label}: ${e.message}`);
@@ -2665,9 +2672,11 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
           { code: 'TEMU_SERVER_ERROR', httpStatus: resp.status },
         );
       }
+      // 404/410/405 大概率是 endpoint 写错(半托猜的 URL 不对 / method 不对)→ 标 mismatch
+      const mismatch = (resp.status === 404 || resp.status === 410 || resp.status === 405);
       throw Object.assign(
         new Error(`TEMU_FETCH_FAILED: HTTP ${resp.status}: ${txt.slice(0, 300)}`),
-        { code: 'TEMU_FETCH_FAILED' },
+        { code: 'TEMU_FETCH_FAILED', mismatch },
       );
     }
     let data;
@@ -2683,6 +2692,15 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
         httpStatus: 200,
         msg: `Temu rate-limited: ${rl.reason}`,
       });
+    }
+
+    // API 层 success:false + 已知 mismatch 错误码 → 早退
+    if (data?.success === false) {
+      const mismatch = MISMATCH_CODES.has(data?.errorCode);
+      throw Object.assign(
+        new Error(`API_FAILED: errorCode=${data?.errorCode} errorMsg=${data?.errorMsg}`),
+        { code: 'API_FAILED', mismatch },
+      );
     }
 
     const list = getPath(data, spec.listPath);
