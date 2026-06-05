@@ -3002,3 +3002,6 @@ export function attachMessageHandlers() {
     }
   });
 }
+
+// ── ESM export for jest tests (无害,SW 环境不影响)─────────
+export { KIND_TO_FETCH_SPEC };
