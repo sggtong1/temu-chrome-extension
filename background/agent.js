@@ -625,8 +625,11 @@ async function executeTask(task, pluginInstanceId) {
 // raw rows → transform → task.result.rows[](Activity 主表 schema)
 const KIND_TO_FETCH_SPEC = {
   'scrape:marketing-activity': {
-    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity',
-    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
+    // 半托 endpoint 路径推测同 namespace,需绑真半托店实测(同 scrape:sales-30d 模式)
+    pageUrl: (payload) => payload?.shopType === 'semi'
+      ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity'
+      : 'https://agentseller.temu.com/activity/marketing-activity',
+    apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/activity/list',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
