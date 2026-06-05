@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-toplevelact-20260604e';
+const AGENT_BUILD_ID   = 'agent-semi-sales-20260605a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -774,14 +774,22 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems) => transformPriceAdjustResponse(rawItems),
   },
-  // scrape:sales-30d — 近 30 天销量 + 库存(全托管 SKU 级 snapshot)
+  // scrape:sales-30d — 近 30 天销量 + 库存(SKU 级 snapshot)
+  // 全托 / 半托共用:按 payload.shopType 分支 pageUrl + apiUrlPattern
+  //   - 全托管:agentseller.temu.com 销售管理页 → listOverall
+  //   - 半托管:seller.kuajingmaihuo.com 销售管理页 → querySkuSalesNumber(详见 docs/sellfox-plugin-rev-eng.md §3.2 + §3.6)
+  // ★ 半托 endpoint 路径尚未实测(用户绑了真半托店之后才能跑通);path 来自 sellfox-crx 反编译
   'scrape:sales-30d': {
-    pageUrl: 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
-    apiUrlPattern: '/mms/venom/api/supplier/sales/management/listOverall',
+    pageUrl: (payload) => payload?.shopType === 'semi'
+      ? 'https://seller.kuajingmaihuo.com/main/sale-manage/main'
+      : 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
+    apiUrlPattern: (payload) => payload?.shopType === 'semi'
+      ? '/oms/bg/venom/api/supplier/sales/management/querySkuSalesNumber'
+      : '/mms/venom/api/supplier/sales/management/listOverall',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
-    buildBody: (_payload) => ({ isLack: 0 }),     // runFetchInTab 注入 pageNo+pageSize
+    buildBody: (_payload) => ({ isLack: 0 }),
     listPath: 'result.subOrderList',
     totalPath: 'result.total',
     transform: (rawItems) => transformSales30dResponse(rawItems),
@@ -2332,6 +2340,13 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
   const checkAbort = () => {
     if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
   };
+
+  // ★ apiUrlPattern 可以是 string 或 function(payload) — 这里统一解析成 string,
+  //   downstream(SW fetch + capture matcher)继续按 string 处理。
+  //   pageUrl 同样的处理逻辑(以前只有 activity-products 用函数形态)。
+  if (typeof spec.apiUrlPattern === 'function') {
+    spec = { ...spec, apiUrlPattern: spec.apiUrlPattern(payload) };
+  }
 
   const mallId = payload.mallId || 'default';
 
