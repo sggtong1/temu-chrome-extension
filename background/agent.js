@@ -748,8 +748,10 @@ const KIND_TO_FETCH_SPEC = {
   //   listPath: result.dataList  totalPath: result.total
   // 落库:price_review (展开 SPU → SKC → SKU → siteList)
   'scrape:lifecycle-management': {
-    pageUrl: 'https://agentseller.temu.com/newon/product-select',
-    apiUrlPattern: '/api/kiana/mms/robin/searchForChainSupplier',
+    pageUrl: (payload) => payload?.shopType === 'semi'
+      ? 'https://seller.kuajingmaihuo.com/newon/product-select'
+      : 'https://agentseller.temu.com/newon/product-select',
+    apiUrlPattern: (_payload) => '/api/kiana/mms/robin/searchForChainSupplier',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 30,
