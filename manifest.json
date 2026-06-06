@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Temu 数据采集",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "description": "每日采集 Temu 卖家数据并同步到舵手 ERP",
   "permissions": [
     "storage",

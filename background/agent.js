@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-sales-20260605a';
+const AGENT_BUILD_ID   = 'agent-semi-host-fix-20260606a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -641,10 +641,10 @@ function isSemiPayload(payload) {
 // raw rows → transform → task.result.rows[](Activity 主表 schema)
 const KIND_TO_FETCH_SPEC = {
   'scrape:marketing-activity': {
-    // 半托 endpoint 路径推测同 namespace,需绑真半托店实测(同 scrape:sales-30d 模式)
-    pageUrl: (payload) => isSemiPayload(payload)
-      ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity'
-      : 'https://agentseller.temu.com/activity/marketing-activity',
+    // 2026-06-06 CRX 1.0.101 反编译修正:半托数据 API 同样走 agentseller.temu.com(非 kjmh)。
+    // sellfox 用 temuPostNew(url, body, mallId) 直调 agentseller,靠 mallid header 区分店铺。
+    // #9 半托 == 全托(同 host 同 path),之前的 kjmh 分支是 capture 超时根因。详见 docs §3.6.1。
+    pageUrl: (_payload) => 'https://agentseller.temu.com/activity/marketing-activity',
     apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/activity/list',
     method: 'POST',
     paginationMode: 'pageNo',
@@ -695,9 +695,8 @@ const KIND_TO_FETCH_SPEC = {
   // payload: { mallId }  其他不需要(API 按 mallid header 隔离店铺)
   // 落库:ActivityEnrollment(一行 = shop × activity × session × SKU)
   'scrape:activity-data': {
-    pageUrl: (payload) => isSemiPayload(payload)
-      ? 'https://seller.kuajingmaihuo.com/activity/marketing-activity/log'
-      : 'https://agentseller.temu.com/activity/marketing-activity/log',
+    // 2026-06-06 修正:#4 半托 == 全托,数据 API 走 agentseller(非 kjmh)。详见 docs §3.6.1。
+    pageUrl: (_payload) => 'https://agentseller.temu.com/activity/marketing-activity/log',
     apiUrlPattern: (_payload) => '/api/kiana/gamblers/marketing/enroll/list',
     method: 'POST',
     paginationMode: 'pageNo',
