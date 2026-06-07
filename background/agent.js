@@ -714,6 +714,9 @@ const KIND_TO_FETCH_SPEC = {
   //   quickFilter   流量待增长 / 短期增长中 / 长期增长中 / Best Seller
   // 落库:flux_analysis_daily,unique 含 region
   'scrape:flux-analysis': {
+    // ⚠️ 此 kind 走专用 dispatcher dispatchFluxAnalysis,它会用静态值覆盖下面的 apiUrlPattern/pageUrl
+    //    (按 region + isSemiPayload 分支),故这两项实际不生效(仅作文档);真正生效的是
+    //    pageSize/pageNoKey/listPath/buildBody(经 paginatedFetchInSW 按 payload 解析)。
     // 全托:body 带 siteId 区分区域,host 固定 global,endpoint /api/seller/full/...
     // 半托(2026-06-06 §3.6.1):endpoint /api/flow/analysis/list,区域靠 agentseller 子域 host,
     //   body {timeDimension,sortMode,sortType},翻页 pageNumber/pageSize=100,listPath result.pageItems。
