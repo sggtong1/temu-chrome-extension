@@ -379,8 +379,10 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
     return null;
   };
 
-  // Temu 的 conversionRate / clickRate 单位是小数(0.0667),前端展示要 %,所以 *100。
-  const rate = (v) => (v == null ? null : Number(v) * 100);
+  // 全托 conversionRate / clickRate 单位是小数(0.0667),前端展示要 %,所以 *100。
+  // 半托(2026-06-06 实测)rate 字段已经是百分比(clickImpressionRate=2.30 即 2.30%),不能再 *100。
+  const isSemi = (payload?.shopType ?? payload?.siteType) === 'semi';
+  const rate = (v) => (v == null ? null : isSemi ? Number(v) : Number(v) * 100);
 
   for (const item of rawItems) {
     // ★ 重要:Temu 有两个 ID
@@ -425,7 +427,7 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
       platformProductId,
       platformSkcId:    item?.productSkcId != null ? String(item.productSkcId) : null,
       productName:      item?.goodsName ?? item?.productName ?? item?.title ?? null,
-      pictureUrl:       item?.goodsImageUrl ?? item?.pictureUrl ?? item?.imageUrl ?? item?.mainImage ?? null,
+      pictureUrl:       item?.goodsImageUrl ?? item?.pictureUrl ?? item?.imageUrl ?? item?.mainImage ?? item?.mainImageUrl ?? null,
       skuExtCode:       item?.skuExtCode ?? item?.extCode ?? null,
       categoryName:     item?.category?.name ?? item?.categoryName ?? null,
       siteId:           item?.siteId ?? null,
@@ -436,22 +438,23 @@ export function transformFluxAnalysisResponse(rawItems, payload = {}) {
       region,
 
       // —— 流量情况
-      exposureNum:      pick('exposeNum', 'exposureNum', 'impressionNum', 'pv'),
-      clickNum:         pick('clickNum', 'clk'),
-      visitorNum:       pick('goodsDetailVisitorNum', 'visitorNum', 'uv'),
-      browseNum:        pick('goodsDetailVisitNum', 'browseNum', 'viewNum'),
-      addCartUserNum:   pick('addToCartUserNum', 'addCartUserNum', 'cartUserNum'),
-      favoriteUserNum:  pick('collectUserNum', 'favoriteUserNum', 'collectNum'),
+      // 末尾别名为半托(business*/impressionCount 等,2026-06-06 实测)字段名
+      exposureNum:      pick('exposeNum', 'exposureNum', 'impressionNum', 'pv', 'impressionCount'),
+      clickNum:         pick('clickNum', 'clk', 'clickCount'),
+      visitorNum:       pick('goodsDetailVisitorNum', 'visitorNum', 'uv', 'goodsVisitorsUserNum'),
+      browseNum:        pick('goodsDetailVisitNum', 'browseNum', 'viewNum', 'goodsViewsUserNum'),
+      addCartUserNum:   pick('addToCartUserNum', 'addCartUserNum', 'cartUserNum', 'cartCrtUserNum'),
+      favoriteUserNum:  pick('collectUserNum', 'favoriteUserNum', 'collectNum', 'favCrtUserNum'),
 
       // —— 支付情况
-      payItemNum:       pick('payGoodsNum', 'payItemNum', 'salesItemNum', 'salesNum'),
-      payOrderNum:      pick('payOrderNum', 'salesOrderNum', 'orderNum'),
-      payBuyerNum:      pick('buyerNum', 'payBuyerNum'),
+      payItemNum:       pick('payGoodsNum', 'payItemNum', 'salesItemNum', 'salesNum', 'orderPayGoodsNum'),
+      payOrderNum:      pick('payOrderNum', 'salesOrderNum', 'orderNum', 'orderPayOrderNum'),
+      payBuyerNum:      pick('buyerNum', 'payBuyerNum', 'businessDetailPaymentUserNum', 'fullPaymentUserNum'),
 
-      // —— 转化情况(Temu 返小数 0-1,这里 ×100 转成 0-100 整数%)
-      conversionRate:   rate(pick('exposePayConversionRate', 'conversionRate', 'payConvRate')),
-      clickRate:        rate(pick('exposeClickConversionRate', 'clickRate', 'ctr')),
-      clickPayRate:     rate(pick('clickPayConversionRate', 'clickPayRate', 'clickConvRate')),
+      // —— 转化情况(全托返小数 ×100;半托已是 %,rate() 内按 isSemi 决定是否 ×100)
+      conversionRate:   rate(pick('exposePayConversionRate', 'conversionRate', 'payConvRate', 'orderPayImpressionRate')),
+      clickRate:        rate(pick('exposeClickConversionRate', 'clickRate', 'ctr', 'clickImpressionRate')),
+      clickPayRate:     rate(pick('clickPayConversionRate', 'clickPayRate', 'clickConvRate', 'clickOrderRatio')),
 
       // —— 搜索数据
       searchExposureNum:  pick('searchExposeNum', 'searchExposureNum'),
