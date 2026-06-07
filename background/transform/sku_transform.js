@@ -366,7 +366,7 @@ export function transformPriceAdjustResponse(rawItems) {
  */
 export function transformFluxAnalysisResponse(rawItems, payload = {}) {
   const rows = [];
-  const dateLabel = payload?.statisticType ?? 'unknown';
+  const dateLabel = payload?.statisticType ?? 5;   // 默认 5=近7日(数字,保证 ingest Number.isFinite 通过)
   const region    = payload?.region ?? 'global';   // global / us / eu
   const snapshotDate = new Date().toISOString().slice(0, 10);
 
