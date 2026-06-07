@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-host-fix-20260606c';
+const AGENT_BUILD_ID   = 'agent-semi-flux-20260606d';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -714,18 +714,26 @@ const KIND_TO_FETCH_SPEC = {
   //   quickFilter   流量待增长 / 短期增长中 / 长期增长中 / Best Seller
   // 落库:flux_analysis_daily,unique 含 region
   'scrape:flux-analysis': {
-    pageUrl: 'https://agentseller.temu.com/main/flux-analysis-full',
-    apiUrlPattern: '/api/seller/full/flow/analysis/goods/list',
+    // 全托:body 带 siteId 区分区域,host 固定 global,endpoint /api/seller/full/...
+    // 半托(2026-06-06 §3.6.1):endpoint /api/flow/analysis/list,区域靠 agentseller 子域 host,
+    //   body {timeDimension,sortMode,sortType},翻页 pageNumber/pageSize=100,listPath result.pageItems。
+    pageUrl: (payload) => REGION_TO_FLUX_PAGE_URL[payload?.region ?? 'global'],
+    apiUrlPattern: (payload) => isSemiPayload(payload)
+      ? '/api/flow/analysis/list'
+      : '/api/seller/full/flow/analysis/goods/list',
     method: 'POST',
     paginationMode: 'pageNo',
-    pageSize: 50,
-    buildBody: (payload) => ({
-      statisticType: payload?.statisticType ?? 5,                                  // 5 = 近7日
-      siteId:        payload?.siteId ?? REGION_TO_SITE_ID[payload?.region ?? 'global'],
-      ...(payload?.quickFilter ? { quickFilter: payload.quickFilter } : {}),
-    }),
-    listPath: 'result.list',
+    pageSize:  (payload) => isSemiPayload(payload) ? 100 : 50,
+    pageNoKey: (payload) => isSemiPayload(payload) ? 'pageNumber' : 'pageNo',
+    listPath:  (payload) => isSemiPayload(payload) ? 'result.pageItems' : 'result.list',
     totalPath: 'result.total',
+    buildBody: (payload) => isSemiPayload(payload)
+      ? { timeDimension: payload?.statisticType ?? 5, sortMode: 2, sortType: 5 }
+      : {
+          statisticType: payload?.statisticType ?? 5,
+          siteId:        payload?.siteId ?? REGION_TO_SITE_ID[payload?.region ?? 'global'],
+          ...(payload?.quickFilter ? { quickFilter: payload.quickFilter } : {}),
+        },
     transform: (rawItems, payload) => transformFluxAnalysisResponse(rawItems, payload),
   },
   // scrape:flux-analysis-detail — 单 SPU 历史日明细(每日真值)
