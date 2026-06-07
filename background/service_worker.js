@@ -3,7 +3,15 @@ import { transformListResponse, transformSemiUsListResponse } from './transform/
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
 import { transformPromoResponse } from './transform/promo_transform.js';
 import { transformActivityResponse } from './transform/activity_transform.js';
-import { startAgent, attachMessageHandlers as attachAgentHandlers } from './agent.js';
+import {
+  startAgent,
+  attachMessageHandlers as attachAgentHandlers,
+  isLoginFlowUrl,
+  attemptAutoLogin,
+  runSsoForRegion,
+  fetchKjmhUserIdInTab,
+  waitTabComplete,
+} from './agent.js';
 
 // 启动派单中枢（chrome.alarms 周期长轮询 ERP /api/agent/tasks）
 // 注意：放在文件顶部，避免被后面的 onMessage 监听器抢先注册路由
@@ -163,7 +171,125 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleCheckCookies().then(sendResponse);
     return true;
   }
+  if (msg.type === 'AGENT_RECHECK_LOGIN') {
+    // popup 点"重新检测"触发 — 4 个域并行开 hidden tab 看是否跳登录页 → 写 loginHealth
+    handleRecheckLogin().then(sendResponse);
+    return true;
+  }
 });
+
+// ★ 重新检测登录态 — 单 visible tab 串行跑所有区域:
+//   1. 打开 1 个 visible tab 到 kjmh /main
+//   2. 等加载完 → 看是否被踢到 login(kjmh 自身是否过期)
+//   3. 如果 kjmh 还活,fetch userInfo 拿 userId
+//   4. for each 子域 region:同 tab nav kjmh main 重置 referrer → nav SSO URL → 等完成
+//   5. 关闭 tab,写入 loginHealth
+// 单 tab 串行的好处:浏览器只会看到一个 tab 在切来切去(不是 4 个 tab 闪烁),referrer
+// 始终 kjmh 同源,匹配 Sellfox 实测的成功流程。
+async function handleRecheckLogin() {
+  const LOGIN_HEALTH_KEY = 'agent:loginHealth';
+  const SUBDOMAIN_REGIONS = [
+    { key: 'global', host: 'agentseller.temu.com' },
+    { key: 'us',     host: 'agentseller-us.temu.com' },
+    { key: 'eu',     host: 'agentseller-eu.temu.com' },
+  ];
+
+  const log = (msg) => console.log(`[Temu授权] ${msg}`);
+
+  const results = [];
+  let tabId = null;
+  try {
+    // 类型检查 — 确保 import 成功
+    if (typeof runSsoForRegion !== 'function') throw new Error('runSsoForRegion not imported');
+    if (typeof fetchKjmhUserIdInTab !== 'function') throw new Error('fetchKjmhUserIdInTab not imported');
+    if (typeof waitTabComplete !== 'function') throw new Error('waitTabComplete not imported');
+    log('▶ 重新检测登录态开始');
+    // 1. 开 visible tab 跳 kjmh main
+    log('1. 打开商家中心 → seller.kuajingmaihuo.com/main');
+    const tab = await chrome.tabs.create({ url: 'https://seller.kuajingmaihuo.com/main', active: true });
+    tabId = tab.id;
+    try {
+      await waitTabComplete(tabId, null, 15_000);
+    } catch (e) {
+      log(`   ✗ 页面加载超时: ${e?.message}`);
+      results.push({ key: 'kjmh', status: 'unknown', reason: `tab-load-timeout: ${e?.message}` });
+      for (const r of SUBDOMAIN_REGIONS) {
+        results.push({ key: r.key, status: 'unknown', reason: 'tab-load-timeout' });
+      }
+      await writeLoginHealth(LOGIN_HEALTH_KEY, results);
+      return { ok: true, results };
+    }
+
+    // 2. 看 kjmh 是否过期
+    let kjmhTab = await chrome.tabs.get(tabId);
+    if (kjmhTab?.url && isLoginFlowUrl(kjmhTab.url)) {
+      log(`   ✗ 商家中心登录态失效 (被跳转到: ${kjmhTab.url.slice(0, 80)})`);
+      log('   ↳ 无法继续 SSO,所有区域标记为 expired,需手动登录商家中心');
+      results.push({ key: 'kjmh', status: 'expired', reason: `redirected to login: ${kjmhTab.url}` });
+      for (const r of SUBDOMAIN_REGIONS) {
+        results.push({ key: r.key, status: 'expired', reason: 'kjmh-not-logged-in' });
+      }
+      await writeLoginHealth(LOGIN_HEALTH_KEY, results);
+      return { ok: true, results };
+    }
+    log('   ✓ 商家中心登录态正常');
+    results.push({ key: 'kjmh', status: 'ok', reason: null });
+
+    // 3. fetch userId
+    log('2. 获取 userId');
+    await new Promise((r) => setTimeout(r, 800));
+    const uid = await fetchKjmhUserIdInTab(tabId, null);
+    if (!uid?.userId) {
+      log(`   ✗ 获取 userId 失败: ${uid?.error}`);
+      for (const r of SUBDOMAIN_REGIONS) {
+        results.push({ key: r.key, status: 'unknown', reason: `userid-fetch-failed: ${uid?.error}` });
+      }
+      await writeLoginHealth(LOGIN_HEALTH_KEY, results);
+      return { ok: true, results };
+    }
+    log(`   ✓ userId = ${uid.userId}${uid.mallId ? ` | mallId = ${uid.mallId}` : ''}${uid.fromCache ? ' (来自缓存)' : ''}`);
+
+    // 4. 串行跑每个子域 SSO
+    const REGION_NAMES = { global: '全球', us: '美区', eu: '欧区' };
+    log(`3. 开始授权 ${SUBDOMAIN_REGIONS.length} 个子域`);
+    for (let i = 0; i < SUBDOMAIN_REGIONS.length; i++) {
+      const reg = SUBDOMAIN_REGIONS[i];
+      log(`3.${i + 1} ${REGION_NAMES[reg.key] || reg.key}`);
+      const r = await runSsoForRegion(tabId, reg.key, uid.userId, null, uid.mallId);
+      results.push({
+        key: reg.key,
+        status: r.ok ? 'ok' : 'expired',
+        reason: r.ok ? 'auto-login 已恢复' : (r.reason || 'sso-failed'),
+        recovered: r.ok,
+      });
+    }
+
+    // 总结
+    const okList = results.filter((r) => r.status === 'ok').map((r) => REGION_NAMES[r.key] || (r.key === 'kjmh' ? '商家中心' : r.key));
+    const failList = results.filter((r) => r.status !== 'ok').map((r) => REGION_NAMES[r.key] || (r.key === 'kjmh' ? '商家中心' : r.key));
+    log(`▶ 检测完成 | 在线: ${okList.join(' ') || '(无)'}${failList.length ? ` | 失败: ${failList.join(' ')}` : ''}`);
+
+    await writeLoginHealth(LOGIN_HEALTH_KEY, results);
+    return { ok: true, results };
+  } catch (e) {
+    console.error('[Temu授权] ✗ 致命错误', e);
+    return { ok: false, error: String(e?.message ?? e), stack: String(e?.stack || '').slice(0, 500) };
+  } finally {
+    if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} }
+  }
+}
+
+async function writeLoginHealth(key, results) {
+  try {
+    const stored = await chrome.storage.local.get(key);
+    const cur = stored[key] || {};
+    const now = Date.now();
+    for (const r of results) {
+      cur[r.key] = { status: r.status, reason: r.reason, updatedAt: now };
+    }
+    await chrome.storage.local.set({ [key]: cur });
+  } catch {}
+}
 
 // ── Cookie 健康检查 ─────────────────────────────────────────────────────────
 // 检测 Temu 各子域是否已登录（cookie 存在 + 未过期 + 包含已知 session 字段）
@@ -182,6 +308,8 @@ const SESSION_COOKIE_HINTS = [
   'user_uin', 'userUin',
   'is_logined', 'login_state',
   'PASS_ID',
+  // kjmh (seller.kuajingmaihuo.com) 的真实 session cookie
+  'SUB_PASS_ID', 'seller_temp',
 ];
 
 // ★ plugin 实测优先:agent.js captureSessionViaTab 把每次成功/失败的 region 状态
@@ -199,7 +327,9 @@ async function getLoginHealth() {
 async function handleCheckCookies() {
   const out = [];
   const health = await getLoginHealth();
-  const HEALTH_FRESH_MS = 24 * 60 * 60 * 1000;  // 24h 内的实测视为有效;过期了让位给 cookie 检测
+  // session 实测有效窗口:agentseller-* 域 session 常 1-3 天就过期,24h 缓存太长会出现"显示在线但
+  // 实际过期"的滞后。改 4h — 短于多数 session 过期窗口的下限,popup 显示更接近真实
+  const HEALTH_FRESH_MS = 4 * 60 * 60 * 1000;
   const now = Date.now();
 
   for (const d of TEMU_DOMAINS) {
