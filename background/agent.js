@@ -39,7 +39,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-flux-20260606f';
+const AGENT_BUILD_ID   = 'agent-poll-log-20260607a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -542,7 +542,10 @@ async function api(path, opts = {}) {
 // ── 派单轮询 ──────────────────────────────────────────────────────
 export async function pollOnce() {
   const cfg = await getCfg();
-  if (!cfg.apiUrl) return; // 还没配 ERP 地址，跳过
+  if (!cfg.apiUrl) {
+    console.warn('· 轮询跳过:未配置 ERP API 地址(popup 顶部"切换账号"填)');
+    return;
+  }
 
   const pluginInstanceId = await ensurePluginInstanceId();
 
@@ -567,7 +570,10 @@ export async function pollOnce() {
   }
 
   const tasks = resp?.tasks || [];
-  if (tasks.length === 0) return;
+  if (tasks.length === 0) {
+    console.log(`· 轮询 OK,本轮 0 任务 (build=${AGENT_BUILD_ID})`);
+    return;
+  }
   console.log(`一、领取 ${tasks.length} 个任务:`, tasks.map((t) => taskKindLabel(t.kind)).join(' / '));
   for (const t of tasks) executeTask(t, pluginInstanceId);
 }
