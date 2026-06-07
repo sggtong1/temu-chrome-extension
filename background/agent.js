@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-host-fix-20260606a';
+const AGENT_BUILD_ID   = 'agent-semi-host-fix-20260606c';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -763,10 +763,12 @@ const KIND_TO_FETCH_SPEC = {
   //   listPath: result.dataList  totalPath: result.total
   // 落库:price_review (展开 SPU → SKC → SKU → siteList)
   'scrape:lifecycle-management': {
-    pageUrl: (payload) => isSemiPayload(payload)
-      ? 'https://seller.kuajingmaihuo.com/newon/product-select'
-      : 'https://agentseller.temu.com/newon/product-select',
-    apiUrlPattern: (_payload) => '/api/kiana/mms/robin/searchForChainSupplier',
+    // 2026-06-06 §3.6.1 修正:半托数据走 agentseller(非 kjmh);#6 真实 endpoint 是
+    // searchForSemiSupplier(searchForChainSupplier 在 CRX 源里不存在)。pageUrl 路由仍待实测。
+    pageUrl: (_payload) => 'https://agentseller.temu.com/newon/product-select',
+    apiUrlPattern: (payload) => isSemiPayload(payload)
+      ? '/api/kiana/mms/robin/searchForSemiSupplier'
+      : '/api/kiana/mms/robin/searchForChainSupplier',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 30,
@@ -786,16 +788,13 @@ const KIND_TO_FETCH_SPEC = {
   // 对照 Sallfox 接口盘点:"Temu 调价单 magnus/mms/price-adjust/*"
   //   = 官方 bg.full.adjust.price.page.query
   'scrape:declared-price': {
-    pageUrl: (payload) => isSemiPayload(payload)
-      // 半托 页面路由推测 — sellfox 文档 §3.6 写 "商品/价格管理/申报价格"
-      // 该路径未实测,失败会触发 capture-timeout(我们不接 ENDPOINT_MISMATCH,因为 timeout 不是 4xx)
-      ? 'https://seller.kuajingmaihuo.com/price-management/declared-price'
-      : 'https://agentseller.temu.com/price-management/price-adjust',
-    apiUrlPattern: (payload) => isSemiPayload(payload)
-      // 半托:sellfox 反编译写的 robin namespace,非全托 magnus/price-adjust
-      // 详见 docs/sellfox-plugin-rev-eng.md §3.6 row 3
-      ? '/api/kiana/mms/robin/queryProductSkuPriceAndStatus'
-      : '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
+    // 2026-06-06 实测结论:此 SPEC 仅适用全托。半托侧无独立申报价列表接口 —
+    // queryProductSkuPriceAndStatus 是按单 SKU 查价明细(需 productSkuId,不可列表化,空 body 报 3000000);
+    // 全托 product-adjust-query(调价单查询)在半托 agentseller 页面不触发(CAPTURE_FAILED)。
+    // sellfox 半托唯一价格列表是 searchForSemiSupplier,已由 scrape:lifecycle-management(#6)覆盖。
+    // → 半托店的 scrape:declared-price cron 已置 enabled=false。详见 docs §3.6.1。
+    pageUrl: (_payload) => 'https://agentseller.temu.com/price-management/price-adjust',
+    apiUrlPattern: (_payload) => '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
