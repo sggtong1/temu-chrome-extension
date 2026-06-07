@@ -23,6 +23,7 @@ import {
 } from './transform/activity_transform.js';
 import {
   transformSales30dResponse,
+  transformSkuSalesDailyResponse,
   transformPriceAdjustResponse,
   transformFluxAnalysisResponse,
   transformFluxAnalysisDetailResponse,
@@ -46,6 +47,7 @@ const SUPPORTED_KINDS = [
   'scrape:marketing-activity',
   'scrape:activity-products',
   'scrape:sales-30d',
+  'scrape:sku-sales-daily',
   'scrape:activity-data',
   'scrape:declared-price',
   'scrape:lifecycle-management',
@@ -834,6 +836,22 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems) => transformSales30dResponse(rawItems),
   },
+  // scrape:sku-sales-daily — per-SKU per-day 历史销量(全托)
+  // 同 sale-manage 页,endpoint querySkuSalesNumber。一次返指定 SKU 在 [start,end] 的每日销量。
+  // body 需 productSkuIds 列表 → 不走 pageNo 分页(single);SKU 列表分块由 dispatchSkuSalesDaily 控制。
+  'scrape:sku-sales-daily': {
+    pageUrl: () => 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
+    apiUrlPattern: () => '/mms/venom/api/supplier/sales/management/querySkuSalesNumber',
+    method: 'POST',
+    paginationMode: 'single',
+    buildBody: (payload) => ({
+      productSkuIds: (payload.productSkuIds ?? []).map(Number),
+      startDate: payload.startDate ?? payload.dateFrom,
+      endDate: payload.endDate ?? payload.dateTo,
+    }),
+    listPath: 'result',
+    transform: (rawItems) => transformSkuSalesDailyResponse(rawItems),
+  },
   // 其他 4 个 scrape:* kind 由后续 plan 添加
 };
 
@@ -845,6 +863,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:marketing-activity':   return dispatchMarketingActivity(task, signal);
     case 'scrape:activity-products':    return dispatchActivityProducts(task, signal);
     case 'scrape:sales-30d':            return dispatchSales30d(task, signal);
+    case 'scrape:sku-sales-daily':      return dispatchSkuSalesDaily(task, signal);
     case 'scrape:activity-data':        return dispatchActivityData(task, signal);
     case 'scrape:declared-price':       return dispatchDeclaredPrice(task, signal);
     case 'scrape:lifecycle-management': return dispatchLifecycleManagement(task, signal);
@@ -935,6 +954,55 @@ async function dispatchSales30d(task, signal) {
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
+}
+
+// ── scrape:sku-sales-daily 专用 wrapper ──────────────────────────
+// 任务语义:全托管 per-SKU per-day 历史销量(querySkuSalesNumber),落到 ShopSkuDailySnapshot。
+// payload: { mallId, dateFrom, dateTo }(productSkuIds 可选;不给则插件先用 listOverall 枚举)
+// 步骤:① 复用 sales-30d(listOverall)枚举 SKU 列表 + 顺带 seed session;
+//       ② 分块调 querySkuSalesNumber(同 mallId session 已缓存,直接复用 anti-content headers)。
+async function dispatchSkuSalesDaily(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) {
+    throw Object.assign(
+      new Error(`payload.mallId missing for scrape:sku-sales-daily (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+  const startDate = payload.startDate ?? payload.dateFrom;
+  const endDate = payload.endDate ?? payload.dateTo;
+  if (!startDate || !endDate) {
+    throw Object.assign(
+      new Error(`startDate/endDate missing for scrape:sku-sales-daily (got ${JSON.stringify(payload)})`),
+      { code: 'BAD_PAYLOAD' },
+    );
+  }
+
+  // ① 枚举 SKU 列表 — 复用 sales-30d 的 listOverall(全托同页同 session),同时 seed session
+  let skuIds = Array.isArray(payload.productSkuIds) ? payload.productSkuIds.map(Number).filter(Boolean) : [];
+  if (skuIds.length === 0) {
+    const salesSpec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    const { transformed: skuRows } = await dispatchViaHiddenTab(salesSpec, payload, signal);
+    skuIds = [...new Set(skuRows.map((r) => Number(r.platformSkuId)).filter(Boolean))];
+  }
+  if (skuIds.length === 0) {
+    return { rows: [], rawCount: 0, completedAt: new Date().toISOString(), agent: agentDiag() };
+  }
+
+  // ② 分块调 querySkuSalesNumber(session 已缓存 → HIT,不再开 tab)
+  const spec = KIND_TO_FETCH_SPEC['scrape:sku-sales-daily'];
+  const CHUNK = 100;
+  const rows = [];
+  let rawCount = 0;
+  for (let i = 0; i < skuIds.length; i += CHUNK) {
+    const chunk = skuIds.slice(i, i + CHUNK);
+    const { rawItems, transformed } = await dispatchViaHiddenTab(
+      spec, { ...payload, productSkuIds: chunk, startDate, endDate }, signal,
+    );
+    rawCount += rawItems.length;
+    rows.push(...transformed);
+  }
+  return { rows, rawCount, completedAt: new Date().toISOString(), agent: agentDiag() };
 }
 
 // ── scrape:activity-data 专用 wrapper ────────────────────────────

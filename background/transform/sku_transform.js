@@ -265,6 +265,24 @@ export function transformSales30dResponse(rawItems) {
   return rows;
 }
 
+// querySkuSalesNumber 响应 → per-SKU per-day 销量行。
+// raw 每条:{ date:'yyyy-mm-dd', prodSkuId, salesNumber, isPredict, soldOut }
+// isPredict === true 是未来预测值,跳过(只落真实历史)。
+export function transformSkuSalesDailyResponse(rawItems) {
+  const rows = [];
+  for (const it of rawItems) {
+    if (it?.prodSkuId == null || !it?.date) continue;
+    if (it?.isPredict === true) continue;
+    rows.push({
+      platformSkuId: String(it.prodSkuId ?? it.productSkuId),
+      date: String(it.date),
+      salesNumber: Number(it.salesNumber ?? it.saleNum ?? 0),
+    });
+  }
+  console.log(`[temu] transformSkuSalesDailyResponse: ${rawItems.length} raw → ${rows.length} day-rows`);
+  return rows;
+}
+
 /**
  * Maps /api/kiana/magnus/mms/price-adjust/product-adjust-query response →
  * 一行 = 一个 (SPU × SKU) 调价/申报价记录。
