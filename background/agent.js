@@ -2633,7 +2633,11 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
   const headers = { ...capturedHeaders, 'content-type': 'application/json' };
   const bodyTemplate = spec.buildBody(payload);
   const mode = spec.paginationMode ?? 'pageNo';
-  const pageSize = spec.pageSize ?? 50;
+  // spec 字段支持「函数(payload)→值」或静态值,容纳全/半托差异
+  const resolve = (v) => (typeof v === 'function' ? v(payload) : v);
+  const pageSize  = resolve(spec.pageSize) ?? 50;
+  const listPath  = resolve(spec.listPath);
+  const totalPath = resolve(spec.totalPath);
   const maxPages = 200;
   const collected = [];
   const getPath = (obj, path) => {
@@ -2656,8 +2660,8 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       body = { ...bodyTemplate };
     } else {
       // pageNo/pageSize 默认字段名为 pageNo,但部分接口要 pageNum(detail / flow analysis)
-      const pNoKey = spec.pageNoKey ?? 'pageNo';
-      const pSizeKey = spec.pageSizeKey ?? 'pageSize';
+      const pNoKey = resolve(spec.pageNoKey) ?? 'pageNo';
+      const pSizeKey = resolve(spec.pageSizeKey) ?? 'pageSize';
       body = { ...bodyTemplate, [pNoKey]: pageNo, [pSizeKey]: pageSize };
     }
 
@@ -2716,10 +2720,10 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       );
     }
 
-    const list = getPath(data, spec.listPath);
+    const list = getPath(data, listPath);
     if (!Array.isArray(list)) {
       throw Object.assign(
-        new Error(`SHAPE_BAD: listPath '${spec.listPath}' not array; keys: ${Object.keys(data || {}).join(',')}`),
+        new Error(`SHAPE_BAD: listPath '${listPath}' not array; keys: ${Object.keys(data || {}).join(',')}`),
         { code: 'SHAPE_BAD' },
       );
     }
@@ -2730,7 +2734,7 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       ? `游标第 ${iter + 1} 页`
       : `第 ${pageNo} 页`;
     try {
-      const totalSuffix = spec.totalPath ? ` total=${getPath(data, spec.totalPath) ?? '?'}` : '';
+      const totalSuffix = totalPath ? ` total=${getPath(data, totalPath) ?? '?'}` : '';
       console.log(`  ${pageLabel} listLen=${list.length}${totalSuffix}`, data);
     } catch {}
 
@@ -2743,8 +2747,8 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
       break;
     } else {
       if (list.length === 0) break;
-      if (spec.totalPath) {
-        const total = Number(getPath(data, spec.totalPath) ?? list.length);
+      if (totalPath) {
+        const total = Number(getPath(data, totalPath) ?? list.length);
         const lastPage = Math.ceil(total / pageSize) || 1;
         if (pageNo >= lastPage) break;
       } else if (list.length < pageSize) {
