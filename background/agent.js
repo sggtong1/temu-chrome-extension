@@ -38,7 +38,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-flux-20260606d';
+const AGENT_BUILD_ID   = 'agent-semi-flux-20260606e';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -973,10 +973,16 @@ async function dispatchFluxAnalysis(task, signal) {
     );
   }
   const region = payload.region ?? 'global';
-  const listApi = REGION_TO_FLUX_LIST_API[region];
-  const detailApi = REGION_TO_FLUX_DETAIL_API[region];
-  const pageUrl = REGION_TO_FLUX_PAGE_URL[region];
-  if (!listApi || !detailApi) {
+  // 半托(2026-06-06 §3.6.1):endpoint /api/flow/analysis/list,页面 /main/flux-analysis(无 -full 后缀,
+  // 触发的正是 /api/flow/analysis/list);全托走 /main/flux-analysis-full + /api/seller/full/...。
+  // 三区域 host 不变(REGION_TO_FLUX_PAGE_URL 已含 global/us/eu 的 agentseller 子域)。
+  const semi = isSemiPayload(payload);
+  const listApi   = semi ? '/api/flow/analysis/list'          : REGION_TO_FLUX_LIST_API[region];
+  const detailApi = semi ? '/api/flow/analysis/goods/detail'  : REGION_TO_FLUX_DETAIL_API[region];
+  const fullPageUrl = REGION_TO_FLUX_PAGE_URL[region];
+  const pageUrl = semi ? (fullPageUrl ? fullPageUrl.replace('/main/flux-analysis-full', '/main/flux-analysis') : fullPageUrl)
+                       : fullPageUrl;
+  if (!listApi || !detailApi || !pageUrl) {
     throw Object.assign(
       new Error(`flux endpoints not configured for region=${region}`),
       { code: 'BAD_REGION' },
