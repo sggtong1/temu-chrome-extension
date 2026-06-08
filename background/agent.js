@@ -31,6 +31,7 @@ import {
   transformFluxAnalysisDetailResponse,
   transformLifecycleResponse,
 } from './transform/sku_transform.js';
+import { transformOrderAmounts, buildPriceMap } from './transform/order_transform.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -41,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-activity-sessionstatus2-20260608a';
+const AGENT_BUILD_ID   = 'agent-order-amounts-20260608a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -55,6 +56,7 @@ const SUPPORTED_KINDS = [
   'scrape:lifecycle-management',
   'scrape:flux-analysis',
   'scrape:flux-analysis-detail',
+  'scrape:order-amounts',
   'scrape:settlement',
   'submit:price-confirm',
   'submit:activity-enroll',
@@ -93,6 +95,20 @@ const REGION_TO_FLUX_DETAIL_API = {
   global: FLUX_DETAIL_API_PATH,
   us:     FLUX_DETAIL_API_PATH,
   eu:     FLUX_DETAIL_API_PATH,
+};
+
+// 订单管理:recentOrderList 按区域走 agentseller 子域(us/eu/global)
+const REGION_TO_ORDER_HOST = {
+  global: 'https://agentseller.temu.com',
+  us:     'https://agentseller-us.temu.com',
+  eu:     'https://agentseller-eu.temu.com',
+};
+const ORDER_LIST_PATH = '/kirogi/bg/mms/recentOrderList';
+const ORDER_SUPPLIER_PRICE_PATH = '/bg-visage-agent-seller/product/sku/supplierPrice/batchQueryByOrder';
+const REGION_TO_ORDER_PAGE_URL = {
+  global: 'https://agentseller.temu.com/main/order/list',
+  us:     'https://agentseller-us.temu.com/main/order/list',
+  eu:     'https://agentseller-eu.temu.com/main/order/list',
 };
 
 // ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
@@ -597,6 +613,7 @@ const KIND_LABELS = {
   'scrape:lifecycle-management': '商品生命周期',
   'scrape:flux-analysis':      '流量分析',
   'scrape:flux-analysis-detail': '流量分析详情',
+  'scrape:order-amounts':      '订单产品金额',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
   'submit:price-reject':       '核价驳回',
@@ -786,6 +803,22 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems, payload) => transformFluxAnalysisDetailResponse(rawItems, payload),
   },
+  // scrape:order-amounts — 订单产品金额(recentOrderList 分页 + batchQueryByOrder 批量)
+  // payload: { mallId, region }  走专用 dispatchOrderAmounts(两段链式);此 spec 仅供
+  //   dispatchViaHiddenTab 跑第一段 recentOrderList。
+  'scrape:order-amounts': {
+    pageUrl: (p) => REGION_TO_ORDER_PAGE_URL[p?.region ?? 'global'],
+    apiUrlPattern: (_p) => ORDER_LIST_PATH,
+    method: 'POST',
+    paginationMode: 'pageNo',
+    pageSize: 50,
+    pageNoKey: 'pageNumber',
+    pageSizeKey: 'pageSize',
+    buildBody: (_p) => ({ fulfillmentMode: null, queryType: 0, sortType: 1, timeZone: 'UTC+8', sellerNoteLabelList: [] }),
+    listPath: 'result.pageItems',
+    totalPath: 'result.totalItemNum',
+    transform: (rawItems) => rawItems,
+  },
   // scrape:lifecycle-management — 抓"上新生命周期 — 价格申报中"列表(对照 Sallfox Temu核价主表)
   // payload: { mallId, supplierTodoType?(默认1=价格申报中) }
   //   POST /api/kiana/mms/robin/searchForChainSupplier
@@ -901,6 +934,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:lifecycle-management': return dispatchLifecycleManagement(task, signal);
     case 'scrape:flux-analysis':        return dispatchFluxAnalysis(task, signal);
     case 'scrape:flux-analysis-detail': return dispatchFluxAnalysisDetail(task, signal);
+    case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
     case 'submit:activity-enroll':      return dispatchActivityEnroll(task, signal);
@@ -1236,6 +1270,56 @@ async function dispatchFluxAnalysisDetail(task, signal) {
     rawCount: rawItems.length,
     productId: payload.productId,
     region: payload.region ?? 'global',
+    completedAt: new Date().toISOString(),
+    agent: agentDiag(),
+  };
+}
+
+// ── scrape:order-amounts 专用 wrapper ────────────────────────────
+// 任务语义:抓订单产品金额(recentOrderList 分页 + batchQueryByOrder 批量 join)。
+// 两段链式:第一段 dispatchViaHiddenTab 抓 recentOrderList(含 parentOrderSn),
+//   第二段复用 cached session headers 批量直 POST batchQueryByOrder(50/批)。
+// payload: { mallId, region? }
+async function dispatchOrderAmounts(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:order-amounts'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'global';
+  const host = REGION_TO_ORDER_HOST[region];
+  if (!host) throw Object.assign(new Error(`order host not configured for region=${region}`), { code: 'BAD_REGION' });
+
+  // 第一段:recentOrderList 分页(dispatchViaHiddenTab 捕 session + 翻页),rawItems = pageItems
+  const spec = { ...KIND_TO_FETCH_SPEC['scrape:order-amounts'], pageUrl: REGION_TO_ORDER_PAGE_URL[region] };
+  const { rawItems: pageItems } = await dispatchViaHiddenTab(spec, payload, signal);
+
+  const sns = [...new Set((pageItems ?? [])
+    .map((it) => it?.parentOrderMap?.parentOrderSn).filter(Boolean).map(String))];
+
+  // 第二段:复用 cached session headers 批量直 POST batchQueryByOrder(50/批)
+  const session = await getCachedSession(payload.mallId);
+  if (!session?.headers) throw Object.assign(new Error('no cached session for batchQueryByOrder'), { code: 'NO_SESSION' });
+  const headers = { ...session.headers, 'content-type': 'application/json' };
+  const bqUrl = host + ORDER_SUPPLIER_PRICE_PATH;
+  let priceMap = {};
+  for (let i = 0; i < sns.length; i += 50) {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+    const batch = sns.slice(i, i + 50);
+    const resp = await fetch(bqUrl, { method: 'POST', credentials: 'include', headers, body: JSON.stringify({ parentOrderSnList: batch }) });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw Object.assign(new Error(`batchQueryByOrder HTTP ${resp.status}: ${txt.slice(0, 200)}`),
+        { code: resp.status >= 500 ? 'TEMU_SERVER_ERROR' : 'TEMU_FETCH_FAILED' });
+    }
+    const data = await resp.json();
+    Object.assign(priceMap, buildPriceMap(data));
+    if (i + 50 < sns.length) await sleep(300, signal);
+  }
+
+  const rows = transformOrderAmounts(pageItems, priceMap, region);
+  return {
+    rows,
+    rawCount: (pageItems ?? []).length,
+    orderCount: sns.length,
+    region,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
