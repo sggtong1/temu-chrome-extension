@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-amounts-20260608d';
+const AGENT_BUILD_ID   = 'agent-order-amounts-20260608e';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1284,49 +1284,113 @@ async function dispatchFluxAnalysisDetail(task, signal) {
 // 两段链式:第一段 dispatchViaHiddenTab 抓 recentOrderList(含 parentOrderSn),
 //   第二段复用 cached session headers 批量直 POST batchQueryByOrder(50/批)。
 // payload: { mallId, region? }
+// ★ 方式改为 sellfox 同款(2026-06-08):不"开页面等 XHR 捕 session"(orders SPA 冷加载不发任何
+//   可捕请求),而是开 orders 页 → 等加载 → executeScript 注入 MAIN-world 函数,在页面上下文里
+//   直接 fetch recentOrderList + batchQueryByOrder(页面 WAF SDK 自动签 anti-content,等价 temuPostNew)。
+//   返回 raw pageItems + batchQueryByOrder 响应,join 在 SW 里做(transform 不能注入页面)。
 async function dispatchOrderAmounts(task, signal) {
   const payload = task.payload ?? {};
   if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:order-amounts'), { code: 'BAD_PAYLOAD' });
   const region = payload.region ?? 'global';
-  const host = REGION_TO_ORDER_HOST[region];
-  if (!host) throw Object.assign(new Error(`order host not configured for region=${region}`), { code: 'BAD_REGION' });
+  const pageUrl = REGION_TO_ORDER_PAGE_URL[region];
+  if (!pageUrl) throw Object.assign(new Error(`order page not configured for region=${region}`), { code: 'BAD_REGION' });
 
-  // 第一段:recentOrderList 分页(dispatchViaHiddenTab 捕 session + 翻页),rawItems = pageItems
-  const spec = { ...KIND_TO_FETCH_SPEC['scrape:order-amounts'], pageUrl: REGION_TO_ORDER_PAGE_URL[region] };
-  const { rawItems: pageItems } = await dispatchViaHiddenTab(spec, payload, signal);
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
-  const sns = [...new Set((pageItems ?? [])
-    .map((it) => it?.parentOrderMap?.parentOrderSn).filter(Boolean).map(String))];
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[order-amounts] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
 
-  // 第二段:复用 cached session headers 批量直 POST batchQueryByOrder(50/批)
-  const session = await getCachedSession(payload.mallId);
-  if (!session?.headers) throw Object.assign(new Error('no cached session for batchQueryByOrder'), { code: 'NO_SESSION' });
-  const headers = { ...session.headers, 'content-type': 'application/json' };
-  const bqUrl = host + ORDER_SUPPLIER_PRICE_PATH;
-  let priceMap = {};
-  for (let i = 0; i < sns.length; i += 50) {
-    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
-    const batch = sns.slice(i, i + 50);
-    const resp = await fetch(bqUrl, { method: 'POST', credentials: 'include', headers, body: JSON.stringify({ parentOrderSnList: batch }) });
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      throw Object.assign(new Error(`${region} 订单页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    }
+    await sleep(2000, signal);   // 让页面 WAF SDK 就绪
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runOrdersInTab,
+      args: [{
+        listPath: ORDER_LIST_PATH,
+        supplierPricePath: ORDER_SUPPLIER_PRICE_PATH,
+        listBody: { fulfillmentMode: null, queryType: 0, sortType: 1, timeZone: 'UTC+8', sellerNoteLabelList: [] },
+        pageSize: 50,
+        maxPages: 20,        // 上限 ~1000 单(近期),避免一次扫全量
+        batchSize: 50,
+      }],
+    });
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+
+    const pageItems = result.pageItems ?? [];
+    const priceMap = {};
+    for (const r of (result.bqResponses ?? [])) Object.assign(priceMap, buildPriceMap(r));
+    const rows = transformOrderAmounts(pageItems, priceMap, region);
+    return {
+      rows,
+      rawCount: pageItems.length,
+      orderCount: result.orderCount ?? 0,
+      region,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// ── MAIN-world 注入函数:在 orders 页上下文里 fetch(WAF SDK 自动签 anti-content)──────
+// 必须是纯函数(executeScript 序列化),不能引用外部变量/import。同源相对路径 fetch。
+async function runOrdersInTab(args) {
+  const { listPath, supplierPricePath, listBody, pageSize, maxPages, batchSize } = args;
+  const post = async (path, body) => {
+    const resp = await fetch(path, {
+      method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '');
-      throw Object.assign(new Error(`batchQueryByOrder HTTP ${resp.status}: ${txt.slice(0, 200)}`),
-        { code: resp.status >= 500 ? 'TEMU_SERVER_ERROR' : 'TEMU_FETCH_FAILED' });
+      throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
     }
-    const data = await resp.json();
-    Object.assign(priceMap, buildPriceMap(data));
-    if (i + 50 < sns.length) await sleep(300, signal);
-  }
-
-  const rows = transformOrderAmounts(pageItems, priceMap, region);
-  return {
-    rows,
-    rawCount: (pageItems ?? []).length,
-    orderCount: sns.length,
-    region,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
+    return resp.json();
   };
+  try {
+    // 1) recentOrderList 分页
+    const pageItems = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post(listPath, { ...listBody, pageNumber: p, pageSize });
+      const items = data?.result?.pageItems ?? [];
+      pageItems.push(...items);
+      if (items.length < pageSize) break;
+    }
+    // 2) distinct parentOrderSn
+    const seen = {};
+    const sns = [];
+    for (const it of pageItems) {
+      const sn = it && it.parentOrderMap && it.parentOrderMap.parentOrderSn;
+      if (sn && !seen[sn]) { seen[sn] = 1; sns.push(String(sn)); }
+    }
+    // 3) batchQueryByOrder 批量
+    const bqResponses = [];
+    for (let i = 0; i < sns.length; i += batchSize) {
+      bqResponses.push(await post(supplierPricePath, { parentOrderSnList: sns.slice(i, i + batchSize) }));
+    }
+    return { ok: true, pageItems, bqResponses, orderCount: sns.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED' };
+  }
 }
 
 // ── submit:price-confirm 专用 wrapper ────────────────────────────
