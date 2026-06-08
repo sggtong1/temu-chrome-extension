@@ -41,7 +41,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-sales-fixedhost-20260607f';
+const AGENT_BUILD_ID   = 'agent-activity-sessionstatus2-20260608a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -718,7 +718,10 @@ const KIND_TO_FETCH_SPEC = {
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
-    buildBody: (_payload) => ({}),     // runFetchInTab 注入 pageNo+pageSize
+    // sessionStatus:2 = 只取「进行中」场次。不加这个过滤,Temu 会返回退出/已售罄等
+    // 状态的报名记录,它们的 activityPrice 不准 → 产品分析销售额(销量×最低活动价)偏差。
+    // runFetchInTab 仍会注入 pageNo+pageSize。
+    buildBody: (_payload) => ({ sessionStatus: 2 }),
     listPath: 'result.list',
     totalPath: 'result.total',
     transform: (rawItems) => transformActivityEnrollments(rawItems),
