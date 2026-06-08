@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-amounts-20260608e';
+const AGENT_BUILD_ID   = 'agent-order-amounts-20260608f';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1323,6 +1323,7 @@ async function dispatchOrderAmounts(task, signal) {
         pageSize: 50,
         maxPages: 20,        // 上限 ~1000 单(近期),避免一次扫全量
         batchSize: 50,
+        mallId: String(payload.mallId),   // ★ 必带 mallid header,否则 400020037 No Permission
       }],
     });
     const result = await Promise.race([
@@ -1353,11 +1354,11 @@ async function dispatchOrderAmounts(task, signal) {
 // ── MAIN-world 注入函数:在 orders 页上下文里 fetch(WAF SDK 自动签 anti-content)──────
 // 必须是纯函数(executeScript 序列化),不能引用外部变量/import。同源相对路径 fetch。
 async function runOrdersInTab(args) {
-  const { listPath, supplierPricePath, listBody, pageSize, maxPages, batchSize } = args;
+  const { listPath, supplierPricePath, listBody, pageSize, maxPages, batchSize, mallId } = args;
   const post = async (path, body) => {
     const resp = await fetch(path, {
       method: 'POST', credentials: 'include',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
       body: JSON.stringify(body),
     });
     if (!resp.ok) {
