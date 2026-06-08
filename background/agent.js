@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-amounts-20260608a';
+const AGENT_BUILD_ID   = 'agent-order-amounts-20260608b';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -106,9 +106,9 @@ const REGION_TO_ORDER_HOST = {
 const ORDER_LIST_PATH = '/kirogi/bg/mms/recentOrderList';
 const ORDER_SUPPLIER_PRICE_PATH = '/bg-visage-agent-seller/product/sku/supplierPrice/batchQueryByOrder';
 const REGION_TO_ORDER_PAGE_URL = {
-  global: 'https://agentseller.temu.com/main/order/list',
-  us:     'https://agentseller-us.temu.com/main/order/list',
-  eu:     'https://agentseller-eu.temu.com/main/order/list',
+  global: 'https://agentseller.temu.com/mmsos/orders.html',
+  us:     'https://agentseller-us.temu.com/mmsos/orders.html',
+  eu:     'https://agentseller-eu.temu.com/mmsos/orders.html',
 };
 
 // ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
