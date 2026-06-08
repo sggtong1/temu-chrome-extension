@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-amounts-20260608c';
+const AGENT_BUILD_ID   = 'agent-order-amounts-20260608d';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -809,9 +809,10 @@ const KIND_TO_FETCH_SPEC = {
   'scrape:order-amounts': {
     pageUrl: (p) => REGION_TO_ORDER_PAGE_URL[p?.region ?? 'global'],
     apiUrlPattern: (_p) => ORDER_LIST_PATH,
-    // recentOrderList 只有点"全部订单"tab 才发,冷加载不发 → capture 改等页面加载时
-    //   必发的地址快照请求(同 mallId session 跨 path 通用),fetch 仍走 recentOrderList。
-    captureApiUrlPattern: '/mms/orchid/address/batch/snapshot/order_shipping_address_base_info_query',
+    // recentOrderList 只有点"全部订单"tab 才发,冷加载不发;地址快照又依赖订单先加载。
+    //   → capture 等订单页 bootstrap 阶段必发的配置调用(不依赖订单列表,最早最稳),
+    //   同 mallId session 跨 path 通用,fetch 仍走 recentOrderList。
+    captureApiUrlPattern: '/garen/mms/mall/queryOrderRegion1ReturnConfig',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
