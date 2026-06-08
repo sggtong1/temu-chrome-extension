@@ -125,12 +125,40 @@ describe('scrape:declared-price', () => {
 
 // ── siteType compat (popup vocabulary) ───────────────────────────
 describe('siteType compat — popup 派任务用 siteType 字段', () => {
-  test('scrape:sales-30d siteType=semi (popup vocabulary) → semi URL', () => {
+  test('scrape:sales-30d siteType=semi (popup vocabulary) → 数据中心 sale/analysis/detail', () => {
     const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    // 半托走数据中心「商品数据」页(按 region 选 agentseller host),endpoint /api/sale/analysis/detail
     const url = spec.pageUrl({ siteType: 'semi' });
     const api = spec.apiUrlPattern({ siteType: 'semi' });
-    expect(url).toContain('seller.kuajingmaihuo.com');
-    expect(api).toBe('/oms/bg/venom/api/supplier/sales/management/querySkuSalesNumber');
+    expect(url).toContain('agentseller.temu.com');
+    expect(url).toContain('/main/data-center/goods-data');
+    expect(api).toBe('/api/sale/analysis/detail');
+  });
+
+  test('scrape:sales-30d siteType=semi → 销量 host 固定主域,不分 region', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    // 销量 detail 只在主域,与 payload.region 无关(流量才分区)
+    expect(spec.pageUrl({ siteType: 'semi', region: 'us' })).toContain('agentseller.temu.com');
+    expect(spec.pageUrl({ siteType: 'semi', region: 'us' })).not.toContain('agentseller-us');
+    expect(spec.pageUrl({ siteType: 'semi', region: 'pa' })).toContain('agentseller.temu.com');
+    expect(spec.pageUrl({ siteType: 'semi' })).toContain('agentseller.temu.com');
+  });
+
+  test('scrape:sales-30d semi body = { timeType } + pageNum/pageSize 分页(实测 body shape)', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    const p = { siteType: 'semi' };
+    expect(spec.buildBody(p)).toEqual({ timeType: 4 });
+    expect(spec.pageNoKey(p)).toBe('pageNum');
+    expect(spec.pageSizeKey(p)).toBe('pageSize');
+    expect(spec.pageSize(p)).toBe(30);
+    // payload.timeType 可覆盖默认 4
+    expect(spec.buildBody({ siteType: 'semi', timeType: 2 })).toEqual({ timeType: 2 });
+  });
+
+  test('scrape:sales-30d full → listOverall(销售管理页,不受半托改动影响)', () => {
+    const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
+    expect(spec.apiUrlPattern({ shopType: 'full' })).toBe('/mms/venom/api/supplier/sales/management/listOverall');
+    expect(spec.pageUrl({ shopType: 'full' })).toContain('/stock/fully-mgt/sale-manage/main');
   });
 
   test('scrape:declared-price siteType=semi → robin namespace URL', () => {

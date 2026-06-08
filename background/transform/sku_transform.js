@@ -283,6 +283,98 @@ export function transformSkuSalesDailyResponse(rawItems) {
   return rows;
 }
 
+// ── 半托管 sales-30d transform ───────────────────────────────────
+// 半托店没有全托的「供货销量 listOverall」(供货模式才有在仓库存快照);
+// 半托是自卖模式,销量来自数据中心「商品数据」页的 /api/sale/analysis/detail。
+// 实测响应(2026-06-07,真半托店 mallId 634418221310504,详见 docs/sellfox-plugin-rev-eng.md §3.2):
+//   { result: { total, saleAnalysisDetailDTOList: [{
+//       productSkuId, productSkcId, productId, skuExtCode, skcExtCode,
+//       goodsName, goodsImage, goodsCat,                       // 品名/主图/类目
+//       goodsSkuLast1DQty, goodsSkuLast7DQty, goodsSkuLast30DQty,  // ★ 预聚合销量(SKU级)
+//       inventoryNum, authWhInventoryNum, avlbDay,            // 库存 + 可售天数
+//       skuSaleDTOList: [{ date, saleNum, isSellOut }], ... } ] } }
+// rawItems = listPath('result.saleAnalysisDetailDTOList') 取出的数组。
+// ★ 直接用平台预聚合的 goodsSkuLast{1,7,30}DQty,不要自己累加 skuSaleDTOList —— 后者跨 ~90 天
+//   且含未来预测日(isSellOut:-1),累加会得到错误的 30 天销量。
+// 半托响应字段齐全:含 productSkcId(SKC)、库存、品名/主图,产品分析各维度 + 缩略图均可用。
+export function transformSemiSalesResponse(rawItems) {
+  const rows = [];
+  for (const item of rawItems) {
+    if (item?.productSkuId == null) continue;
+
+    const last1  = Number(item.goodsSkuLast1DQty ?? 0);
+    const last7  = Number(item.goodsSkuLast7DQty ?? 0);
+    const last30 = Number(item.goodsSkuLast30DQty ?? 0);
+
+    const productId    = item.productId    != null ? String(item.productId)    : null;
+    const productSkcId = item.productSkcId != null ? String(item.productSkcId) : null;
+    const ext = (item.skuExtCode && String(item.skuExtCode).trim()) ? String(item.skuExtCode).trim() : null;
+    // avlbDay=9999 是 Temu 的「无限/无销量」哨兵值,落 null 更干净
+    const avlb = (typeof item.avlbDay === 'number' && item.avlbDay > 0 && item.avlbDay < 9999) ? item.avlbDay : null;
+
+    rows.push({
+      platformSkuId: String(item.productSkuId),
+      productId,                                  // SPU(半托响应含,全托 transform 顶层无此字段)
+      productSkcId,                               // SKC(同上)
+      productName: item.goodsName ?? null,
+      productSkcPicture: item.goodsImage ?? null, // 主图 URL
+      category: item.goodsCat ?? null,            // 类目名
+      className: item.skuSize ?? null,            // 规格(颜色/尺寸)
+      skuExtCode: ext,
+
+      todaySaleVolume: last1,                     // 半托无「今日」字段,用近1天近似
+      sales7dVolume:   last7,
+      sales30dVolume:  last30,
+      totalSaleVolume: last30,
+
+      warehouseQty:    Number(item.inventoryNum ?? 0),
+      waitReceiveQty:  0,
+      waitOnShelfQty:  0,
+      waitDeliveryQty: 0,
+
+      avgDailySales: last30 / 30,
+      daysRemaining: avlb,
+      supplierPriceCents: null,                   // 半托此接口不返供货价
+
+      platformPayload: {
+        sku: {
+          productSkuId: item.productSkuId, skuSize: item.skuSize,
+          skuSaleLable: item.skuSaleLable, isHotSku: item.isHotSku,
+          authWhInventoryNum: item.authWhInventoryNum, avlbDay: item.avlbDay,
+        },
+        parent: { productId, productSkcId, productName: item.goodsName ?? null, goodsImage: item.goodsImage ?? null },
+      },
+    });
+  }
+  console.log(`[temu] transformSemiSalesResponse: ${rawItems.length} SKUs → ${rows.length} rows`);
+  return rows;
+}
+
+// ── 半托管 sales-30d 的每日明细 → ShopSkuDailySnapshot 行 ─────────
+// 同一次 /api/sale/analysis/detail 响应,每项还带 `skuSaleDTOList: [{date, saleNum, isSellOut}]`,
+// 覆盖过去 ~30 天的真实每日销量(+ 未来若干天的预测,`isSellOut === -1` 标记)。
+// 把它转成 ingestSkuSalesDaily 期望的 { platformSkuId, date, salesNumber } 行,落 shop_sku_daily_snapshot,
+// 让产品分析半托页支持「按真实日期区间求和」(否则无日快照只能回落固定 7d/30d 聚合,换日期不变)。
+// ⚠️ 过滤 `isSellOut === -1`(未来预测日),只落真实历史。
+export function transformSemiSalesDailyResponse(rawItems) {
+  const rows = [];
+  for (const item of rawItems) {
+    if (item?.productSkuId == null) continue;
+    const daily = Array.isArray(item.skuSaleDTOList) ? item.skuSaleDTOList : [];
+    for (const d of daily) {
+      if (!d?.date) continue;
+      if (d.isSellOut === -1) continue; // 未来预测日,跳过
+      rows.push({
+        platformSkuId: String(item.productSkuId),
+        date: String(d.date),
+        salesNumber: Number(d.saleNum ?? 0),
+      });
+    }
+  }
+  console.log(`[temu] transformSemiSalesDailyResponse: ${rawItems.length} SKUs → ${rows.length} day-rows`);
+  return rows;
+}
+
 /**
  * Maps /api/kiana/magnus/mms/price-adjust/product-adjust-query response →
  * 一行 = 一个 (SPU × SKU) 调价/申报价记录。

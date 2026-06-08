@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from '../background/transform/sku_transform.js';
+import { parseSalesResponse, parseOrdersResponse, buildSkuRows, transformSemiSalesResponse, transformSemiSalesDailyResponse } from '../background/transform/sku_transform.js';
 
 describe('parseSalesResponse — semi_us', () => {
   const ctx = { siteType: 'semi_us', date: '2026-05-03' };
@@ -83,6 +83,96 @@ describe('parseSalesResponse — full_managed', () => {
     };
     const { skuSales } = parseSalesResponse(raw, ctx);
     expect(skuSales['222']).toBe(0);
+  });
+});
+
+describe('transformSemiSalesResponse — 半托 /api/sale/analysis/detail', () => {
+  // 实测响应形状(节选自真半托店 mallId 634418221310504)
+  const sampleItem = {
+    productSkuId: 39396279178,
+    productSkcId: 22961983155,
+    productId: 9489993747,
+    skuExtCode: '',
+    goodsName: 'Mini Electric Shaver',
+    goodsImage: 'https://img.kwcdn.com/x.jpg',
+    goodsCat: '电动剃须刀',
+    skuSize: 'Grey',
+    goodsSkuLast1DQty: 0,
+    goodsSkuLast7DQty: 0,
+    goodsSkuLast30DQty: 5,
+    inventoryNum: 6,
+    authWhInventoryNum: 0,
+    avlbDay: 9999.0,
+    skuSaleDTOList: [ // 含未来预测日,不应被累加
+      { date: '2026-05-20', saleNum: 1 },
+      { date: '2026-07-31', saleNum: 0, isSellOut: -1 },
+    ],
+  };
+
+  it('uses pre-aggregated goodsSkuLast{1,7,30}DQty (NOT summed daily)', () => {
+    const rows = transformSemiSalesResponse([sampleItem]);
+    expect(rows).toHaveLength(1);
+    const r = rows[0];
+    expect(r.platformSkuId).toBe('39396279178');
+    expect(r.sales30dVolume).toBe(5);   // = goodsSkuLast30DQty,不是 skuSaleDTOList 之和
+    expect(r.sales7dVolume).toBe(0);
+    expect(r.todaySaleVolume).toBe(0);
+    expect(r.totalSaleVolume).toBe(5);
+    expect(r.avgDailySales).toBeCloseTo(5 / 30);
+  });
+
+  it('maps SKC/SPU/name/image/inventory from the real fields', () => {
+    const r = transformSemiSalesResponse([sampleItem])[0];
+    expect(r.productId).toBe('9489993747');
+    expect(r.productSkcId).toBe('22961983155');   // SKC 确实存在
+    expect(r.productName).toBe('Mini Electric Shaver');
+    expect(r.productSkcPicture).toBe('https://img.kwcdn.com/x.jpg');
+    expect(r.category).toBe('电动剃须刀');
+    expect(r.warehouseQty).toBe(6);               // inventoryNum
+    expect(r.daysRemaining).toBeNull();           // avlbDay=9999 → null 哨兵
+    expect(r.supplierPriceCents).toBeNull();
+  });
+
+  it('empty skuExtCode → null; avlbDay<9999 kept', () => {
+    const r = transformSemiSalesResponse([{ ...sampleItem, skuExtCode: '  ', avlbDay: 42 }])[0];
+    expect(r.skuExtCode).toBeNull();
+    expect(r.daysRemaining).toBe(42);
+  });
+
+  it('skips items without productSkuId and returns [] for empty input', () => {
+    expect(transformSemiSalesResponse([])).toEqual([]);
+    expect(transformSemiSalesResponse([{ productId: 1 }])).toEqual([]);
+  });
+});
+
+describe('transformSemiSalesDailyResponse — 半托每日明细 → 日快照行', () => {
+  it('emits {platformSkuId,date,salesNumber} per past day, drops future (isSellOut=-1)', () => {
+    const rawItems = [{
+      productSkuId: 111,
+      skuSaleDTOList: [
+        { date: '2026-06-05', saleNum: 3, isSellOut: 0 },
+        { date: '2026-06-06', saleNum: 1, isSellOut: 0 },
+        { date: '2026-06-07', saleNum: 0, isSellOut: -1 },  // 未来预测,丢弃
+        { date: '2026-06-08', saleNum: 0, isSellOut: -1 },  // 未来预测,丢弃
+      ],
+    }];
+    const rows = transformSemiSalesDailyResponse(rawItems);
+    expect(rows).toEqual([
+      { platformSkuId: '111', date: '2026-06-05', salesNumber: 3 },
+      { platformSkuId: '111', date: '2026-06-06', salesNumber: 1 },
+    ]);
+  });
+
+  it('flattens multiple SKUs and skips items without productSkuId / empty input', () => {
+    const rawItems = [
+      { productSkuId: 1, skuSaleDTOList: [{ date: '2026-06-01', saleNum: 2, isSellOut: 0 }] },
+      { skuSaleDTOList: [{ date: '2026-06-01', saleNum: 9, isSellOut: 0 }] }, // 无 productSkuId
+      { productSkuId: 2, skuSaleDTOList: [{ date: '2026-06-01', saleNum: 5, isSellOut: 1 }] },
+    ];
+    const rows = transformSemiSalesDailyResponse(rawItems);
+    expect(rows).toHaveLength(2);
+    expect(rows.map(r => r.platformSkuId)).toEqual(['1', '2']);
+    expect(transformSemiSalesDailyResponse([])).toEqual([]);
   });
 });
 

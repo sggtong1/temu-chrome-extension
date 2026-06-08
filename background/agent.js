@@ -23,6 +23,8 @@ import {
 } from './transform/activity_transform.js';
 import {
   transformSales30dResponse,
+  transformSemiSalesResponse,
+  transformSemiSalesDailyResponse,
   transformSkuSalesDailyResponse,
   transformPriceAdjustResponse,
   transformFluxAnalysisResponse,
@@ -39,7 +41,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-poll-log-20260607a';
+const AGENT_BUILD_ID   = 'agent-semi-sales-fixedhost-20260607f';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -92,6 +94,13 @@ const REGION_TO_FLUX_DETAIL_API = {
   us:     FLUX_DETAIL_API_PATH,
   eu:     FLUX_DETAIL_API_PATH,
 };
+
+// ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
+// ★★ 实测确认:销量 detail 的 host 固定主域 agentseller.temu.com,【不分区】(跟店铺区域无关);
+//   只有流量 /api/flow/analysis/list 才按区域走 agentseller-us/-eu 子域。
+//   销量和流量的 host 规则不同 —— 销量不要按 region 选 host。
+const SEMI_SALES_PAGE_URL = 'https://agentseller.temu.com/main/data-center/goods-data';
+const SEMI_SALES_API_PATH = '/api/sale/analysis/detail';
 const AGENT_IMPORT_URL = import.meta.url;
 
 function agentDiag() {
@@ -823,24 +832,38 @@ const KIND_TO_FETCH_SPEC = {
     transform: (rawItems) => transformPriceAdjustResponse(rawItems),
   },
   // scrape:sales-30d — 近 30 天销量 + 库存(SKU 级 snapshot)
-  // 全托 / 半托共用:按 payload.shopType 分支 pageUrl + apiUrlPattern
-  //   - 全托管:agentseller.temu.com 销售管理页 → listOverall
-  //   - 半托管:seller.kuajingmaihuo.com 销售管理页 → querySkuSalesNumber(详见 docs/sellfox-plugin-rev-eng.md §3.2 + §3.6)
-  // ★ 半托 endpoint 路径尚未实测(用户绑了真半托店之后才能跑通);path 来自 sellfox-crx 反编译
+  // 全托 / 半托走两套不同 endpoint(数据模型不同,详见 docs/sellfox-plugin-rev-eng.md §3.2):
+  //   - 全托管(供货模式):agentseller.temu.com 销售管理页 → listOverall(含在仓库存,翻页)
+  //   - 半托管(自卖模式):agentseller[-us/-eu] 数据中心「商品数据」页 → /api/sale/analysis/detail
+  //       半托无独立销量任务,该接口按 SKU×日返回销量(无库存字段),单次返完整不翻页(single)。
+  // 半托 body(2026-06-07 用户在数据中心商品数据页实测):{ pageNum, pageSize, timeType }
+  //   - 分页字段名是 pageNum(非 pageNo)+ pageSize;翻页靠短页检测(list.length < pageSize)结束。
+  //   - timeType 是时间枚举(实测 4;用户在「近30天」视图抓的 → 4≈近30天),不传 startDate/endDate。
+  //   - 翻页 pageNum/pageSize 由 paginatedFetchInSW 注入,buildBody 只放 timeType。
+  // ⚠️ 仍待实测:capture 是否冷开自动发 /api/sale/analysis/detail(否则补 captureApiUrlPattern/active-trigger);
+  //    timeType 其它枚举值;响应是否含 skuSaleDTOList 每日明细(transform 据此累加 7d/30d)。
   'scrape:sales-30d': {
     pageUrl: (payload) => isSemiPayload(payload)
-      ? 'https://seller.kuajingmaihuo.com/main/sale-manage/main'
+      ? SEMI_SALES_PAGE_URL  // 销量 detail host 固定主域,不分 region(与流量 host 规则不同)
       : 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main',
     apiUrlPattern: (payload) => isSemiPayload(payload)
-      ? '/oms/bg/venom/api/supplier/sales/management/querySkuSalesNumber'
+      ? SEMI_SALES_API_PATH
       : '/mms/venom/api/supplier/sales/management/listOverall',
     method: 'POST',
     paginationMode: 'pageNo',
-    pageSize: 50,
-    buildBody: (_payload) => ({ isLack: 0 }),
-    listPath: 'result.subOrderList',
-    totalPath: 'result.total',
-    transform: (rawItems) => transformSales30dResponse(rawItems),
+    pageNoKey:   (payload) => isSemiPayload(payload) ? 'pageNum' : 'pageNo',
+    pageSizeKey: (payload) => isSemiPayload(payload) ? 'pageSize' : 'pageSize',
+    pageSize:    (payload) => isSemiPayload(payload) ? 30 : 50,
+    buildBody: (payload) => isSemiPayload(payload)
+      ? { timeType: payload.timeType ?? 4 }   // 4≈近30天(实测);pageNum/pageSize 由分页逻辑注入
+      : { isLack: 0 },
+    listPath: (payload) => isSemiPayload(payload)
+      ? 'result.saleAnalysisDetailDTOList'
+      : 'result.subOrderList',
+    totalPath: 'result.total',   // 全/半托响应都有 result.total,翻页按总数判断结束
+    transform: (rawItems, payload) => isSemiPayload(payload)
+      ? transformSemiSalesResponse(rawItems)
+      : transformSales30dResponse(rawItems),
   },
   // scrape:sku-sales-daily — per-SKU per-day 历史销量(全托)
   // 同 sale-manage 页,endpoint querySkuSalesNumber。一次返指定 SKU 在 [start,end] 的每日销量。
@@ -954,12 +977,18 @@ async function dispatchSales30d(task, signal) {
   }
   const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
   const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
-  return {
+  const result = {
     rows: transformed,
     rawCount: rawItems.length,
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
+  // 半托:同一次 /api/sale/analysis/detail 响应已带 skuSaleDTOList 每日明细,顺带产 dailyRows
+  // 落 shop_sku_daily_snapshot(让产品分析半托页按真实日期区间求和)。全托走独立 scrape:sku-sales-daily。
+  if (isSemiPayload(payload)) {
+    result.dailyRows = transformSemiSalesDailyResponse(rawItems);
+  }
+  return result;
 }
 
 // ── scrape:sku-sales-daily 专用 wrapper ──────────────────────────
@@ -2723,9 +2752,9 @@ async function paginatedFetchInSW(spec, payload, url, capturedHeaders, signal) {
   };
   const headers = { ...capturedHeaders, 'content-type': 'application/json' };
   const bodyTemplate = spec.buildBody(payload);
-  const mode = spec.paginationMode ?? 'pageNo';
   // spec 字段支持「函数(payload)→值」或静态值,容纳全/半托差异
   const resolve = (v) => (typeof v === 'function' ? v(payload) : v);
+  const mode = resolve(spec.paginationMode) ?? 'pageNo';
   const pageSize  = resolve(spec.pageSize) ?? 50;
   const listPath  = resolve(spec.listPath);
   const totalPath = resolve(spec.totalPath);
