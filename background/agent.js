@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-returns-20260608b';
+const AGENT_BUILD_ID   = 'agent-returns-20260608c';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -112,8 +112,13 @@ const REGION_TO_ORDER_PAGE_URL = {
   eu:     'https://agentseller-eu.temu.com/mmsos/orders.html',
 };
 
-// 退货退款:列表全区域同 path;详情按区分流(global=ReturnDetails,eu/us=RefundDetails)。
-// 宿主页复用 orders.html(WAF SDK 在,/garen 同源)。
+// 退货退款:专属页 return-refund-list.html(referer 匹配 garen 接口);列表全区域同 path;
+// 详情按区分流(global=ReturnDetails,eu/us=RefundDetails)。
+const REGION_TO_RETURNS_PAGE_URL = {
+  global: 'https://agentseller.temu.com/mmsos/return-refund-list.html',
+  us:     'https://agentseller-us.temu.com/mmsos/return-refund-list.html',
+  eu:     'https://agentseller-eu.temu.com/mmsos/return-refund-list.html',
+};
 const RETURNS_LIST_PATH = '/garen/mms/afterSales/queryReturnAndRefundPaList';
 const REGION_TO_RETURNS_DETAIL_PATH = {
   global: '/garen/mms/afterSales/queryReturnDetails',
@@ -1414,7 +1419,7 @@ async function dispatchReturns(task, signal) {
   const payload = task.payload ?? {};
   if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:returns'), { code: 'BAD_PAYLOAD' });
   const region = payload.region ?? 'global';
-  const pageUrl = REGION_TO_ORDER_PAGE_URL[region];   // 复用 orders 页(WAF SDK + 同源)
+  const pageUrl = REGION_TO_RETURNS_PAGE_URL[region];   // 退货退款专属页(WAF SDK + 同源 + referer 匹配)
   const detailPath = REGION_TO_RETURNS_DETAIL_PATH[region];
   if (!pageUrl || !detailPath) throw Object.assign(new Error(`returns 配置缺 region=${region}`), { code: 'BAD_REGION' });
 
