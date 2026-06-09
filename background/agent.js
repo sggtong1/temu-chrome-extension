@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-returns-20260608a';
+const AGENT_BUILD_ID   = 'agent-returns-20260608b';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1442,7 +1442,7 @@ async function dispatchReturns(task, signal) {
         pageSize: 100,
         maxPages: 20,
         windowDays: 90,
-        detailDelayMs: 200,
+        detailDelayMs: 500,
         mallId: String(payload.mallId),
       }],
     });
@@ -1470,19 +1470,28 @@ async function dispatchReturns(task, signal) {
 // 纯函数(序列化)。同源相对 fetch,WAF SDK 自动签 anti-content;必带 mallid header。
 async function runReturnsInTab(args) {
   const { listPath, detailPath, pageSize, maxPages, windowDays, detailDelayMs, mallId } = args;
-  const post = async (path, body) => {
-    const resp = await fetch(path, {
-      method: 'POST', credentials: 'include',
-      headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => '');
-      throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
-    }
-    return resp.json();
-  };
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 详情逐单密集调用易触发 429,post 内置退避重试(读 Retry-After,否则 2s/4s/6s...)。
+  const post = async (path, body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(path, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
+      }
+      return resp.json();
+    }
+    throw new Error(`HTTP 429 ${path.slice(0, 40)}: 限流退避重试 6 次仍失败`);
+  };
   try {
     const now = Date.now();
     const listBody = {
