@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-mall-multi-20260609a';
+const AGENT_BUILD_ID   = 'agent-semi-ad-20260609a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -58,6 +58,7 @@ const SUPPORTED_KINDS = [
   'scrape:flux-analysis-detail',
   'scrape:order-amounts',
   'scrape:returns',
+  'scrape:semi-ad',
   'scrape:settlement',
   'submit:price-confirm',
   'submit:activity-enroll',
@@ -125,6 +126,10 @@ const REGION_TO_RETURNS_DETAIL_PATH = {
   eu:     '/garen/mms/afterSales/queryRefundDetails',
   us:     '/garen/mms/afterSales/queryRefundDetails',
 };
+
+// 半托广告:独立域名 ads.temu.com(实测注入页直 fetch,无需 x-phan-data/list_id/mallid,cookie 自带)。
+const SEMI_AD_PAGE_URL = 'https://ads.temu.com/data-report.html';
+const SEMI_AD_REPORT_PATH = '/api/v1/coconut/ad/ads_report';
 
 // ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
 // ★★ 实测确认:销量 detail 的 host 固定主域 agentseller.temu.com,【不分区】(跟店铺区域无关);
@@ -653,6 +658,7 @@ const KIND_LABELS = {
   'scrape:flux-analysis-detail': '流量分析详情',
   'scrape:order-amounts':      '订单产品金额',
   'scrape:returns':            '退货退款',
+  'scrape:semi-ad':            '半托广告数据',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
   'submit:price-reject':       '核价驳回',
@@ -985,6 +991,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:flux-analysis-detail': return dispatchFluxAnalysisDetail(task, signal);
     case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
     case 'scrape:returns':              return dispatchReturns(task, signal);
+    case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
     case 'submit:activity-enroll':      return dispatchActivityEnroll(task, signal);
@@ -1603,6 +1610,103 @@ async function runReturnsInTab(args) {
     return { ok: true, listPages, details, afterSalesCount: pairs.length, diag };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstListResp };
+  }
+}
+
+// ── scrape:semi-ad 专用 wrapper(ads.temu.com 半托广告)────────────
+async function dispatchSemiAd(task, signal) {
+  const payload = task.payload ?? {};
+  const region = payload.region ?? 'global';
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 6 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: SEMI_AD_PAGE_URL, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[semi-ad] tab ${tabId} → ${SEMI_AD_PAGE_URL}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`ads.temu.com 跳登录,需登录半托广告后台`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);
+
+    console.log(`[semi-ad] region=${region} 注入页面抓取(近 7 天逐日 + 分页)...`);
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runSemiAdInTab,
+      args: [{ reportPath: SEMI_AD_REPORT_PATH, windowDays: 7, pageSize: 50, maxPages: 20, dayDelayMs: 300 }],
+    });
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[semi-ad] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const dayReports = result.dayReports ?? [];
+    const totalRows = dayReports.reduce((s, d) => s + (d.pages ?? []).reduce((a, p) => a + (p?.result?.ads_detail?.length ?? 0), 0), 0);
+    console.log(`[semi-ad] ✓ region=${region} days=${dayReports.length} 商品行=${totalRows}`, {
+      diag: result.diag,
+      sampleRow: dayReports[0]?.pages?.[0]?.result?.ads_detail?.[0] ?? null,
+    });
+    return { region, dayReports, diag: result.diag, completedAt: new Date().toISOString(), agent: agentDiag() };
+  } finally {
+    await cleanup();
+  }
+}
+
+// ── MAIN-world 注入:ads.temu.com 逐日 + 分页 fetch ads_report,raw 回传(不解析)──────
+// 实测:不需 x-phan-data / list_id / mallid(cookie 自带)。纯函数(序列化)。
+async function runSemiAdInTab(args) {
+  const { reportPath, windowDays, pageSize, maxPages, dayDelayMs } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const diag = { daysQueried: 0, pagesFetched: 0, rows: 0 };
+  let firstResp = null;
+  const post = async (body) => {
+    const resp = await fetch(reportPath, {
+      method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/json;charset=UTF-8' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${reportPath}`);
+    return resp.json();
+  };
+  const baseBody = {
+    ad_status: [], specific_query_info: '', sort_by: 0, sort_type: 'desc', source: 0,
+    need_del_status_ad: true, need_calculate_goods_summary: true, selected_roas_type: 1,
+    filter_cooperative_ad_type: 0, data_filter: null, ad_group_list: null,
+    selected_site_id_list: null, ad_phase: -1, columns_type: 21,
+  };
+  try {
+    const now = new Date();
+    const dayReports = [];
+    for (let d = 0; d < windowDays; d++) {
+      const day = new Date(now.getTime() - d * 86400000);
+      const y = day.getFullYear(), m = String(day.getMonth() + 1).padStart(2, '0'), dd = String(day.getDate()).padStart(2, '0');
+      const reportDate = `${y}-${m}-${dd}`;
+      const startMs = new Date(`${reportDate}T00:00:00`).getTime();
+      const endMs = startMs + 86400000 - 1;
+      const pages = [];
+      for (let p = 1; p <= maxPages; p++) {
+        const data = await post({ ...baseBody, start_time: startMs, end_time: endMs, page_number: p, page_size: pageSize });
+        if (!firstResp) firstResp = data;
+        pages.push(data);
+        diag.pagesFetched++;
+        diag.rows += data?.result?.ads_detail?.length ?? 0;
+        if (!data?.result?.has_more) break;
+      }
+      dayReports.push({ reportDate, pages });
+      diag.daysQueried++;
+      if (dayDelayMs) await wait(dayDelayMs);
+    }
+    return { ok: true, dayReports, diag };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
   }
 }
 
