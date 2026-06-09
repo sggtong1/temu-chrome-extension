@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-returns-20260608d';
+const AGENT_BUILD_ID   = 'agent-returns-20260608e';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1478,12 +1478,17 @@ async function dispatchReturns(task, signal) {
 async function runReturnsInTab(args) {
   const { listPath, detailPath, pageSize, maxPages, windowDays, detailDelayMs, mallId } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  // 详情逐单密集调用易触发 429,post 内置退避重试(读 Retry-After,否则 2s/4s/6s...)。
+  // ★ sellfox 同款:显式生成 anti-content(页面 WAF SDK window.rose),不靠"页面自动签"(不稳→20002/403)。
+  //   每请求 fresh。getAntiContent = new(window.rose(4))({serverTime:Date.now()}).messagePack()
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  // 429(HTTP)+ 20002(body 系统异常/请稍后重试)都退避重试(读 Retry-After,否则 2s/4s/6s...)。
   const post = async (path, body) => {
     for (let attempt = 0; attempt < 6; attempt++) {
       const resp = await fetch(path, {
         method: 'POST', credentials: 'include',
-        headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
         body: JSON.stringify(body),
       });
       if (resp.status === 429) {
@@ -1495,9 +1500,14 @@ async function runReturnsInTab(args) {
         const txt = await resp.text().catch(() => '');
         throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
       }
-      return resp.json();
+      const data = await resp.json();
+      if (data && data.success === false && (data.errorCode === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || ''))) {
+        await wait(2000 * (attempt + 1));
+        continue;
+      }
+      return data;
     }
-    throw new Error(`HTTP 429 ${path.slice(0, 40)}: 限流退避重试 6 次仍失败`);
+    throw new Error(`${path.slice(0, 40)}: 退避重试 6 次仍失败(限流/系统异常)`);
   };
   try {
     const now = Date.now();
