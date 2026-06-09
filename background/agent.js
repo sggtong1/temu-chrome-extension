@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-delivery-fee-20260609a';
+const AGENT_BUILD_ID   = 'agent-mall-multi-20260609a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -266,15 +266,31 @@ function inferRegionKeyForSSO(url) {
   return null;
 }
 
-// userId 5 分钟缓存,避免重复 fetch
-const _userIdCache = { value: null, mallId: null, expiresAt: 0 };
+// userId 5 分钟缓存,避免重复 fetch。mallIdList = 该账号所有授权 mall(全托+半托一起,
+// 同 Sellfox logInMallIdList)— MALL_MISMATCH 用它判"同账号多 mall"。
+const _userIdCache = { value: null, mallId: null, mallIdList: [], expiresAt: 0 };
+
+// 该账号是否拥有此 mallId(全托/半托属同账号 → captured session 可服务任意自有 mall)
+function accountOwnsMall(mallId) {
+  if (mallId == null) return false;
+  return (_userIdCache.mallIdList || []).map(String).includes(String(mallId));
+}
+// 把 headers 里所有 mallid 别名覆盖成指定 mallId(同账号切 mall 只需换 header)
+function overrideMallidHeader(headers, mallId) {
+  const out = { ...(headers || {}) };
+  for (const k of ['mallid', 'mallId', 'mall-id', 'mall_id', 'mall_id_cookies', 'mallid_cookies']) {
+    if (k in out) delete out[k];
+  }
+  out.mallid = String(mallId);
+  return out;
+}
 
 // ★ 在指定 tab(必须已在 kjmh 主域 page context 上)拿 userId + mallId。
 //   返回 { userId, mallId } 或 { error }。
 //   mallId 是 SSO URL 必需参数(Sellfox URL pattern: ?init=true&mallId&uId&validateid)。
 export async function fetchKjmhUserIdInTab(tabId, signal) {
   if (_userIdCache.value && _userIdCache.mallId && Date.now() < _userIdCache.expiresAt) {
-    return { userId: _userIdCache.value, mallId: _userIdCache.mallId, fromCache: true };
+    return { userId: _userIdCache.value, mallId: _userIdCache.mallId, mallIdList: _userIdCache.mallIdList, fromCache: true };
   }
   if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
 
@@ -295,9 +311,14 @@ export async function fetchKjmhUserIdInTab(tabId, signal) {
           if (!data?.success) return { error: `api-failed: ${data?.errorCode}/${data?.errorMsg}` };
           const userId = data?.result?.userId;
           if (userId == null) return { error: 'userid-missing' };
-          // mallId:companyList[0].malInfoList[0].mallId(跟 Sellfox 取法一致)
-          const mallId = data?.result?.companyList?.[0]?.malInfoList?.[0]?.mallId;
-          return { userId: String(userId), mallId: mallId != null ? String(mallId) : '' };
+          // ★ 账号所有授权 mall(全托+半托):companyList[].malInfoList[].mallId 全收
+          //   (之前只取 [0][0] → 多 mall 账号被当单 mall,全托任务 MALL_MISMATCH)。
+          const mallIdList = (data?.result?.companyList ?? [])
+            .flatMap((c) => (c?.malInfoList ?? []).map((m) => m?.mallId))
+            .filter((x) => x != null)
+            .map(String);
+          const mallId = mallIdList[0] ?? '';
+          return { userId: String(userId), mallId, mallIdList };
         } catch (e) {
           return { error: `fetch: ${e?.message}` };
         }
@@ -307,7 +328,9 @@ export async function fetchKjmhUserIdInTab(tabId, signal) {
     if (result.userId) {
       _userIdCache.value = result.userId;
       _userIdCache.mallId = result.mallId || '';
+      _userIdCache.mallIdList = Array.isArray(result.mallIdList) ? result.mallIdList : [];
       _userIdCache.expiresAt = Date.now() + 5 * 60_000;
+      console.log(`[Temu后台] userInfo: userId=${result.userId} 账号 mall 列表=[${_userIdCache.mallIdList.join(',')}]`);
     }
     return result;
   } catch (e) {
@@ -1621,14 +1644,19 @@ async function dispatchPriceConfirm(task, signal) {
     freshlyCaptured = true;
     // 暂不写缓存 — 先 MALL_MISMATCH 检测,避免缓存污染
   }
-  // MALL_MISMATCH 防御
+  // MALL_MISMATCH 防御(同账号多 mall 放行 — 见 dispatchViaHiddenTab 同款注释)
   const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
   if (capturedMall && String(capturedMall) !== String(mallId)) {
-    await invalidateSession(mallId);
-    throw Object.assign(
-      new Error(`MALL_MISMATCH: submit expects mallId=${mallId} but chrome is ${capturedMall}`),
-      { code: 'MALL_MISMATCH' },
-    );
+    if (accountOwnsMall(mallId)) {
+      session.headers = overrideMallidHeader(session.headers, mallId);
+      session.mallId = String(mallId);
+    } else {
+      await invalidateSession(mallId);
+      throw Object.assign(
+        new Error(`MALL_MISMATCH: submit expects mallId=${mallId} but chrome is ${capturedMall} (account malls=[${(_userIdCache.mallIdList || []).join(',')}])`),
+        { code: 'MALL_MISMATCH' },
+      );
+    }
   }
   if (freshlyCaptured) {
     await setCachedSession(mallId, session.headers, session.origin, session.mallId);
@@ -1728,13 +1756,18 @@ async function dispatchActivityEnroll(task, signal) {
   console.log(`[Temu后台] enroll always fresh-capture (detail-new) thematic=${payload.thematicId}`);
   if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
   const session = await captureSessionViaTab(captureSpec, payload, signal);
-  // MALL_MISMATCH 防御
+  // MALL_MISMATCH 防御(同账号多 mall 放行 — 见 dispatchViaHiddenTab 同款注释)
   const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
   if (capturedMall && String(capturedMall) !== String(mallId)) {
-    throw Object.assign(
-      new Error(`MALL_MISMATCH: enroll expects mallId=${mallId} but chrome is ${capturedMall}`),
-      { code: 'MALL_MISMATCH' },
-    );
+    if (accountOwnsMall(mallId)) {
+      session.headers = overrideMallidHeader(session.headers, mallId);
+      session.mallId = String(mallId);
+    } else {
+      throw Object.assign(
+        new Error(`MALL_MISMATCH: enroll expects mallId=${mallId} but chrome is ${capturedMall} (account malls=[${(_userIdCache.mallIdList || []).join(',')}])`),
+        { code: 'MALL_MISMATCH' },
+      );
+    }
   }
 
   // ★ Temu /enroll/submit body 结构(2026-05-19 真 cURL 实测 — DevTools 不显示 Payload,
@@ -2886,20 +2919,28 @@ async function dispatchViaHiddenTab(spec, payload, signal) {
       console.log(`三、session 缓存命中 mall=${mallId}`);
     }
 
-    // ★ 跨店数据污染防御:plugin 打开的 hidden tab 永远是 chrome 当前登录的 mallId,
-    // 跟 payload.mallId 不一致就 fail-fast,避免把 A 店的数据写进 B 店。
-    // (例如同 chrome profile 多个 ERP 店共享一个 Temu 登录账号时)
+    // ★ 跨账号污染防御 + 同账号多 mall 放行(全托/半托属同一 Temu 账号,共享 session):
+    //   - chrome 活跃 mall ≠ 任务 mall,但任务 mall 在账号授权列表里(accountOwnsMall)
+    //     → 同账号另一个 mall,合法。captured session 是账号级,覆盖 mallid header 即可服务它。
+    //   - 任务 mall 不在账号列表 → 真跨账号,fail-fast 避免把 A 账号数据写进 B 店。
+    //   (账号 mall 列表来自 userInfo companyList[].malInfoList[],auto-login 时填 _userIdCache)
     const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
     if (capturedMall && String(capturedMall) !== String(mallId)) {
-      // 把脏缓存清掉,下次任务来再 capture 一次(用户可能切登过来了)
-      await invalidateSession(mallId);
-      throw Object.assign(
-        new Error(`MALL_MISMATCH: task expects mallId=${mallId} but chrome is logged in as ${capturedMall}`),
-        { code: 'MALL_MISMATCH', expectedMallId: mallId, capturedMallId: capturedMall },
-      );
+      if (accountOwnsMall(mallId)) {
+        console.log(`三、同账号多 mall:chrome 活跃=${capturedMall},任务=${mallId}(账号列表含之)→ 覆盖 mallid header`);
+        session.headers = overrideMallidHeader(session.headers, mallId);
+        session.mallId = String(mallId);
+      } else {
+        await invalidateSession(mallId);
+        throw Object.assign(
+          new Error(`MALL_MISMATCH: task expects mallId=${mallId} but chrome is logged in as ${capturedMall} (account malls=[${(_userIdCache.mallIdList || []).join(',')}])`),
+          { code: 'MALL_MISMATCH', expectedMallId: mallId, capturedMallId: capturedMall },
+        );
+      }
     }
 
-    // 校验通过才写缓存(只在 fresh capture 时;HIT 路径不重复写)
+    // 校验通过才写缓存(只在 fresh capture 时;HIT 路径不重复写)。
+    // 注:多 mall 覆盖后 session.headers/mallId 已是任务 mall → 缓存 key=任务 mall,干净。
     if (freshlyCaptured) {
       await setCachedSession(mallId, session.headers, session.origin, session.mallId);
     }
