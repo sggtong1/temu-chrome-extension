@@ -1,12 +1,26 @@
 /**
  * recentOrderList pageItems + batchQueryByOrder 供货价 → Plan A 订单行契约。
  * - priceMap key = `${orderSn}::${productSkuId}`
- * - 运费(尾程)= parentOrderMap.waybillInfoList[].interlineInfoForAggregationInfo[].shippingFeeAmount 之和,
- *   按订单内各行 quantity 占比分摊。
+ * - 平台配送费(尾程+揽收)= parentOrderMap.waybillInfoList[].interlineInfoForAggregationInfo[].estimatedAmount
+ *   之和(字符串如 "$3.27",买家侧币种 USD),按订单内各行 quantity 占比分摊 → deliveryFeeCents。
+ *   注:一个订单可能有 2 段(COLLECTION_CHANNEL 揽收 + TAIL_CHANNEL 尾程)需相加。
  * - 单价取 activitySupplierPrice ?? supplierPrice(分,CNY)。
  * 字段须匹配 shop_sku_snapshot 标识(spec §3.1):productSkuId=platform_sku_id、
  * productSpuId=product_id(SPU 数字 id)、skuExtCode=货号。
  */
+
+// "$3.27" / "$1,234.56" → 327 / 123456(分)
+export function parseMoneyToCents(s) {
+  if (s == null) return 0;
+  const n = parseFloat(String(s).replace(/[^0-9.]/g, ''));
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+function detectCurrency(s) {
+  const t = String(s ?? '');
+  if (t.includes('€')) return 'EUR';
+  if (t.includes('£')) return 'GBP';
+  return 'USD';
+}
 
 export function buildPriceMap(resp) {
   const map = {};
@@ -40,10 +54,14 @@ export function transformOrderAmounts(pageItems, priceMap, region) {
     const orderTime = pm.parentOrderTimeStr ?? null;
     const orderStatus = pm.parentOrderStatus != null ? Number(pm.parentOrderStatus) : null;
 
-    let shippingTotal = 0;
+    // 平台配送费(尾程+揽收预估)— estimatedAmount 字符串求和;一单可能 2 段需相加
+    let deliveryTotal = 0;
+    let deliveryCurrency = null;
     for (const wb of (pm.waybillInfoList ?? [])) {
       for (const info of (wb.interlineInfoForAggregationInfo ?? [])) {
-        shippingTotal += Number(info.shippingFeeAmount ?? 0) || 0;
+        if (info.estimatedAmount == null) continue;
+        deliveryTotal += parseMoneyToCents(info.estimatedAmount);
+        if (!deliveryCurrency) deliveryCurrency = detectCurrency(info.estimatedAmount);
       }
     }
     const lines = item.orderList ?? [];
@@ -57,7 +75,7 @@ export function transformOrderAmounts(pageItems, priceMap, region) {
       const orderSn = String(line.orderSn ?? '');
       const quantity = Number(line.quantity) || 0;
       const price = priceMap[`${orderSn}::${productSkuId}`] ?? null;
-      const shippingFeeCents = totalQty > 0 ? Math.round(shippingTotal * (quantity / totalQty)) : 0;
+      const deliveryFeeCents = totalQty > 0 ? Math.round(deliveryTotal * (quantity / totalQty)) : 0;
       rows.push({
         region,
         parentOrderSn,
@@ -70,7 +88,9 @@ export function transformOrderAmounts(pageItems, priceMap, region) {
         unitPriceCents: price ? price.unitPriceCents : 0,
         priceType: price ? price.priceType : 'daily',
         currency: price ? price.currency : 'CNY',
-        shippingFeeCents,
+        shippingFeeCents: 0,                       // 运费(自发货)暂无源,保留 0
+        deliveryFeeCents,                          // 平台配送费(尾程+揽收预估,买家侧币种)
+        deliveryCurrency: deliveryCurrency ?? null,
         orderTime,
         orderStatus,
       });
