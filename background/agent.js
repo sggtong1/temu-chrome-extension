@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-amounts-20260608f';
+const AGENT_BUILD_ID   = 'agent-returns-20260608a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -57,6 +57,7 @@ const SUPPORTED_KINDS = [
   'scrape:flux-analysis',
   'scrape:flux-analysis-detail',
   'scrape:order-amounts',
+  'scrape:returns',
   'scrape:settlement',
   'submit:price-confirm',
   'submit:activity-enroll',
@@ -109,6 +110,15 @@ const REGION_TO_ORDER_PAGE_URL = {
   global: 'https://agentseller.temu.com/mmsos/orders.html',
   us:     'https://agentseller-us.temu.com/mmsos/orders.html',
   eu:     'https://agentseller-eu.temu.com/mmsos/orders.html',
+};
+
+// 退货退款:列表全区域同 path;详情按区分流(global=ReturnDetails,eu/us=RefundDetails)。
+// 宿主页复用 orders.html(WAF SDK 在,/garen 同源)。
+const RETURNS_LIST_PATH = '/garen/mms/afterSales/queryReturnAndRefundPaList';
+const REGION_TO_RETURNS_DETAIL_PATH = {
+  global: '/garen/mms/afterSales/queryReturnDetails',
+  eu:     '/garen/mms/afterSales/queryRefundDetails',
+  us:     '/garen/mms/afterSales/queryRefundDetails',
 };
 
 // ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
@@ -614,6 +624,7 @@ const KIND_LABELS = {
   'scrape:flux-analysis':      '流量分析',
   'scrape:flux-analysis-detail': '流量分析详情',
   'scrape:order-amounts':      '订单产品金额',
+  'scrape:returns':            '退货退款',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
   'submit:price-reject':       '核价驳回',
@@ -939,6 +950,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:flux-analysis':        return dispatchFluxAnalysis(task, signal);
     case 'scrape:flux-analysis-detail': return dispatchFluxAnalysisDetail(task, signal);
     case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
+    case 'scrape:returns':              return dispatchReturns(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
     case 'submit:activity-enroll':      return dispatchActivityEnroll(task, signal);
@@ -1389,6 +1401,114 @@ async function runOrdersInTab(args) {
       bqResponses.push(await post(supplierPricePath, { parentOrderSnList: sns.slice(i, i + batchSize) }));
     }
     return { ok: true, pageItems, bqResponses, orderCount: sns.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED' };
+  }
+}
+
+// ── scrape:returns 专用 wrapper ──────────────────────────────────
+// 任务语义:抓退货退款列表(afterSales 分页)+ 每条 afterSales 的详情。
+// 两段:先 list 分页收全 parentAfterSalesSn,再逐条 detail,raw 回传(不解析)。
+// payload: { mallId, region? }
+async function dispatchReturns(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:returns'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'global';
+  const pageUrl = REGION_TO_ORDER_PAGE_URL[region];   // 复用 orders 页(WAF SDK + 同源)
+  const detailPath = REGION_TO_RETURNS_DETAIL_PATH[region];
+  if (!pageUrl || !detailPath) throw Object.assign(new Error(`returns 配置缺 region=${region}`), { code: 'BAD_REGION' });
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 8 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[returns] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runReturnsInTab,
+      args: [{
+        listPath: RETURNS_LIST_PATH,
+        detailPath,
+        pageSize: 100,
+        maxPages: 20,
+        windowDays: 90,
+        detailDelayMs: 200,
+        mallId: String(payload.mallId),
+      }],
+    });
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+
+    return {
+      region,
+      listPages: result.listPages ?? [],
+      details: result.details ?? [],
+      afterSalesCount: result.afterSalesCount ?? 0,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// ── MAIN-world 注入:退货退款 list 分页 + detail 循环,raw 回传(不解析)──────
+// 纯函数(序列化)。同源相对 fetch,WAF SDK 自动签 anti-content;必带 mallid header。
+async function runReturnsInTab(args) {
+  const { listPath, detailPath, pageSize, maxPages, windowDays, detailDelayMs, mallId } = args;
+  const post = async (path, body) => {
+    const resp = await fetch(path, {
+      method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
+    }
+    return resp.json();
+  };
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    const now = Date.now();
+    const listBody = {
+      groupSearchType: 0, pageSize, reverseSignedTimeSearchType: 7000,
+      selectOnlyRefund: true, selectReturnRefund: true, timeSearchType: 5000,
+      startCreatedTime: now - windowDays * 86400000, endCreatedTime: now,
+    };
+    const listPages = [];
+    const seen = {};
+    const pairs = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post(listPath, { ...listBody, pageNumber: p });
+      listPages.push(data);
+      const rows = data?.result?.mmsPageVO?.data ?? [];
+      for (const row of rows) {
+        const pas = row?.parentAfterSalesSn;
+        if (pas && !seen[pas]) { seen[pas] = 1; pairs.push({ parentAfterSalesSn: String(pas), parentOrderSn: row?.parentOrderSn != null ? String(row.parentOrderSn) : null }); }
+      }
+      if (rows.length < pageSize) break;
+    }
+    const details = [];
+    for (const pr of pairs) {
+      details.push(await post(detailPath, { parentAfterSalesSn: pr.parentAfterSalesSn, parentOrderSn: pr.parentOrderSn }));
+      if (detailDelayMs) await wait(detailDelayMs);
+    }
+    return { ok: true, listPages, details, afterSalesCount: pairs.length };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED' };
   }
