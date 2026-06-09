@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-returns-20260608f';
+const AGENT_BUILD_ID   = 'agent-inject-loggable-20260608a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1343,18 +1343,27 @@ async function dispatchOrderAmounts(task, signal) {
         mallId: String(payload.mallId),   // ★ 必带 mallid header,否则 400020037 No Permission
       }],
     });
+    console.log(`[order-amounts] region=${region} 注入页面抓取(列表分页+供货价批量)...`);
     const result = await Promise.race([
       scriptPromise.then(([r]) => r?.result),
       new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
     ]);
 
     if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
-    if (!result.ok) throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    // ★ 注入函数跑页面 MAIN world,console 不进 SW → 它把 diag/样本 return 回来,这里结构化打日志
+    if (!result.ok) {
+      console.error(`[order-amounts] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstListResp: result.firstListResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
 
     const pageItems = result.pageItems ?? [];
     const priceMap = {};
     for (const r of (result.bqResponses ?? [])) Object.assign(priceMap, buildPriceMap(r));
     const rows = transformOrderAmounts(pageItems, priceMap, region);
+    console.log(
+      `[order-amounts] ✓ region=${region} orders=${pageItems.length} priceBatches=${(result.bqResponses ?? []).length} → ${rows.length} 订单行`,
+      { diag: result.diag, sampleOrder: pageItems[0] ?? null, samplePrice: result.bqResponses?.[0]?.result ?? null, sampleRow: rows[0] ?? null },
+    );
     return {
       rows,
       rawCount: pageItems.length,
@@ -1384,11 +1393,16 @@ async function runOrdersInTab(args) {
     }
     return resp.json();
   };
+  const diag = { pagesFetched: 0, totalItemNum: null, ordersCollected: 0, priceBatches: 0 };
+  let firstListResp = null;
   try {
     // 1) recentOrderList 分页
     const pageItems = [];
     for (let p = 1; p <= maxPages; p++) {
       const data = await post(listPath, { ...listBody, pageNumber: p, pageSize });
+      if (!firstListResp) firstListResp = data;
+      diag.pagesFetched++;
+      diag.totalItemNum = data?.result?.totalItemNum ?? diag.totalItemNum;
       const items = data?.result?.pageItems ?? [];
       pageItems.push(...items);
       if (items.length < pageSize) break;
@@ -1400,14 +1414,16 @@ async function runOrdersInTab(args) {
       const sn = it && it.parentOrderMap && it.parentOrderMap.parentOrderSn;
       if (sn && !seen[sn]) { seen[sn] = 1; sns.push(String(sn)); }
     }
+    diag.ordersCollected = sns.length;
     // 3) batchQueryByOrder 批量
     const bqResponses = [];
     for (let i = 0; i < sns.length; i += batchSize) {
       bqResponses.push(await post(supplierPricePath, { parentOrderSnList: sns.slice(i, i + batchSize) }));
+      diag.priceBatches++;
     }
-    return { ok: true, pageItems, bqResponses, orderCount: sns.length };
+    return { ok: true, pageItems, bqResponses, orderCount: sns.length, diag };
   } catch (e) {
-    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED' };
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstListResp };
   }
 }
 
