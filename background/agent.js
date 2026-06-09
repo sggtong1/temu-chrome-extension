@@ -722,10 +722,16 @@ const KIND_TO_FETCH_SPEC = {
   //   - body 不传 activityThematicId,只传 activityType + rowCount + addSite
   //   - Temu server 自动返该活动所有可报商品
   'scrape:activity-products': {
-    pageUrl: (payload) => payload.activityThematicId
-      ? `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${payload.activityType}&thematicId=${payload.activityThematicId}`
-      : `https://agentseller.temu.com/activity/marketing-activity`,
+    // 2026-06-09 capture-timeout 根因修复(同 scrape:order-amounts 教训):
+    //   detail-new 页冷加载**不主动发** /enroll/scroll/match(需先选站点 / 点查询),
+    //   旧 spec 直接捕 scroll/match → 每个任务 capture 超时 → session 永不入缓存 →
+    //   每个任务都新开 tab(tab 风暴)。
+    //   修法:pageUrl 改主页(冷加载必发 /enroll/activity/list,与 scrape:marketing-activity 同),
+    //   captureApiUrlPattern 捕 activity/list 拿同 mallId 跨 path 通用 headers,
+    //   真正的 scroll/match fetch 仍在 SW 用这组 headers 跑(body 带 thematicId,服务端无状态)。
+    pageUrl: (_payload) => 'https://agentseller.temu.com/activity/marketing-activity',
     apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/scroll/match',
+    captureApiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
     method: 'POST',
     paginationMode: 'scroll',
     cursorOutPath: 'result.searchScrollContext',
