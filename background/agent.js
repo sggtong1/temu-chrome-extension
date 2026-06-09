@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-returns-20260608e';
+const AGENT_BUILD_ID   = 'agent-returns-20260608f';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1453,18 +1453,32 @@ async function dispatchReturns(task, signal) {
         mallId: String(payload.mallId),
       }],
     });
+    console.log(`[returns] region=${region} 注入页面抓取(列表分页+详情逐单,可能 1-2min)...`);
     const result = await Promise.race([
       scriptPromise.then(([r]) => r?.result),
       new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
     ]);
     if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
-    if (!result.ok) throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
-
+    // ★ 注入函数跑在页面 MAIN world,console 不进 SW → 它把诊断/样本 return 回来,这里结构化打日志
+    if (!result.ok) {
+      console.error(`[returns] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstListResp: result.firstListResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const listPages = result.listPages ?? [];
+    const details = result.details ?? [];
+    console.log(
+      `[returns] ✓ region=${region} listPages=${listPages.length} details=${details.length} cases=${result.afterSalesCount}`,
+      {
+        diag: result.diag,
+        listTotalCount: listPages[0]?.result?.mmsPageVO?.totalCount ?? null,
+        sampleListRow: listPages[0]?.result?.mmsPageVO?.data?.[0] ?? null,
+        sampleDetailItem: details[0]?.result?.afterSalesItemVOList?.[0] ?? null,
+      },
+    );
     return {
-      region,
-      listPages: result.listPages ?? [],
-      details: result.details ?? [],
+      region, listPages, details,
       afterSalesCount: result.afterSalesCount ?? 0,
+      diag: result.diag,
       completedAt: new Date().toISOString(),
       agent: agentDiag(),
     };
@@ -1509,6 +1523,8 @@ async function runReturnsInTab(args) {
     }
     throw new Error(`${path.slice(0, 40)}: 退避重试 6 次仍失败(限流/系统异常)`);
   };
+  const diag = { pagesFetched: 0, listTotalCount: null, casesCollected: 0, detailsFetched: 0 };
+  let firstListResp = null;
   try {
     const now = Date.now();
     const listBody = {
@@ -1521,7 +1537,10 @@ async function runReturnsInTab(args) {
     const pairs = [];
     for (let p = 1; p <= maxPages; p++) {
       const data = await post(listPath, { ...listBody, pageNumber: p });
+      if (!firstListResp) firstListResp = data;          // 失败时回传给 SW 看错误码
       listPages.push(data);
+      diag.pagesFetched++;
+      diag.listTotalCount = data?.result?.mmsPageVO?.totalCount ?? diag.listTotalCount;
       const rows = data?.result?.mmsPageVO?.data ?? [];
       for (const row of rows) {
         const pas = row?.parentAfterSalesSn;
@@ -1529,14 +1548,16 @@ async function runReturnsInTab(args) {
       }
       if (rows.length < pageSize) break;
     }
+    diag.casesCollected = pairs.length;
     const details = [];
     for (const pr of pairs) {
       details.push(await post(detailPath, { parentAfterSalesSn: pr.parentAfterSalesSn, parentOrderSn: pr.parentOrderSn }));
+      diag.detailsFetched++;
       if (detailDelayMs) await wait(detailDelayMs);
     }
-    return { ok: true, listPages, details, afterSalesCount: pairs.length };
+    return { ok: true, listPages, details, afterSalesCount: pairs.length, diag };
   } catch (e) {
-    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED' };
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstListResp };
   }
 }
 
