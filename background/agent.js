@@ -42,7 +42,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semi-ad-20260609a';
+const AGENT_BUILD_ID   = 'agent-order-anti-20260610a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1339,8 +1339,9 @@ async function dispatchFluxAnalysisDetail(task, signal) {
 // payload: { mallId, region? }
 // ★ 方式改为 sellfox 同款(2026-06-08):不"开页面等 XHR 捕 session"(orders SPA 冷加载不发任何
 //   可捕请求),而是开 orders 页 → 等加载 → executeScript 注入 MAIN-world 函数,在页面上下文里
-//   直接 fetch recentOrderList + batchQueryByOrder(页面 WAF SDK 自动签 anti-content,等价 temuPostNew)。
-//   返回 raw pageItems + batchQueryByOrder 响应,join 在 SW 里做(transform 不能注入页面)。
+//   直接 fetch recentOrderList + batchQueryByOrder。
+//   anti-content:显式 window.rose 现签 + 退避重试(2026-06-10 修,见 runOrdersInTab 注释;
+//   原"靠页面自动签"偶发 403)。返回 raw pageItems + batchQueryByOrder 响应,join 在 SW 里做。
 async function dispatchOrderAmounts(task, signal) {
   const payload = task.payload ?? {};
   if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:order-amounts'), { code: 'BAD_PAYLOAD' });
@@ -1413,21 +1414,43 @@ async function dispatchOrderAmounts(task, signal) {
   }
 }
 
-// ── MAIN-world 注入函数:在 orders 页上下文里 fetch(WAF SDK 自动签 anti-content)──────
+// ── MAIN-world 注入函数:在 orders 页上下文里 fetch ───────────────────────────────────
 // 必须是纯函数(executeScript 序列化),不能引用外部变量/import。同源相对路径 fetch。
+// ★ 2026-06-10:从"靠页面 WAF SDK 自动签 anti-content"改为显式 window.rose 现签 + 退避重试
+//   (与 runReturnsInTab 同款)。旧写法只带 mallid、不带 anti-content、且无重试 → 自动签偶发失败
+//   时直接 HTTP 403 死(实测 recentOrderList 403)。显式签 + 重试后等价 returns 的稳健链路。
 async function runOrdersInTab(args) {
   const { listPath, supplierPricePath, listBody, pageSize, maxPages, batchSize, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 显式生成 anti-content(页面 WAF SDK window.rose),每请求 fresh;失败回空串(让后端按缺签报错→重试)
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  // 429(HTTP)+ 20002(body 系统异常/请稍后重试)都退避重试(读 Retry-After,否则 2s/4s/6s...)。
   const post = async (path, body) => {
-    const resp = await fetch(path, {
-      method: 'POST', credentials: 'include',
-      headers: { 'content-type': 'application/json', 'mallid': String(mallId) },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => '');
-      throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(path, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} ${path.slice(0, 40)}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false && (data.errorCode === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || ''))) {
+        await wait(2000 * (attempt + 1));
+        continue;
+      }
+      return data;
     }
-    return resp.json();
+    throw new Error(`${path.slice(0, 40)}: 退避重试 6 次仍失败(限流/系统异常)`);
   };
   const diag = { pagesFetched: 0, totalItemNum: null, ordersCollected: 0, priceBatches: 0 };
   let firstListResp = null;
