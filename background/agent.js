@@ -31,7 +31,8 @@ import {
   transformFluxAnalysisDetailResponse,
   transformLifecycleResponse,
 } from './transform/sku_transform.js';
-import { transformOrderAmounts, buildPriceMap } from './transform/order_transform.js';
+// order_transform.js 已退役(2026-06-11 薄插件化):订单行解析迁至 ERP 后端
+// AgentResultIngestor.parseOrderAmounts,插件只回传 raw pageItems+bqResponses。
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -42,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-order-anti-20260610a';
+const AGENT_BUILD_ID   = 'agent-logistics-bill-20260611a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -58,6 +59,7 @@ const SUPPORTED_KINDS = [
   'scrape:flux-analysis-detail',
   'scrape:order-amounts',
   'scrape:returns',
+  'scrape:logistics-bill',
   'scrape:semi-ad',
   'scrape:settlement',
   'submit:price-confirm',
@@ -658,6 +660,7 @@ const KIND_LABELS = {
   'scrape:flux-analysis-detail': '流量分析详情',
   'scrape:order-amounts':      '订单产品金额',
   'scrape:returns':            '退货退款',
+  'scrape:logistics-bill':     '物流对账账单',
   'scrape:semi-ad':            '半托广告数据',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
@@ -991,6 +994,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:flux-analysis-detail': return dispatchFluxAnalysisDetail(task, signal);
     case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
     case 'scrape:returns':              return dispatchReturns(task, signal);
+    case 'scrape:logistics-bill':       return dispatchLogisticsBill(task, signal);
     case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
@@ -1393,16 +1397,17 @@ async function dispatchOrderAmounts(task, signal) {
       throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
     }
 
+    // ★ 薄插件(2026-06-11):不再本地 transform,raw 原样回传,解析统一在后端
+    //   (AgentResultIngestor.parseOrderAmounts,含订单行 join + waybillInfoList 包裹提取)
     const pageItems = result.pageItems ?? [];
-    const priceMap = {};
-    for (const r of (result.bqResponses ?? [])) Object.assign(priceMap, buildPriceMap(r));
-    const rows = transformOrderAmounts(pageItems, priceMap, region);
+    const bqResponses = result.bqResponses ?? [];
     console.log(
-      `[order-amounts] ✓ region=${region} orders=${pageItems.length} priceBatches=${(result.bqResponses ?? []).length} → ${rows.length} 订单行`,
-      { diag: result.diag, sampleOrder: pageItems[0] ?? null, samplePrice: result.bqResponses?.[0]?.result ?? null, sampleRow: rows[0] ?? null },
+      `[order-amounts] ✓ region=${region} orders=${pageItems.length} priceBatches=${bqResponses.length}(raw 回传,后端解析)`,
+      { diag: result.diag, sampleOrder: pageItems[0] ?? null, samplePrice: bqResponses[0]?.result ?? null },
     );
     return {
-      rows,
+      pageItems,
+      bqResponses,
       rawCount: pageItems.length,
       orderCount: result.orderCount ?? 0,
       region,
@@ -1987,6 +1992,162 @@ async function dispatchActivityEnroll(task, signal) {
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
+}
+
+// ── scrape:logistics-bill 专用 wrapper ───────────────────────────────
+// 任务语义:抓半托物流对账账单(发货面单费等包裹级费用)。raw 回传,后端
+// parseLogisticsBillRows 解析(薄插件)。endpoint/字段 2026-06-11 实抓确认:
+//   POST /api/udp/yuanbenchu/seller_central/recon_bill/list
+//   body { settleStatus, deductTimeBegin/End(epoch ms), rowCount, scrollContext }
+//   响应 result.sellerBillList[]:reconciliationId/packageSn/waybillSn/statusDesc/
+//   priceCurrencyFormat{amountYuan,currencyCode}/deductTime/serviceProviderName
+// payload: { mallId, region?, dateFrom?, dateTo?, settleStatus? }
+const REGION_TO_LOGISTICS_PAGE_URL = {
+  global: 'https://agentseller.temu.com/labor/stml-logistics',
+  us:     'https://agentseller-us.temu.com/labor/stml-logistics',
+  eu:     'https://agentseller-eu.temu.com/labor/stml-logistics',
+};
+const LOGISTICS_BILL_LIST_PATH = '/api/udp/yuanbenchu/seller_central/recon_bill/list';
+
+async function dispatchLogisticsBill(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:logistics-bill'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'us';
+  const pageUrl = REGION_TO_LOGISTICS_PAGE_URL[region];
+  if (!pageUrl) throw Object.assign(new Error(`logistics page not configured for region=${region}`), { code: 'BAD_REGION' });
+
+  // deductTime 窗口:dateFrom/dateTo(YYYY-MM-DD,北京日)→ epoch ms;缺省近 15 天
+  // ★ 显式 +08:00 后缀(SW/页面 new Date 无 TZ 串按 UTC 解析的老坑,R2 时区约定)
+  const now = Date.now();
+  const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 15 * 86_400_000;
+  const deductTimeEnd   = payload.dateTo   ? new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime() : now;
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[logistics-bill] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 物流对账页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);   // 让页面 WAF SDK 就绪
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runLogisticsBillInTab,
+      args: [{
+        listPath: LOGISTICS_BILL_LIST_PATH,
+        settleStatus: payload.settleStatus ?? 1,   // 实抓页面默认 1;其他值未验证
+        deductTimeBegin, deductTimeEnd,
+        rowCount: 100,
+        maxPages: 50,
+        mallId: String(payload.mallId),
+      }],
+    });
+    console.log(`[logistics-bill] region=${region} 注入页面抓取(scrollContext 翻页)...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    // ★ 注入函数跑页面 MAIN world,console 不进 SW → diag/样本 return 回来这里结构化打日志
+    if (!result.ok) {
+      console.error(`[logistics-bill] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const pages = result.pages ?? [];
+    console.log(
+      `[logistics-bill] ✓ region=${region} pages=${pages.length} bills=${result.billCount}`,
+      { diag: result.diag, sampleBill: pages[0]?.result?.sellerBillList?.[0] ?? null },
+    );
+    return {
+      region, pages,
+      billCount: result.billCount ?? 0,
+      diag: result.diag,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// MAIN-world 注入:物流对账列表分页(scrollContext 游标)。纯函数,不引外部变量。
+// anti-content 策略:先裸发(订单页实测 kirogi 不带签也通);403/40001 再尝试
+// window.rose 显式签(若页面有);429/20002 退避重试。diag.signMode 记录最终生效模式。
+async function runLogisticsBillInTab(args) {
+  const { listPath, settleStatus, deductTimeBegin, deductTimeEnd, rowCount, maxPages, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let signMode = 'none';   // none | rose
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
+      if (signMode === 'rose') {
+        const ac = genAntiContent();
+        if (ac) headers['anti-content'] = ac;
+      }
+      const resp = await fetch(listPath, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(body) });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (resp.status === 403) {
+        // 裸发被 WAF 拒 → 升级显式签再试
+        if (signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP 403: ${txt.slice(0, 120)}`);
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false) {
+        const code = Number(data.errorCode);
+        if (code === 40001 && signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
+          await wait(2000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
+      }
+      return data;
+    }
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+  };
+  const diag = { pagesFetched: 0, billsCollected: 0, signMode, lastScrollContext: null };
+  let firstResp = null;
+  try {
+    const pages = [];
+    let scrollContext = null;
+    let billCount = 0;
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post({ settleStatus, deductTimeBegin, deductTimeEnd, rowCount, scrollContext });
+      if (!firstResp) firstResp = data;
+      diag.pagesFetched++;
+      const list = data?.result?.sellerBillList ?? [];
+      billCount += list.length;
+      pages.push(data);
+      scrollContext = data?.result?.scrollContext ?? data?.result?.nextScrollContext ?? null;
+      diag.lastScrollContext = scrollContext ? String(scrollContext).slice(0, 40) : null;
+      if (list.length < rowCount || !scrollContext) break;
+    }
+    diag.billsCollected = billCount;
+    diag.signMode = signMode;
+    return { ok: true, pages, billCount, diag };
+  } catch (e) {
+    diag.signMode = signMode;
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+  }
 }
 
 // ── scrape:settlement 专用 wrapper(2026-05-24c: 多 variant)──────────
