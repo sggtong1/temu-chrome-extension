@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-reverse-logistics-20260611a';
+const AGENT_BUILD_ID   = 'agent-violation-20260611a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -62,6 +62,7 @@ const SUPPORTED_KINDS = [
   'scrape:logistics-bill',
   'scrape:reverse-logistics-bill',
   'scrape:settle-flow',
+  'scrape:violation-appeals',
   'scrape:semi-ad',
   'scrape:settlement',
   'submit:price-confirm',
@@ -681,6 +682,7 @@ const KIND_LABELS = {
   'scrape:logistics-bill':     '物流对账账单',
   'scrape:reverse-logistics-bill': '退货面单费',
   'scrape:settle-flow':        '结算流水(已到账)',
+  'scrape:violation-appeals':  '违规罚款',
   'scrape:semi-ad':            '半托广告数据',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
@@ -1017,6 +1019,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:logistics-bill':       return dispatchLogisticsBill(task, signal);
     case 'scrape:reverse-logistics-bill': return dispatchReverseLogisticsBill(task, signal);
     case 'scrape:settle-flow':          return dispatchSettleFlow(task, signal);
+    case 'scrape:violation-appeals':    return dispatchViolationAppeals(task, signal);
     case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
@@ -2169,6 +2172,138 @@ async function runLogisticsBillInTab(args) {
     return { ok: true, pages, billCount, diag };
   } catch (e) {
     diag.signMode = signMode;
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+  }
+}
+
+// ── scrape:violation-appeals 专用 wrapper ────────────────────────────
+// 任务语义:抓半托违规申诉中心(违规 + 预估罚款)。raw 回传,后端
+// parseViolationAppeals 解析。endpoint/字段 2026-06-11 实抓确认:
+//   POST /reaper/violation/appeal/queryMallAppeals
+//   body { targetType:1, pageNo, pageSize },响应 result.total + result.pageData[]
+//   行:violationAppealSn/violationType/appealStatus/informTime/
+//   mallAttribute{exceptedAmount(预估串),actualAmount(实扣,多 null),orderSnList,parentOrderSnList}
+// ⚠️ reaper 域用 x-phan-data(非 anti-content)。注入式裸发先试(页面对 reaper 接口
+//    很可能自动注入 x-phan-data);失败看 firstResp 再定。
+// payload: { mallId, region? }
+const REGION_TO_VIOLATION_PAGE_URL = {
+  global: 'https://agentseller.temu.com/mmsos/mall-appeal.html?targetType=1',
+  us:     'https://agentseller-us.temu.com/mmsos/mall-appeal.html?targetType=1',
+  eu:     'https://agentseller-eu.temu.com/mmsos/mall-appeal.html?targetType=1',
+};
+const VIOLATION_LIST_PATH = '/reaper/violation/appeal/queryMallAppeals';
+
+async function dispatchViolationAppeals(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:violation-appeals'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'us';
+  const pageUrl = REGION_TO_VIOLATION_PAGE_URL[region];
+  if (!pageUrl) throw Object.assign(new Error(`violation page not configured for region=${region}`), { code: 'BAD_REGION' });
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[violation-appeals] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 违规申诉页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2500, signal);   // reaper 页 WAF/x-phan SDK 就绪
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runViolationAppealsInTab,
+      args: [{
+        listPath: VIOLATION_LIST_PATH,
+        targetType: 1,
+        pageSize: 50,
+        maxPages: 50,
+        mallId: String(payload.mallId),
+      }],
+    });
+    console.log(`[violation-appeals] region=${region} 注入页面抓取(pageNo 翻页)...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[violation-appeals] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const pages = result.pages ?? [];
+    console.log(
+      `[violation-appeals] ✓ region=${region} pages=${pages.length} violations=${result.violationCount}`,
+      { diag: result.diag, sampleRow: pages[0]?.result?.pageData?.[0] ?? null },
+    );
+    return {
+      region, pages,
+      violationCount: result.violationCount ?? 0,
+      diag: result.diag,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// MAIN-world 注入:违规申诉列表 pageNo 翻页。纯函数。
+// reaper 域用 x-phan-data 自动签(页面 fetch 上下文),我们只手动带 mallid;
+// 若被拒(403/40001)记 firstResp 观察(本接口签名机制不同于 anti-content)。
+async function runViolationAppealsInTab(args) {
+  const { listPath, targetType, pageSize, maxPages, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
+      const resp = await fetch(listPath, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(body) });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false) {
+        const code = Number(data.errorCode);
+        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
+          await wait(2000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
+      }
+      return data;
+    }
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+  };
+  const diag = { pagesFetched: 0, violationsCollected: 0, total: null };
+  let firstResp = null;
+  try {
+    const pages = [];
+    let violationCount = 0;
+    for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
+      const data = await post({ targetType, pageNo, pageSize });
+      if (!firstResp) firstResp = data;
+      diag.pagesFetched++;
+      if (diag.total == null) diag.total = data?.result?.total ?? null;
+      const list = data?.result?.pageData ?? [];
+      violationCount += list.length;
+      pages.push(data);
+      if (list.length < pageSize) break;
+      await wait(300);
+    }
+    diag.violationsCollected = violationCount;
+    return { ok: true, pages, violationCount, diag };
+  } catch (e) {
     return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
   }
 }
