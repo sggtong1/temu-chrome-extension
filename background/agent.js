@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-orders-maxpages-20260611b';
+const AGENT_BUILD_ID   = 'agent-mall-target-20260611c';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -480,7 +480,10 @@ export async function runSsoForRegion(tabId, regionKey, userId, signal, mallId =
 // 单个 task 流程(captureSessionViaTab 等)中检测到 login redirect 调用。
 // 用调用方提供的 tab(原本在 agentseller 子域上),先 nav 它去 kjmh main 拿 userId + 建 referrer,
 // 然后 nav SSO URL → 等完成。调用方负责 SSO 完事后把 tab navigate 回任务页。
-export async function attemptAutoLogin(tabId, signal) {
+// targetMallId(2026-06-11 加,T-SettleMall):任务目标店。不传 → 老行为(列表[0],
+// 多 mall 账号会随 userInfo 列表顺序漂移选错店 → 子域 SSO 落错店 → 导出失败/数据归错店)。
+// 传了 → 精确选目标店;不在账号列表 → fail-fast。
+export async function attemptAutoLogin(tabId, signal, targetMallId = '') {
   const actions = [];
   const log = (msg) => console.log(`[Temu授权] ${msg}`);
   const step = (msg) => { actions.push(msg); log(`  ${msg}`); };
@@ -537,7 +540,20 @@ export async function attemptAutoLogin(tabId, signal) {
     userId = res.userId;
     step(`✓ 获取 userId = ${userId}${res.mallId ? ` | mallId = ${res.mallId}` : ''}`);
   }
-  const mallId = _userIdCache.mallId || '';
+  // ★ mall 选择:目标店优先(在账号列表内才放行);不传 target 用列表[0](老行为,兜底)
+  const list = _userIdCache.mallIdList ?? [];
+  let mallId;
+  if (targetMallId) {
+    if (!list.includes(String(targetMallId))) {
+      step(`✗ 目标店 ${targetMallId} 不在账号 mall 列表 [${list.join(',')}] — MALL_MISMATCH`);
+      return { ok: false, reason: 'target-mall-not-in-account', actions };
+    }
+    mallId = String(targetMallId);
+    step(`✓ 选定目标店 mallId = ${mallId}(任务指定)`);
+  } else {
+    mallId = _userIdCache.mallId || '';
+    if (list.length > 1) step(`⚠ 未指定目标店,默认列表[0]=${mallId}(多 mall 账号有选错风险)`);
+  }
 
   // 3. 跑 SSO
   const r = await runSsoForRegion(tabId, regionKey, userId, signal, mallId);
@@ -2386,7 +2402,7 @@ async function runOneSettlementVariant(variant, { beginTime, endTime, mallId }, 
     let t = await chrome.tabs.get(tabId);
     if (t?.url && isLoginFlowUrl(t.url)) {
       console.log(`[Temu后台] settlement[${variant.name}]: login redirect (${t.url.slice(0,120)}) → 尝试自动登陆`);
-      const loginResult = await attemptAutoLogin(tabId, signal);
+      const loginResult = await attemptAutoLogin(tabId, signal, String(mallId ?? ''));
       console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
       if (!loginResult.ok) {
         await updateLoginHealth(variant.region, 'expired', `auto-login failed: ${loginResult.reason}`);
@@ -2488,7 +2504,7 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
     let t = await chrome.tabs.get(tabId);
     if (t?.url && isLoginFlowUrl(t.url)) {
       console.log(`[Temu后台] diag[${variant.name}]: login redirect (${t.url.slice(0,120)}) → 尝试自动登陆`);
-      const loginResult = await attemptAutoLogin(tabId, signal);
+      const loginResult = await attemptAutoLogin(tabId, signal, String(mallId ?? ''));
       console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
       if (!loginResult.ok) {
         await updateLoginHealth(variant.region, 'expired', `auto-login failed: ${loginResult.reason}`);
@@ -3369,7 +3385,7 @@ async function captureSessionViaTab(spec, payload, signal) {
       } catch {}
       if (currentUrl && isLoginFlowUrl(currentUrl) && captureRegionKey) {
         console.log(`[Temu后台] capture[${spec.kind}]: login redirect (${currentUrl.slice(0,120)}) → 尝试自动登陆`);
-        const loginResult = await attemptAutoLogin(tabId, signal);
+        const loginResult = await attemptAutoLogin(tabId, signal, String(payload?.mallId ?? ''));
         console.log(`[Temu后台] auto-login result: ok=${loginResult.ok} actions=${JSON.stringify(loginResult.actions)}`);
         if (loginResult.ok) {
           try {
