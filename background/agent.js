@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-violation-20260611a';
+const AGENT_BUILD_ID   = 'agent-violation-20260611b';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2212,7 +2212,7 @@ async function dispatchViolationAppeals(task, signal) {
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
     const t = await chrome.tabs.get(tabId);
     if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 违规申诉页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
-    await sleep(2500, signal);   // reaper 页 WAF/x-phan SDK 就绪
+    await sleep(3500, signal);   // reaper 页 WAF/x-phan SDK 就绪(注入函数内再轮询等 fetch 包装)
 
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
@@ -2259,6 +2259,14 @@ async function dispatchViolationAppeals(task, signal) {
 async function runViolationAppealsInTab(args) {
   const { listPath, targetType, pageSize, maxPages, mallId } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // ★ reaper 域 x-phan-data 由页面包装的 fetch 自动注入(实测 console 手调 success)。
+  //   裸 native fetch → 40001 Invalid Login State。注入可能早于页面包装完成 →
+  //   先轮询等 window.fetch 变成非 native(已被页面 SDK 包装)再发,最多等 ~25s。
+  let fetchWrapped = false;
+  for (let i = 0; i < 50; i++) {
+    if (!/native code/.test('' + window.fetch)) { fetchWrapped = true; break; }
+    await wait(500);
+  }
   const post = async (body) => {
     for (let attempt = 0; attempt < 6; attempt++) {
       const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
@@ -2270,22 +2278,25 @@ async function runViolationAppealsInTab(args) {
       }
       if (!resp.ok) {
         const txt = await resp.text().catch(() => '');
+        // 403/40001 多为 x-phan-data 未就绪(fetch 包装延迟)→ 退避重试
+        if ((resp.status === 403 || resp.status === 401) && attempt < 5) { await wait(1500 * (attempt + 1)); continue; }
         throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
       }
       const data = await resp.json();
       if (data && data.success === false) {
         const code = Number(data.errorCode);
-        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
-          await wait(2000 * (attempt + 1));
+        // 40001 Invalid Login State = x-phan-data 缺/未就绪;20002 系统异常 → 退避重试
+        if (code === 40001 || code === 20002 || /系统异常|请稍后|刷新重试|login/i.test(data.errorMsg || '')) {
+          await wait(1500 * (attempt + 1));
           continue;
         }
         throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
       }
       return data;
     }
-    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(40001/限流/系统异常)`);
   };
-  const diag = { pagesFetched: 0, violationsCollected: 0, total: null };
+  const diag = { pagesFetched: 0, violationsCollected: 0, total: null, fetchWrapped };
   let firstResp = null;
   try {
     const pages = [];
