@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-logistics-bill-20260611a';
+const AGENT_BUILD_ID   = 'agent-orders-maxpages-20260611b';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -1379,7 +1379,8 @@ async function dispatchOrderAmounts(task, signal) {
         supplierPricePath: ORDER_SUPPLIER_PRICE_PATH,
         listBody: { fulfillmentMode: null, queryType: 0, sortType: 1, timeZone: 'UTC+8', sellerNoteLabelList: [] },
         pageSize: 50,
-        maxPages: 20,        // 上限 ~1000 单(近期),避免一次扫全量
+        // 默认 20 页 ≈ 1000 单(近期);payload.maxPages 可调(一次性深采历史回填用,上限 200)
+        maxPages: Math.min(Number(payload.maxPages) || 20, 200),
         batchSize: 50,
         mallId: String(payload.mallId),   // ★ 必带 mallid header,否则 400020037 No Permission
       }],
