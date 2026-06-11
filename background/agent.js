@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-settle-flow-20260611a';
+const AGENT_BUILD_ID   = 'agent-reverse-logistics-20260611a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -60,6 +60,7 @@ const SUPPORTED_KINDS = [
   'scrape:order-amounts',
   'scrape:returns',
   'scrape:logistics-bill',
+  'scrape:reverse-logistics-bill',
   'scrape:settle-flow',
   'scrape:semi-ad',
   'scrape:settlement',
@@ -678,6 +679,7 @@ const KIND_LABELS = {
   'scrape:order-amounts':      '订单产品金额',
   'scrape:returns':            '退货退款',
   'scrape:logistics-bill':     '物流对账账单',
+  'scrape:reverse-logistics-bill': '退货面单费',
   'scrape:settle-flow':        '结算流水(已到账)',
   'scrape:semi-ad':            '半托广告数据',
   'scrape:settlement':         '结算账单',
@@ -1013,6 +1015,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
     case 'scrape:returns':              return dispatchReturns(task, signal);
     case 'scrape:logistics-bill':       return dispatchLogisticsBill(task, signal);
+    case 'scrape:reverse-logistics-bill': return dispatchReverseLogisticsBill(task, signal);
     case 'scrape:settle-flow':          return dispatchSettleFlow(task, signal);
     case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
@@ -2160,6 +2163,158 @@ async function runLogisticsBillInTab(args) {
       scrollContext = data?.result?.scrollContext ?? data?.result?.nextScrollContext ?? null;
       diag.lastScrollContext = scrollContext ? String(scrollContext).slice(0, 40) : null;
       if (list.length < rowCount || !scrollContext) break;
+    }
+    diag.billsCollected = billCount;
+    diag.signMode = signMode;
+    return { ok: true, pages, billCount, diag };
+  } catch (e) {
+    diag.signMode = signMode;
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+  }
+}
+
+// ── scrape:reverse-logistics-bill 专用 wrapper ───────────────────────
+// 任务语义:抓半托退货面单费(逆向物流对账,商家承担)。raw 回传,后端
+// parseReverseLogisticsBillRows 解析(薄插件)。endpoint/字段 2026-06-11 实抓确认:
+//   POST /portal/udp/sunce/seller/center/bill/list
+//   body { deductTimeBegin/End(epoch ms), pageSize, scrollContextString }
+//   响应 result.list[]:reconciliationId/parentOrderSn(直给)/wayBillSn/deductType/
+//   totalCharge(元串)/deductTime/sign/remark(退货面单费（全段）)
+// payload: { mallId, region?, dateFrom?, dateTo? }
+const REGION_TO_REVERSE_LOGISTICS_PAGE_URL = {
+  global: 'https://agentseller.temu.com/labor/stml-reverse-logistics',
+  us:     'https://agentseller-us.temu.com/labor/stml-reverse-logistics',
+  eu:     'https://agentseller-eu.temu.com/labor/stml-reverse-logistics',
+};
+const REVERSE_LOGISTICS_BILL_LIST_PATH = '/portal/udp/sunce/seller/center/bill/list';
+
+async function dispatchReverseLogisticsBill(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:reverse-logistics-bill'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'us';
+  const pageUrl = REGION_TO_REVERSE_LOGISTICS_PAGE_URL[region];
+  if (!pageUrl) throw Object.assign(new Error(`reverse logistics page not configured for region=${region}`), { code: 'BAD_REGION' });
+
+  // deductTime 窗口:dateFrom/dateTo(YYYY-MM-DD,北京日)→ epoch ms;缺省近 15 天
+  const now = Date.now();
+  const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 15 * 86_400_000;
+  const deductTimeEnd   = payload.dateTo   ? new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime() : now;
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[reverse-logistics-bill] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 逆向物流页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runReverseLogisticsBillInTab,
+      args: [{
+        listPath: REVERSE_LOGISTICS_BILL_LIST_PATH,
+        deductTimeBegin, deductTimeEnd,
+        pageSize: 100,
+        maxPages: 50,
+        mallId: String(payload.mallId),
+      }],
+    });
+    console.log(`[reverse-logistics-bill] region=${region} 注入页面抓取(scrollContextString 翻页)...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[reverse-logistics-bill] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const pages = result.pages ?? [];
+    console.log(
+      `[reverse-logistics-bill] ✓ region=${region} pages=${pages.length} bills=${result.billCount}`,
+      { diag: result.diag, sampleBill: pages[0]?.result?.list?.[0] ?? null },
+    );
+    return {
+      region, pages,
+      billCount: result.billCount ?? 0,
+      diag: result.diag,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// MAIN-world 注入:逆向物流对账列表分页(scrollContextString 游标)。纯函数。
+// anti-content 策略同正向 logistics-bill:先裸发,403/40001 升级 window.rose 显式签,
+// 429/20002 退避重试。
+async function runReverseLogisticsBillInTab(args) {
+  const { listPath, deductTimeBegin, deductTimeEnd, pageSize, maxPages, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let signMode = 'none';
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
+      if (signMode === 'rose') {
+        const ac = genAntiContent();
+        if (ac) headers['anti-content'] = ac;
+      }
+      const resp = await fetch(listPath, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(body) });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (resp.status === 403) {
+        if (signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP 403: ${txt.slice(0, 120)}`);
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false) {
+        const code = Number(data.errorCode);
+        if (code === 40001 && signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
+          await wait(2000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
+      }
+      return data;
+    }
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+  };
+  const diag = { pagesFetched: 0, billsCollected: 0, signMode, lastScrollContext: null };
+  let firstResp = null;
+  try {
+    const pages = [];
+    let scrollContextString = null;
+    let billCount = 0;
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post({ deductTimeBegin, deductTimeEnd, pageSize, scrollContextString });
+      if (!firstResp) firstResp = data;
+      diag.pagesFetched++;
+      const list = data?.result?.list ?? [];
+      billCount += list.length;
+      pages.push(data);
+      scrollContextString = data?.result?.scrollContextString ?? data?.result?.scrollContext ?? data?.result?.nextScrollContext ?? null;
+      diag.lastScrollContext = scrollContextString ? String(scrollContextString).slice(0, 40) : null;
+      if (list.length < pageSize || !scrollContextString) break;
     }
     diag.billsCollected = billCount;
     diag.signMode = signMode;
