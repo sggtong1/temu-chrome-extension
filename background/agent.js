@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-settle-mallmatch-20260611d';
+const AGENT_BUILD_ID   = 'agent-settle-nocache-20260611e';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2778,15 +2778,13 @@ function runSettlementInTab(args) {
           status: r?.status,
           keys: r ? Object.keys(r).slice(0, 20) : [],
         }));
-        exportRow = existing.find(r => r?.status === 2 && matchesRangeStrict(r, endTime) && mallMatches(r));
-        if (exportRow) {
-          skippedCreate = true;
-          console.log(`[runSettlementInTab] Step1 复用 ready row id=${exportRow.id} mallId=${rowMallId(exportRow)}(=本店 ${mallId})`);
-        } else {
-          // 诊断:有日期匹配但归属别店的 row?(账号级 history 串店的直接证据)
-          const wrongMall = existing.filter(r => r?.status === 2 && matchesRangeStrict(r, endTime) && !mallMatches(r));
-          if (wrongMall.length) console.log(`[runSettlementInTab] Step1 跳过 ${wrongMall.length} 条同期但别店的 row(mallId=${wrongMall.map(rowMallId).join(',')}),改走 create`);
-        }
+        // ★ 2026-06-11(T-SettleMall 真因):禁用历史复用 —— export history 是账号级,
+        //   一条旧 row 的 agentSellerExportParams 可能指向别店/账号级旧导出,顶层无 mallId、
+        //   params.mallId 标签也不可信(实测复用拿到全托数据)。用户实证:只有重新点导出
+        //   (走 create)才生成当前店纯净报表。结算低频,强制 create,绝不复用历史。
+        exportRow = null;
+        const sameDate = existing.filter(r => r?.status === 2 && matchesRangeStrict(r, endTime));
+        if (sameDate.length) console.log(`[runSettlementInTab] history 有 ${sameDate.length} 条同期 ready row(不复用,强制 create;mallId 标签=${sameDate.map(rowMallId).join(',')})`);
       } catch (e) {
         step1Diag.fetchError = String(e?.message ?? e);
       }
@@ -2894,22 +2892,14 @@ function runSettlementInTab(args) {
         return all;
       }
 
+      // ★ 2026-06-11:4 次微调 endTime 都被服务端 dedup → 不再复用历史 row(账号级,会污染),
+      //   直接 fail。结算同范围 30min 内已导过,过会儿重试 / 改日期 / 手动导出后重采。
       if (dupCreate) {
-        try {
-          const allRows = await fetchAllHistoryPages();
-          if (allRows[0]) {
-            console.log(`[runSettlementInTab] dupCreate 共 ${allRows.length} 条 history row,row[0] keys=${Object.keys(allRows[0]).join(',')}`);
-          }
-          exportRow = allRows.find(r => r?.status === 2 && matchesRange(r) && mallMatches(r));
-          if (exportRow) {
-            console.log(`[runSettlementInTab] dupCreate ✓ 匹配 row id=${exportRow.id} mallId=${rowMallId(exportRow)} begin=${exportRow.searchExportTimeBegin} end=${exportRow.searchExportTimeEnd}`);
-          } else {
-            const sample = allRows.slice(0, 3).map(r => `(${r.searchExportTimeBegin}→${r.searchExportTimeEnd} status=${r.status})`).join(', ');
-            console.warn(`[runSettlementInTab] dupCreate ✗ 共扫 ${allRows.length} 条没找匹配,开头 3 条:${sample}`);
-          }
-        } catch (e) {
-          console.warn(`[runSettlementInTab] dupCreate fetch fail: ${e.message}`);
-        }
+        return {
+          ok: false, phase: 'create', code: 'EXPORT_DUP_GIVEUP',
+          error: `同范围 30min 内已导出过(服务端 dedup),不复用历史(防账号级/别店污染)。30min 后重试 / 改日期范围 / 在 Temu UI 手动导出后再采`,
+          step1Diag,
+        };
       }
       if (!exportRow) {
         const polls = dupCreate ? Math.min(6, maxPolls) : maxPolls;
