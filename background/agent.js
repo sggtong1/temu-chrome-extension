@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-mall-target-20260611c';
+const AGENT_BUILD_ID   = 'agent-settle-mallmatch-20260611d';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2734,6 +2734,14 @@ function runSettlementInTab(args) {
       };
       const beginDay = epochToCnDay(beginTime);
       const endDay   = epochToCnDay(endTime);
+      // ★ 归属校验(2026-06-11,T-SettleMall 真因):export history 是 kjmh **账号级**
+      //   (一份历史含账号下所有店的导出),row 顶层无 mallId,但 agentSellerExportParams
+      //   解码后有 mallId。不校验归属 → 按日期复用别店旧导出 → 下成别店数据(半托撞全托)。
+      //   解不出 mallId 一律不复用(保守:宁可重新 create 也不复用归属不明的 row)。
+      const rowMallId = (row) => {
+        try { return String(JSON.parse(atob(row.agentSellerExportParams)).mallId ?? ''); } catch { return ''; }
+      };
+      const mallMatches = (row) => { const m = rowMallId(row); return m !== '' && m === String(mallId); };
       const matchesRangeStrict = (row, _endT) => row
         && epochToCnDay(row.searchExportTimeBegin) === beginDay
         && epochToCnDay(row.searchExportTimeEnd)   === endDay;
@@ -2770,9 +2778,14 @@ function runSettlementInTab(args) {
           status: r?.status,
           keys: r ? Object.keys(r).slice(0, 20) : [],
         }));
-        exportRow = existing.find(r => r?.status === 2 && matchesRangeStrict(r, endTime));
+        exportRow = existing.find(r => r?.status === 2 && matchesRangeStrict(r, endTime) && mallMatches(r));
         if (exportRow) {
           skippedCreate = true;
+          console.log(`[runSettlementInTab] Step1 复用 ready row id=${exportRow.id} mallId=${rowMallId(exportRow)}(=本店 ${mallId})`);
+        } else {
+          // 诊断:有日期匹配但归属别店的 row?(账号级 history 串店的直接证据)
+          const wrongMall = existing.filter(r => r?.status === 2 && matchesRangeStrict(r, endTime) && !mallMatches(r));
+          if (wrongMall.length) console.log(`[runSettlementInTab] Step1 跳过 ${wrongMall.length} 条同期但别店的 row(mallId=${wrongMall.map(rowMallId).join(',')}),改走 create`);
         }
       } catch (e) {
         step1Diag.fetchError = String(e?.message ?? e);
@@ -2887,9 +2900,9 @@ function runSettlementInTab(args) {
           if (allRows[0]) {
             console.log(`[runSettlementInTab] dupCreate 共 ${allRows.length} 条 history row,row[0] keys=${Object.keys(allRows[0]).join(',')}`);
           }
-          exportRow = allRows.find(r => r?.status === 2 && matchesRange(r));
+          exportRow = allRows.find(r => r?.status === 2 && matchesRange(r) && mallMatches(r));
           if (exportRow) {
-            console.log(`[runSettlementInTab] dupCreate ✓ 匹配 row id=${exportRow.id} begin=${exportRow.searchExportTimeBegin} end=${exportRow.searchExportTimeEnd}`);
+            console.log(`[runSettlementInTab] dupCreate ✓ 匹配 row id=${exportRow.id} mallId=${rowMallId(exportRow)} begin=${exportRow.searchExportTimeBegin} end=${exportRow.searchExportTimeEnd}`);
           } else {
             const sample = allRows.slice(0, 3).map(r => `(${r.searchExportTimeBegin}→${r.searchExportTimeEnd} status=${r.status})`).join(', ');
             console.warn(`[runSettlementInTab] dupCreate ✗ 共扫 ${allRows.length} 条没找匹配,开头 3 条:${sample}`);
@@ -2906,8 +2919,8 @@ function runSettlementInTab(args) {
           try {
             const all = await fetchAllHistoryPages();
             const candidates = dupCreate
-              ? all.filter(matchesRange)
-              : all.filter(r => r?.createTime > beforeMaxCreate && matchesRange(r));
+              ? all.filter(r => matchesRange(r) && mallMatches(r))
+              : all.filter(r => r?.createTime > beforeMaxCreate && matchesRange(r) && mallMatches(r));
             if (candidates.length === 0) continue;
             const ready = candidates.find(r => r?.status === 2);
             if (ready) { exportRow = ready; break; }
