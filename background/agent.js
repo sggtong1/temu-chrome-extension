@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-settle-nocache-20260611e';
+const AGENT_BUILD_ID   = 'agent-settle-flow-20260611a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -60,6 +60,7 @@ const SUPPORTED_KINDS = [
   'scrape:order-amounts',
   'scrape:returns',
   'scrape:logistics-bill',
+  'scrape:settle-flow',
   'scrape:semi-ad',
   'scrape:settlement',
   'submit:price-confirm',
@@ -677,6 +678,7 @@ const KIND_LABELS = {
   'scrape:order-amounts':      '订单产品金额',
   'scrape:returns':            '退货退款',
   'scrape:logistics-bill':     '物流对账账单',
+  'scrape:settle-flow':        '结算流水(已到账)',
   'scrape:semi-ad':            '半托广告数据',
   'scrape:settlement':         '结算账单',
   'submit:price-confirm':      '核价确认',
@@ -1011,6 +1013,7 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:order-amounts':        return dispatchOrderAmounts(task, signal);
     case 'scrape:returns':              return dispatchReturns(task, signal);
     case 'scrape:logistics-bill':       return dispatchLogisticsBill(task, signal);
+    case 'scrape:settle-flow':          return dispatchSettleFlow(task, signal);
     case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
     case 'scrape:settlement':           return dispatchSettlement(task, signal, onProgress);
     case 'submit:price-confirm':        return dispatchPriceConfirm(task, signal);
@@ -2161,6 +2164,164 @@ async function runLogisticsBillInTab(args) {
     diag.billsCollected = billCount;
     diag.signMode = signMode;
     return { ok: true, pages, billCount, diag };
+  } catch (e) {
+    diag.signMode = signMode;
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+  }
+}
+
+// ── scrape:settle-flow 专用 wrapper ──────────────────────────────────
+// 任务语义:抓半托「已到账」结算流水明细(销售回款/运费回款逐笔)。raw 回传,
+// 后端 parseSettleFlowRows 解析(薄插件)。endpoint/字段 2026-06-11 实抓确认:
+//   POST /api/xiaowenhou/settle-flow/sm/settled/o/page-query
+//   body { pageSize:20, pageNum, orderCreateTimeStart/End(YYYY-MM-DD,北京日) }
+//   响应 result.dataList[]:settleId/batchSn/parentOrderSn/transSn/type/
+//   settleAmount{value,sign}/skuItems[{id,number,extCode,supplyPrice}]/accountTime
+// payload: { mallId, region?, dateFrom?, dateTo? }
+const REGION_TO_SETTLE_PAGE_URL = {
+  global: 'https://agentseller.temu.com/labor/settle',
+  us:     'https://agentseller-us.temu.com/labor/settle',
+  eu:     'https://agentseller-eu.temu.com/labor/settle',
+};
+const SETTLE_FLOW_LIST_PATH = '/api/xiaowenhou/settle-flow/sm/settled/o/page-query';
+
+async function dispatchSettleFlow(task, signal) {
+  const payload = task.payload ?? {};
+  if (!payload.mallId) throw Object.assign(new Error('payload.mallId missing for scrape:settle-flow'), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'us';
+  const pageUrl = REGION_TO_SETTLE_PAGE_URL[region];
+  if (!pageUrl) throw Object.assign(new Error(`settle page not configured for region=${region}`), { code: 'BAD_REGION' });
+
+  // 窗口=订单创建北京日(YYYY-MM-DD 直传 body);缺省近 45 天(覆盖结算滞后)
+  const fmtBjDate = (ms) => {
+    const d = new Date(ms + 8 * 3600_000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  };
+  const now = Date.now();
+  const orderCreateTimeStart = payload.dateFrom ?? fmtBjDate(now - 45 * 86_400_000);
+  const orderCreateTimeEnd   = payload.dateTo   ?? fmtBjDate(now);
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[settle-flow] tab ${tabId} → ${pageUrl}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 结算页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);   // 让页面 WAF SDK 就绪
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runSettleFlowInTab,
+      args: [{
+        listPath: SETTLE_FLOW_LIST_PATH,
+        orderCreateTimeStart, orderCreateTimeEnd,
+        pageSize: 20,            // 仅验证 20;改大需实测
+        maxPages: 200,
+        mallId: String(payload.mallId),
+      }],
+    });
+    console.log(`[settle-flow] region=${region} 注入页面抓取(pageNum 翻页)window=${orderCreateTimeStart}~${orderCreateTimeEnd} ...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    // ★ 注入函数跑页面 MAIN world,console 不进 SW → diag/样本 return 回来这里结构化打日志
+    if (!result.ok) {
+      console.error(`[settle-flow] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    const pages = result.pages ?? [];
+    console.log(
+      `[settle-flow] ✓ region=${region} pages=${pages.length} lines=${result.lineCount}`,
+      { diag: result.diag, sampleLine: pages[0]?.result?.dataList?.[0] ?? null },
+    );
+    return {
+      region, pages,
+      lineCount: result.lineCount ?? 0,
+      window: { orderCreateTimeStart, orderCreateTimeEnd },
+      diag: result.diag,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+// MAIN-world 注入:结算流水明细 pageNum 翻页。纯函数,不引外部变量。
+// anti-content 策略同 logistics-bill:先裸发,403/40001 升级 window.rose 显式签,
+// 429/20002 退避重试。diag.signMode 记录最终生效模式。
+async function runSettleFlowInTab(args) {
+  const { listPath, orderCreateTimeStart, orderCreateTimeEnd, pageSize, maxPages, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let signMode = 'none';   // none | rose
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
+      if (signMode === 'rose') {
+        const ac = genAntiContent();
+        if (ac) headers['anti-content'] = ac;
+      }
+      const resp = await fetch(listPath, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(body) });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (resp.status === 403) {
+        // 裸发被 WAF 拒 → 升级显式签再试
+        if (signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP 403: ${txt.slice(0, 120)}`);
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false) {
+        const code = Number(data.errorCode);
+        if (code === 40001 && signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
+          await wait(2000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
+      }
+      return data;
+    }
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+  };
+  const diag = { pagesFetched: 0, linesCollected: 0, total: null, signMode };
+  let firstResp = null;
+  try {
+    const pages = [];
+    let lineCount = 0;
+    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+      const data = await post({ pageSize, pageNum, orderCreateTimeStart, orderCreateTimeEnd });
+      if (!firstResp) firstResp = data;
+      diag.pagesFetched++;
+      if (diag.total == null) diag.total = data?.result?.total ?? null;
+      const list = data?.result?.dataList ?? [];
+      lineCount += list.length;
+      pages.push(data);
+      if (list.length < pageSize) break;
+      await wait(300);   // 节流,71 页 ≈ 25s
+    }
+    diag.linesCollected = lineCount;
+    diag.signMode = signMode;
+    return { ok: true, pages, lineCount, diag };
   } catch (e) {
     diag.signMode = signMode;
     return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
