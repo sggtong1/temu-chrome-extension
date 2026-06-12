@@ -244,7 +244,8 @@ export function transformActivityEnrollments(rawItems) {
     // Temu /enroll/list 顶层 productId/SPU 路径(SPU 是 act.goodsId,SPU 图 act.pictureUrl)
     const platformProductId = act.goodsId != null ? String(act.goodsId) : null;
     const productPictureUrl = act.pictureUrl ?? act.imageUrl ?? null;
-    const targetActivityStock = act.activityStock ?? act.targetActivityStock ?? null;
+    const targetActivityStock = act.activityStock ?? act.targetActivityStock ?? null;       // 提报库存
+    const remainingActivityStock = act.remainingActivityStock ?? null;                       // 剩余库存
 
     // SKU 级展开:skcList[].skuList[] 是常态,productSkuIds 是 legacy fallback
     let skuCount = 0;
@@ -265,6 +266,7 @@ export function transformActivityEnrollments(rawItems) {
             platformProductId,
             platformSkcId,
             targetActivityStock,
+            remainingActivityStock,
             skuTitle: skuTitleBase,
             // 给 ingester 顺手传商品图/属性,供 enrollment.skuMeta 直接落,不必再 join ActivityProduct
             skuMeta: {
@@ -302,6 +304,8 @@ export function transformActivityEnrollments(rawItems) {
           platformSessionId,
           platformEnrollId,
           platformSkuId: String(id),
+          targetActivityStock,
+          remainingActivityStock,
           skuTitle: skuTitleBase,
           activityPriceCents: act.activityPrice != null ? Math.round(act.activityPrice) : null,
           currency: act.currency ?? null,
