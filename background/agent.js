@@ -594,15 +594,18 @@ async function updateLoginHealth(regionKey, status, reason = null) {
 // ── 配置 ───────────────────────────────────────────────────────────
 // 固定 ERP 网关:走 Tailscale,客户机在同一 tailnet 内开箱即用。
 // storage 里有非空值才覆盖(本机 dev 可 chrome.storage.local.set 切到 LAN)。
-const DEFAULT_API_URL = 'http://100.114.163.62:4000';
+const DEFAULT_API_URL = 'https://duoshouapi.868818.xyz'; // 香港 VPS 反代 → Tailscale → mini
 const DEFAULT_TOKEN = 'demo'; // TODO: 权限系统上线后改每客户独立 token
+// 反代鉴权头:VPS nginx 校验 X-ERP-Key,必须与 popup 同值、与 setup-vps.sh --gate-secret 同值。
+const DEFAULT_ERP_GATE_KEY = 'f79063b32edd405e547f5ff2e3174ecddf14132feff78e50';
 
 async function getCfg() {
   const c = await chrome.storage.local.get([
-    'apiUrl', 'token', 'pluginInstanceId', 'selectedShopIds',
+    'apiUrl', 'token', 'pluginInstanceId', 'selectedShopIds', 'erpGateKey',
   ]);
   if (!c.apiUrl) c.apiUrl = DEFAULT_API_URL;
   if (!c.token) c.token = DEFAULT_TOKEN;
+  if (!c.erpGateKey) c.erpGateKey = DEFAULT_ERP_GATE_KEY;
   return c;
 }
 
@@ -617,13 +620,14 @@ async function ensurePluginInstanceId() {
 
 // ── HTTP 辅助 ─────────────────────────────────────────────────────
 async function api(path, opts = {}) {
-  const { apiUrl, token } = await getCfg();
+  const { apiUrl, token, erpGateKey } = await getCfg();
   if (!apiUrl) throw new Error('agent-not-configured');
   const res = await fetch(apiUrl + path, {
     method: opts.method || 'GET',
     headers: {
       'Authorization': `Bearer ${token || 'demo'}`,
       'Content-Type': 'application/json',
+      ...(erpGateKey ? { 'X-ERP-Key': erpGateKey } : {}),
       ...(opts.headers || {}),
     },
     body: opts.body,

@@ -22,17 +22,19 @@ const CHROME = (typeof chrome !== 'undefined' && chrome.runtime) ? chrome : {
 // ──────────────────────────────────────────────────────────────
 $('#version').textContent = CHROME.runtime.getManifest().version;
 
-// 固定 ERP 网关：走 Tailscale，客户机在同一 tailnet 内开箱即用,无需手填。
-// 仅当 storage 里存有非空值时才覆盖(留给本机 dev 切到 LAN:
-//   chrome.storage.local.set({ apiUrl: 'http://192.168.1.6:4000' }) )。
-const DEFAULT_API_URL = 'http://100.114.163.62:4000';
+// 固定 ERP 网关:公网域名(香港 VPS 反代 → Tailscale → mini),客户机开箱即用,无需手填。
+// 仅当 storage 里存有非空值时才覆盖(本机 dev 可 chrome.storage.local.set({apiUrl:'http://192.168.1.6:4000'}))。
+const DEFAULT_API_URL = 'https://duoshouapi.868818.xyz';
 const DEFAULT_TOKEN = 'demo'; // TODO: 权限系统上线后改每客户独立 token
+// 反代鉴权头:VPS nginx 校验 X-ERP-Key,必须与 setup-vps.sh 的 --gate-secret 同值。
+const DEFAULT_ERP_GATE_KEY = 'f79063b32edd405e547f5ff2e3174ecddf14132feff78e50';
 
 let cfg = { apiUrl: DEFAULT_API_URL, token: DEFAULT_TOKEN, custody: 'full' };
-CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpAccountPhone'], (saved) => {
+CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpAccountPhone', 'erpGateKey'], (saved) => {
   cfg = { ...cfg, ...saved };
   if (!cfg.apiUrl) cfg.apiUrl = DEFAULT_API_URL;   // 历史空串也回退
   if (!cfg.token) cfg.token = DEFAULT_TOKEN;
+  if (!cfg.erpGateKey) cfg.erpGateKey = DEFAULT_ERP_GATE_KEY;
   // 本客户端负责的店铺范围(per-browser scope):null=全部,数组=仅这些。
   // 由账号匹配自动写入;SW claim 读同一个 key 过滤派单。
   selectedShops = Array.isArray(saved.selectedShopIds) ? saved.selectedShopIds : null;
@@ -52,15 +54,28 @@ CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpA
 // ──────────────────────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
   if (!cfg.apiUrl) throw new Error('未配置 ERP API');
-  const res = await fetch(cfg.apiUrl + path, {
-    method: opts.method || 'GET',
-    headers: {
-      'Authorization': `Bearer ${cfg.token || 'demo'}`,
-      'Content-Type': 'application/json',
-      ...(opts.headers || {}),
-    },
-    body: opts.body,
-  });
+  // 超时:连不上 ERP 时让 fetch 快速失败(8s),而不是无限挂起 → 上层能进失败 UI。
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 8000);
+  let res;
+  try {
+    res = await fetch(cfg.apiUrl + path, {
+      method: opts.method || 'GET',
+      headers: {
+        'Authorization': `Bearer ${cfg.token || 'demo'}`,
+        'Content-Type': 'application/json',
+        ...(cfg.erpGateKey ? { 'X-ERP-Key': cfg.erpGateKey } : {}),
+        ...(opts.headers || {}),
+      },
+      body: opts.body,
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (e?.name === 'AbortError') throw new Error(`连接 ERP 超时(${cfg.apiUrl})`);
+    throw new Error(`连不上 ERP(${cfg.apiUrl}): ${e?.message || e}`);
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status}: ${t.slice(0, 160)}`);
@@ -1110,7 +1125,10 @@ async function pingServer() {
   }
   try {
     const r = await fetch(`${cfg.apiUrl}/api/health`, {
-      headers: cfg.token ? { Authorization: `Bearer ${cfg.token}` } : {},
+      headers: {
+        ...(cfg.token ? { Authorization: `Bearer ${cfg.token}` } : {}),
+        ...(cfg.erpGateKey ? { 'X-ERP-Key': cfg.erpGateKey } : {}),
+      },
     });
     if (r.ok) {
       dot.className = 'dot dot-ok';
