@@ -22,9 +22,17 @@ const CHROME = (typeof chrome !== 'undefined' && chrome.runtime) ? chrome : {
 // ──────────────────────────────────────────────────────────────
 $('#version').textContent = CHROME.runtime.getManifest().version;
 
-let cfg = { apiUrl: '', token: '', custody: 'full' };
+// 固定 ERP 网关：走 Tailscale，客户机在同一 tailnet 内开箱即用,无需手填。
+// 仅当 storage 里存有非空值时才覆盖(留给本机 dev 切到 LAN:
+//   chrome.storage.local.set({ apiUrl: 'http://192.168.1.6:4000' }) )。
+const DEFAULT_API_URL = 'http://100.114.163.62:4000';
+const DEFAULT_TOKEN = 'demo'; // TODO: 权限系统上线后改每客户独立 token
+
+let cfg = { apiUrl: DEFAULT_API_URL, token: DEFAULT_TOKEN, custody: 'full' };
 CHROME.storage.local.get(['apiUrl', 'token', 'custody'], (saved) => {
   cfg = { ...cfg, ...saved };
+  if (!cfg.apiUrl) cfg.apiUrl = DEFAULT_API_URL;   // 历史空串也回退
+  if (!cfg.token) cfg.token = DEFAULT_TOKEN;
   if (cfg.custody) selectCustody(cfg.custody);
   refreshAccountChip();
   pingServer();

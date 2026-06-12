@@ -19,7 +19,10 @@
 
       <div class="account-switch">
         <span class="account-name" id="account-name">未绑定 ERP</span>
-        <button class="account-caret" id="btn-switch-account" title="切换账号">▾</button>
+        <!-- ERP 网关已固定为 Tailscale 默认值,配置入口对客户隐藏。
+             dev 需切地址时:DevTools 控制台 chrome.storage.local.set({apiUrl:'...'}),
+             或临时去掉下面的 hidden 重开此 modal。 -->
+        <button class="account-caret" id="btn-switch-account" title="切换账号" hidden>▾</button>
       </div>
 
       <div class="topbar-right">

@@ -592,10 +592,18 @@ async function updateLoginHealth(regionKey, status, reason = null) {
 }
 
 // ── 配置 ───────────────────────────────────────────────────────────
+// 固定 ERP 网关:走 Tailscale,客户机在同一 tailnet 内开箱即用。
+// storage 里有非空值才覆盖(本机 dev 可 chrome.storage.local.set 切到 LAN)。
+const DEFAULT_API_URL = 'http://100.114.163.62:4000';
+const DEFAULT_TOKEN = 'demo'; // TODO: 权限系统上线后改每客户独立 token
+
 async function getCfg() {
-  return await chrome.storage.local.get([
+  const c = await chrome.storage.local.get([
     'apiUrl', 'token', 'pluginInstanceId', 'selectedShopIds',
   ]);
+  if (!c.apiUrl) c.apiUrl = DEFAULT_API_URL;
+  if (!c.token) c.token = DEFAULT_TOKEN;
+  return c;
 }
 
 async function ensurePluginInstanceId() {
