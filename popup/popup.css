@@ -743,3 +743,42 @@ html, body {
 .domain-status.partial { background: #fef3c7; color: #b45309; }
 .domain-status.off { background: #f3f4f6; color: #6b7280; }
 .domain-status.error { background: #fee2e2; color: #b91c1c; }
+
+/* ============ 引导:账号匹配 + 区域授权 ============ */
+.onboard-view { padding: 26px 20px 10px; }
+.onboard-steps { list-style: none; margin: 0 auto; padding: 0; max-width: 300px; }
+.onboard-step { display: flex; align-items: center; gap: 12px; position: relative; padding: 9px 0; }
+.onboard-step:not(:last-child)::after {
+  content: ''; position: absolute; left: 12px; top: 33px; bottom: -9px;
+  width: 2px; background: #e5e7eb; z-index: 0;
+}
+.onboard-icon {
+  flex: none; width: 26px; height: 26px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 600; border: 2px solid #d1d5db;
+  color: #9ca3af; background: #fff; box-sizing: border-box; z-index: 1;
+}
+.onboard-icon.running {
+  border-color: #3b82f6; border-top-color: transparent;
+  font-size: 0; animation: spin 1s linear infinite;
+}
+.onboard-icon.ok { border-color: #22c55e; background: #22c55e; color: #fff; font-size: 0; }
+.onboard-icon.ok::after { content: '✓'; font-size: 14px; }
+.onboard-icon.fail { border-color: #ef4444; background: #ef4444; color: #fff; font-size: 0; }
+.onboard-icon.fail::after { content: '✕'; font-size: 12px; }
+.onboard-label { font-size: 14px; color: #374151; }
+.onboard-icon.ok ~ .onboard-label { color: #16a34a; }
+.onboard-icon.fail ~ .onboard-label { color: #b91c1c; font-weight: 600; }
+
+.onboard-tip { margin: 20px auto 0; max-width: 380px; font-size: 12px; color: #6b7280; line-height: 1.95; }
+.onboard-tip .tip-title { font-weight: 600; color: #374151; font-size: 13px; margin-bottom: 7px; }
+.onboard-tip .tip-title.err { color: #b91c1c; }
+.onboard-tip a { color: #3b82f6; text-decoration: none; }
+.onboard-tip a:hover { text-decoration: underline; }
+.onboard-tip .tip-emph { color: #f59e0b; }
+.onboard-tip .onboard-refresh {
+  display: inline-block; margin-top: 12px; padding: 6px 16px; cursor: pointer;
+  border: 1px solid #3b82f6; border-radius: 6px; background: #3b82f6; color: #fff;
+  font-size: 13px;
+}
+.onboard-tip .onboard-refresh:hover { background: #2563eb; }

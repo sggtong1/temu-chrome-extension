@@ -51,11 +51,6 @@
         <!-- 操作栏 -->
         <div class="action-bar">
           <button class="btn-primary" id="btn-fetch">手动获取</button>
-          <button class="shop-picker-btn" id="shop-picker-btn">
-            <span class="shop-picker-icon">🏪</span>
-            <span id="shop-picker-label">全部店铺</span>
-            <span class="shop-picker-caret">▾</span>
-          </button>
           <span class="hint-inline">
             <span class="hint-dot" id="online-dot" title="登录健康度"></span>
             <a class="hint-link" id="link-online">在线情况</a>
@@ -69,21 +64,28 @@
           <button class="icon-btn" id="btn-refresh" title="刷新">↻</button>
         </div>
 
-        <!-- 店铺选择下拉 -->
-        <div class="shop-picker-pop" id="shop-picker-pop" hidden>
-          <header class="shop-picker-head">
-            <label class="check-row">
-              <input type="checkbox" id="shop-pick-all" />
-              <span>全选</span>
-            </label>
-            <span class="hint">共 <b id="shop-pick-count">0</b> 个店铺</span>
-          </header>
-          <div class="shop-picker-body" id="shop-picker-body"></div>
-          <footer class="shop-picker-foot">
-            <button class="btn-secondary" id="shop-pick-cancel">取消</button>
-            <button class="btn-primary" id="shop-pick-apply">应用</button>
-          </footer>
-        </div>
+        <!-- ============ 引导:账号匹配 + 区域授权(开屏 gating)============ -->
+        <section class="onboard-view" id="onboard-view" hidden>
+          <ol class="onboard-steps">
+            <li class="onboard-step" data-step="match">
+              <span class="onboard-icon idle" id="oi-match">1</span>
+              <span class="onboard-label" id="ol-match">账号匹配中…</span>
+            </li>
+            <li class="onboard-step" data-step="global">
+              <span class="onboard-icon idle" id="oi-global">2</span>
+              <span class="onboard-label" id="ol-global">等待全球授权</span>
+            </li>
+            <li class="onboard-step" data-step="eu">
+              <span class="onboard-icon idle" id="oi-eu">3</span>
+              <span class="onboard-label" id="ol-eu">等待欧区授权</span>
+            </li>
+            <li class="onboard-step" data-step="us">
+              <span class="onboard-icon idle" id="oi-us">4</span>
+              <span class="onboard-label" id="ol-us">等待美国授权</span>
+            </li>
+          </ol>
+          <div class="onboard-tip" id="onboard-tip"><!-- rendered by JS --></div>
+        </section>
 
         <!-- 进度树 -->
         <div class="progress-area" id="progress-area">

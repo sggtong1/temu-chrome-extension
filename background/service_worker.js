@@ -176,7 +176,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleRecheckLogin().then(sendResponse);
     return true;
   }
+  if (msg.type === 'AGENT_ONBOARD_MATCH') {
+    // 引导页 step1:账号匹配 — 抓 Temu userInfo(userId + mallIdList),最多重试 3 次
+    handleOnboardMatch().then(sendResponse);
+    return true;
+  }
 });
+
+// 引导进度事件 → popup 实时驱动 stepper(popup 关闭时 sendMessage 会 reject,吞掉)
+function emitOnboardProgress(payload) {
+  try {
+    const p = chrome.runtime.sendMessage({ type: 'AGENT_ONBOARD_PROGRESS', ...payload });
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch {}
+}
+
+// ── 引导 step1:账号匹配(开屏自动跑,最多重试 3 次)────────────────────
+// 开 kjmh tab → 查登录态 → 抓 userInfo(userId + mallIdList)。未登录/抓取失败则重试。
+// 返回给 popup 做 ERP 店铺匹配(mallIdList ∩ 已绑店)。
+async function handleOnboardMatch() {
+  const ATTEMPTS = 3;
+  const log = (m) => console.log(`[Temu匹配] ${m}`);
+  let lastReason = 'unknown';
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    emitOnboardProgress({ step: 'match', status: 'running', attempt });
+    let tabId = null;
+    try {
+      if (attempt > 1) await new Promise((r) => setTimeout(r, 1500)); // 重试前略等,留时间登录
+      const tab = await chrome.tabs.create({ url: 'https://seller.kuajingmaihuo.com/main', active: false });
+      tabId = tab.id;
+      try {
+        await waitTabComplete(tabId, null, 15_000);
+      } catch (e) {
+        lastReason = `tab-load-timeout: ${e?.message}`;
+        log(`尝试 ${attempt}/${ATTEMPTS} ✗ 页面加载超时`);
+        continue;
+      }
+      const cur = await chrome.tabs.get(tabId);
+      if (cur?.url && isLoginFlowUrl(cur.url)) {
+        lastReason = 'not-logged-in';
+        log(`尝试 ${attempt}/${ATTEMPTS} ✗ 商家中心未登录`);
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 600));
+      const uid = await fetchKjmhUserIdInTab(tabId, null);
+      if (!uid?.userId) {
+        lastReason = `userinfo-failed: ${uid?.error || '?'}`;
+        log(`尝试 ${attempt}/${ATTEMPTS} ✗ userInfo 失败: ${uid?.error}`);
+        continue;
+      }
+      const mallIdList = Array.isArray(uid.mallIdList) ? uid.mallIdList.map(String) : [];
+      log(`✓ 匹配成功 userId=${uid.userId} malls=[${mallIdList.join(',')}]`);
+      emitOnboardProgress({ step: 'match', status: 'ok', userId: String(uid.userId), mallIdList });
+      return { ok: true, userId: String(uid.userId), mallIdList };
+    } catch (e) {
+      lastReason = `error: ${e?.message}`;
+      log(`尝试 ${attempt}/${ATTEMPTS} ✗ ${e?.message}`);
+    } finally {
+      if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} }
+    }
+  }
+  log(`✗ 账号匹配失败(${ATTEMPTS} 次): ${lastReason}`);
+  emitOnboardProgress({ step: 'match', status: 'fail', reason: lastReason });
+  return { ok: false, reason: lastReason };
+}
 
 // ★ 重新检测登录态 — 单 visible tab 串行跑所有区域:
 //   1. 打开 1 个 visible tab 到 kjmh /main
@@ -255,7 +318,9 @@ async function handleRecheckLogin() {
     for (let i = 0; i < SUBDOMAIN_REGIONS.length; i++) {
       const reg = SUBDOMAIN_REGIONS[i];
       log(`3.${i + 1} ${REGION_NAMES[reg.key] || reg.key}`);
+      emitOnboardProgress({ step: reg.key, status: 'running' });
       const r = await runSsoForRegion(tabId, reg.key, uid.userId, null, uid.mallId);
+      emitOnboardProgress({ step: reg.key, status: r.ok ? 'ok' : 'fail', reason: r.ok ? null : (r.reason || 'sso-failed') });
       results.push({
         key: reg.key,
         status: r.ok ? 'ok' : 'expired',

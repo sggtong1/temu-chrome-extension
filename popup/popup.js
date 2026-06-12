@@ -29,15 +29,22 @@ const DEFAULT_API_URL = 'http://100.114.163.62:4000';
 const DEFAULT_TOKEN = 'demo'; // TODO: 权限系统上线后改每客户独立 token
 
 let cfg = { apiUrl: DEFAULT_API_URL, token: DEFAULT_TOKEN, custody: 'full' };
-CHROME.storage.local.get(['apiUrl', 'token', 'custody'], (saved) => {
+CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpAccountPhone'], (saved) => {
   cfg = { ...cfg, ...saved };
   if (!cfg.apiUrl) cfg.apiUrl = DEFAULT_API_URL;   // 历史空串也回退
   if (!cfg.token) cfg.token = DEFAULT_TOKEN;
+  // 本客户端负责的店铺范围(per-browser scope):null=全部,数组=仅这些。
+  // 由账号匹配自动写入;SW claim 读同一个 key 过滤派单。
+  selectedShops = Array.isArray(saved.selectedShopIds) ? saved.selectedShopIds : null;
   if (cfg.custody) selectCustody(cfg.custody);
   refreshAccountChip();
   pingServer();
-  refreshFromApi();          // 启动后立刻拉一次真实进度
-  setInterval(refreshFromApi, 5000);  // 每 5s 刷
+  // 开屏门控:还没匹配过(无 scope)→ 跑账号匹配引导;已匹配过 → 直接进面板。
+  if (selectedShops && selectedShops.length > 0) {
+    enterPanel();
+  } else {
+    runOnboard();
+  }
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -131,17 +138,16 @@ async function refreshFromApi() {
   }
   _connected = shopsR.status === 'fulfilled' || tasksR.status === 'fulfilled';
   if (_connected) {
-    shops = buildShopsFromApi();
+    refreshShopViews();
     renderModules();    // ★ 左侧计数依赖 _apiTasks/_apiShops,初次拉到后必须重渲染
     renderProgress();
   }
 }
 
-function buildShopsFromApi() {
-  // 当前 custody Tab 过滤店铺
-  const wanted = activeCustody === 'full' ? 'full' : 'semi';
+// custodyFilter: 'full' / 'semi' 只取该托管;null = 全部托管(选店弹窗用)。
+function buildShopsFromApi(custodyFilter = activeCustody) {
   return _apiShops
-    .filter((s) => s.platform === 'temu' && s.shopType === wanted)
+    .filter((s) => s.platform === 'temu' && (custodyFilter == null || s.shopType === custodyFilter))
     .map((s) => {
       // 按 kind 合并:同 kind 多次任务只留最新一条 + 执行时间。
       // _apiTasks 已按 createdAt desc(后端默认),所以第一遇到的就是最新。
@@ -214,18 +220,15 @@ async function createTasksForSelected() {
   const kinds = [...SELECTED].map((m) => MODULE_TO_KIND[m]).filter(Boolean);
   if (kinds.length === 0) throw new Error('请至少勾选一个模块');
 
-  // 决定派到哪些店铺
-  let targetIds = [];
-  if (selectedShops && selectedShops.length > 0) {
-    targetIds = selectedShops;
-  } else {
-    targetIds = _apiShops
-      .filter((s) => s.platform === 'temu'
-        && s.shopType === activeCustody
-        && s.status === 'active')
-      .map((s) => s.id);
-  }
-  if (targetIds.length === 0) throw new Error('没有可用店铺，请先在 ERP 绑定 Temu 店铺');
+  // 决定派到哪些店铺:当前 custody ∩ 本机 scope ∩ active(与主面板显示一致)。
+  // selectedShops 跨 full/semi,这里叠加 custody 过滤,避免把全托模块派给半托店。
+  const targetIds = _apiShops
+    .filter((s) => s.platform === 'temu'
+      && s.shopType === activeCustody
+      && s.status === 'active'
+      && (selectedShops === null || selectedShops.includes(s.id)))
+    .map((s) => s.id);
+  if (targetIds.length === 0) throw new Error('当前没有可派单的店铺(检查右上角店铺范围 / 是否在 ERP 绑定)');
 
   const region = $('#region')?.value || 'global';
   const dateRange = $('#date-range')?.value || '7d';
@@ -261,10 +264,164 @@ async function createTasksForSelected() {
   return tasks;
 }
 
+// 左上角显示 ERP 登录账号(手机号)—— 与 Temu 平台账号无关,暂为写死/配置值。
+// TODO: 权限系统上线后改成真实登录账号。
+const DEFAULT_ERP_PHONE = '13094411223';
 function refreshAccountChip() {
-  $('#account-name').textContent = cfg.apiUrl
-    ? new URL(cfg.apiUrl).host
-    : '未绑定 ERP';
+  const phone = cfg.erpAccountPhone || DEFAULT_ERP_PHONE;
+  const el = $('#account-name');
+  el.textContent = phone;
+  el.title = '点击重新匹配账号 / 授权';
+  el.style.cursor = 'pointer';
+}
+
+// ──────────────────────────────────────────────────────────────
+// 1.5 账号匹配 + 区域授权 引导(纯自动 scope)
+//   step1 账号匹配:SW 抓 Temu userInfo(userId+mallIdList,最多重试3次)
+//                  → mallIdList 查 ERP /api/shops 匹配已绑店 → 写 selectedShopIds
+//   step2-4 区域授权:SW 逐区域 SSO(复用 AGENT_RECHECK_LOGIN),进度事件驱动 stepper
+// ──────────────────────────────────────────────────────────────
+let _pollStarted = false;
+const ONBOARD_REGION_STEPS = ['global', 'eu', 'us'];
+
+function enterPanel() {
+  const ov = document.getElementById('onboard-view'); if (ov) ov.hidden = true;
+  const pa = document.getElementById('progress-area'); if (pa) pa.hidden = false;
+  const fb = document.getElementById('btn-fetch'); if (fb) fb.disabled = false;
+  refreshFromApi();
+  if (!_pollStarted) { _pollStarted = true; setInterval(refreshFromApi, 5000); }
+}
+
+function showOnboard() {
+  const ov = document.getElementById('onboard-view'); if (ov) ov.hidden = false;
+  const pa = document.getElementById('progress-area'); if (pa) pa.hidden = true;
+  const es = document.getElementById('empty-state'); if (es) es.hidden = true;
+  const fb = document.getElementById('btn-fetch'); if (fb) fb.disabled = true; // 引导期间禁手动获取
+}
+
+function setStep(step, status, label) {
+  const icon = document.getElementById(`oi-${step}`);
+  if (icon) icon.className = `onboard-icon ${status}`; // idle 显序号,其余靠 CSS(spinner/✓/✕)
+  if (label != null) { const lab = document.getElementById(`ol-${step}`); if (lab) lab.textContent = label; }
+}
+
+function resetOnboardSteps() {
+  setStep('match', 'running', '账号匹配中…');
+  setStep('global', 'idle', '等待全球授权');
+  setStep('eu', 'idle', '等待欧区授权');
+  setStep('us', 'idle', '等待美国授权');
+}
+
+function tipDetecting() {
+  return `<div class="tip-title">在线检测中(预计需要 90 秒),请耐心等待</div>
+    请登录到 Temu 后台 <a href="https://seller.kuajingmaihuo.com" target="_blank" rel="noopener">卖家中心</a>;<br/>
+    请保持 Temu 后台和插件 <span class="tip-emph">同时登录在线</span>;<br/>
+    自动打开的页签是插件在采集,<span class="tip-emph">无需操作或关闭</span>。`;
+}
+function tipFailNotLoggedIn() {
+  return `<div class="tip-title err">未检测到 Temu 卖家中心在线,可尝试如下操作:</div>
+    请先登录到 Temu 后台:<a href="https://seller.kuajingmaihuo.com" target="_blank" rel="noopener">https://seller.kuajingmaihuo.com</a><br/>
+    登录后再点击下方按钮,重新检测在线状态<br/>
+    <span class="onboard-refresh" id="onboard-refresh-btn">立即刷新</span>`;
+}
+function tipFailNoBinding() {
+  return `<div class="tip-title err">此账号下暂无已绑定的店铺</div>
+    请先在 ERP 后台绑定该账号下的 Temu 店铺,再重新匹配<br/>
+    <span class="onboard-refresh" id="onboard-refresh-btn">立即刷新</span>`;
+}
+function tipFailApi() {
+  return `<div class="tip-title err">连接 ERP 服务失败</div>
+    请检查网络 / Tailscale 是否在线,再重试<br/>
+    <span class="onboard-refresh" id="onboard-refresh-btn">立即刷新</span>`;
+}
+function setOnboardTip(html) {
+  const tip = document.getElementById('onboard-tip');
+  if (!tip) return;
+  tip.innerHTML = html;
+  const btn = document.getElementById('onboard-refresh-btn');
+  if (btn) btn.addEventListener('click', runOnboard);
+}
+
+// SW 进度事件 → 实时驱动 stepper
+if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== 'AGENT_ONBOARD_PROGRESS') return;
+    if (msg.step === 'match') {
+      // match 的 ok/fail 由 runOnboard 在 ERP 匹配后决定,这里只反映重试转圈
+      if (msg.status === 'running') {
+        setStep('match', 'running', msg.attempt > 1 ? `账号匹配中…(重试 ${msg.attempt}/3)` : '账号匹配中…');
+      }
+    } else if (ONBOARD_REGION_STEPS.includes(msg.step)) {
+      setStep(msg.step, msg.status === 'running' ? 'running' : (msg.status === 'ok' ? 'ok' : 'fail'));
+    }
+  });
+}
+
+function swSend(type) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type }, (r) => { void chrome.runtime.lastError; resolve(r); });
+    } catch { resolve(null); }
+  });
+}
+
+// mallIdList ∩ ERP 已绑店 → 匹配到的 ERP shopId 数组。API 不通则抛错(上层区分提示)。
+async function matchShopsToErp(mallIdList) {
+  const v = await apiFetch('/api/shops');
+  const list = Array.isArray(v) ? v : (v?.items || []);
+  _apiShops = list;
+  const want = new Set((mallIdList || []).map(String));
+  return list
+    .filter((s) => s.platform === 'temu' && want.has(String(s.platformShopId)))
+    .map((s) => s.id);
+}
+
+async function runOnboard() {
+  showOnboard();
+  resetOnboardSteps();
+  setOnboardTip(tipDetecting());
+
+  // step1:Temu 账号匹配(SW 内含 3 次重试)
+  const m = await swSend('AGENT_ONBOARD_MATCH');
+  if (!m?.ok) {
+    setStep('match', 'fail', '账号匹配失败');
+    setOnboardTip(tipFailNotLoggedIn());
+    return;
+  }
+
+  // step1b:mallIdList 匹配 ERP 已绑店
+  setStep('match', 'running', '匹配店铺中…');
+  let matched;
+  try {
+    matched = await matchShopsToErp(m.mallIdList);
+  } catch (e) {
+    console.warn('[onboard] /api/shops 失败:', e?.message);
+    setStep('match', 'fail', '账号匹配失败');
+    setOnboardTip(tipFailApi());
+    return;
+  }
+  if (!matched.length) {
+    setStep('match', 'fail', '账号匹配失败');
+    setOnboardTip(tipFailNoBinding());
+    return;
+  }
+
+  // 写 scope(popup 面板 + SW claim 共用)
+  selectedShops = matched;
+  CHROME.storage.local.set({ selectedShopIds: matched });
+  setStep('match', 'ok', `已匹配 ${matched.length} 家店`);
+
+  // step2-4:区域授权(SW 逐区域 SSO,进度事件已驱动 stepper;最终 results 兜底收尾)
+  setOnboardTip(tipDetecting());
+  const res = await swSend('AGENT_RECHECK_LOGIN');
+  const byKey = {};
+  for (const r of (res?.results || [])) byKey[r.key] = r.status;
+  for (const step of ONBOARD_REGION_STEPS) {
+    if (byKey[step]) setStep(step, byKey[step] === 'ok' ? 'ok' : 'fail');
+  }
+
+  // 完成 → 进入面板(只显示本机匹配到的店)
+  setTimeout(enterPanel, 600);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -293,8 +450,12 @@ const MODULES_BY_CUSTODY = {
 // 按 module key → 这一类下 (成功数 / 总数);只统计当前 custody 下的店铺
 function computeModuleCounts() {
   const wanted = activeCustody === 'full' ? 'full' : 'semi';
+  // 与主面板一致:只统计本机 scope(selectedShops)内的店。null=全部。
   const shopIds = new Set(
-    _apiShops.filter((s) => s.platform === 'temu' && s.shopType === wanted).map((s) => s.id),
+    _apiShops
+      .filter((s) => s.platform === 'temu' && s.shopType === wanted)
+      .filter((s) => selectedShops === null || selectedShops.includes(s.id))
+      .map((s) => s.id),
   );
   const counts = {};
   for (const t of _apiTasks) {
@@ -412,7 +573,20 @@ function mockShops(custody) {
     },
   ];
 }
-let shops = mockShops(activeCustody);
+let allShops = mockShops(activeCustody); // 当前 custody 下全部店
+let shops = allShops;                    // allShops 再按本机 scope 过滤(主面板 + 领单源)
+
+// 按 selectedShops(per-browser scope,账号匹配自动写入)过滤出本机负责的店。null=全部。
+// 注:selectedShops 跨 full/semi —— 当前 custody 视图里对不上的 ID 自然被滤掉。
+function applyShopScope(list) {
+  if (selectedShops === null) return list;
+  return list.filter((s) => selectedShops.includes(s.id));
+}
+// 重建视图:allShops(当前 custody 全部)→ shops(本机已匹配)。连不上时 fallback mock。
+function refreshShopViews() {
+  allShops = _connected ? buildShopsFromApi(activeCustody) : mockShops(activeCustody);
+  shops = applyShopScope(allShops);
+}
 
 function summary(tasks) {
   let ok = 0, total = tasks.length, hasRunning = false, failed = 0;
@@ -544,13 +718,9 @@ function selectCustody(c) {
   activeCustody = c;
   $$('.custody-tab').forEach((b) => b.classList.toggle('active', b.dataset.custody === c));
   $('#custody-pill').textContent = c === 'full' ? '全托模式' : '半托模式';
-  // 优先用真实数据，离线时 fallback 到 mock
-  shops = _connected ? buildShopsFromApi() : mockShops(c);
-  // 切换托管类型时重置店铺选择（避免选了旧 shopId）
-  if (typeof selectedShops !== 'undefined') {
-    selectedShops = null;
-    if (document.getElementById('shop-picker-btn')) updateShopPickerLabel();
-  }
+  // 优先用真实数据，离线时 fallback 到 mock。
+  // 不再重置 selectedShops —— 它是跨 full/semi 的持久 scope,对不上的 ID 会被 applyShopScope 自然滤掉。
+  refreshShopViews();
   renderModules();
   renderProgress();
   CHROME.storage.local.set({ custody: c });
@@ -956,96 +1126,16 @@ async function pingServer() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// 9. 店铺多选
-//    selectedShops = null  → 全部
-//    selectedShops = []    → 空（按钮显示"未选店铺"）
-//    selectedShops = [id]  → 仅这些
+// 9. 店铺 scope —— 现由账号匹配引导自动写入 selectedShopIds(见 runOnboard)。
+//    selectedShops = null → 全部(未匹配前);数组 → 仅本机匹配到的店。
+//    手动选店 picker 已移除(纯自动 scope)。
 // ──────────────────────────────────────────────────────────────
 let selectedShops = null;
-let pendingShops = null;
-
-function updateShopPickerLabel() {
-  const btn = $('#shop-picker-btn');
-  const label = $('#shop-picker-label');
-  if (selectedShops === null) {
-    label.textContent = `全部店铺 (${shops.length})`;
-    btn.classList.remove('has-selection');
-  } else if (selectedShops.length === 0) {
-    label.textContent = '未选店铺';
-    btn.classList.add('has-selection');
-  } else if (selectedShops.length === shops.length) {
-    label.textContent = `全部店铺 (${shops.length})`;
-    btn.classList.remove('has-selection');
-  } else {
-    label.textContent = `已选 ${selectedShops.length} / ${shops.length}`;
-    btn.classList.add('has-selection');
-  }
-}
-
-function isShopChecked(id) {
-  if (pendingShops === null) return true;
-  return pendingShops.includes(id);
-}
-
-function renderShopPickerRows() {
-  $('#shop-pick-count').textContent = String(shops.length);
-  const body = $('#shop-picker-body');
-  body.innerHTML = shops.map((s) => {
-    const checked = isShopChecked(s.id) ? 'checked' : '';
-    return `
-      <label class="shop-picker-row">
-        <input type="checkbox" data-id="${s.id}" ${checked} />
-        <span>${s.name}</span>
-        <span class="row-meta">${s.tasks.length} 任务</span>
-      </label>
-    `;
-  }).join('');
-  body.querySelectorAll('input[type=checkbox]').forEach((cb) => {
-    cb.addEventListener('change', () => {
-      if (pendingShops === null) pendingShops = shops.map((s) => s.id);
-      const id = cb.dataset.id;
-      if (cb.checked) {
-        if (!pendingShops.includes(id)) pendingShops.push(id);
-      } else {
-        pendingShops = pendingShops.filter((x) => x !== id);
-      }
-      $('#shop-pick-all').checked = pendingShops.length === shops.length;
-    });
-  });
-  $('#shop-pick-all').checked = pendingShops === null || pendingShops.length === shops.length;
-}
-
-function openShopPicker() {
-  pendingShops = selectedShops === null ? null : [...selectedShops];
-  renderShopPickerRows();
-  $('#shop-picker-pop').hidden = false;
-}
-function closeShopPicker() { $('#shop-picker-pop').hidden = true; }
-
-$('#shop-picker-btn').addEventListener('click', () => {
-  const pop = $('#shop-picker-pop');
-  pop.hidden ? openShopPicker() : closeShopPicker();
-});
-
-$('#shop-pick-all').addEventListener('change', (e) => {
-  pendingShops = e.target.checked ? shops.map((s) => s.id) : [];
-  renderShopPickerRows();
-});
-
-$('#shop-pick-cancel').addEventListener('click', closeShopPicker);
-$('#shop-pick-apply').addEventListener('click', () => {
-  if (pendingShops === null || pendingShops.length === shops.length) selectedShops = null;
-  else selectedShops = [...pendingShops];
-  updateShopPickerLabel();
-  // TODO[agent-bridge]: 写回 chrome.storage 并通知 background "下次派单只发这些店铺"
-  // CHROME.storage.local.set({ selectedShops })
-  closeShopPicker();
-  renderProgress();
-});
 
 // ──────────────────────────────────────────────────────────────
 // 10. 启动渲染
 // ──────────────────────────────────────────────────────────────
+// 点左上角手机号 → 重新跑账号匹配 + 授权
+document.getElementById('account-name')?.addEventListener('click', () => runOnboard());
 renderModules();
 renderProgress();
-updateShopPickerLabel();
