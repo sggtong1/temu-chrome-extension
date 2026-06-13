@@ -1054,23 +1054,124 @@ async function dispatch(task, signal, onProgress) {
 // ── scrape:marketing-activity 专用 wrapper ───────────────────────
 // 任务语义:抓"可报名活动列表"(Activity 主表),不是已报名记录。
 // 只要 mallId 即可定位 hidden tab 用哪个店登录态;region 仅作 transform 的元信息透传。
-async function dispatchMarketingActivity(task, signal) {
-  const payload = task.payload ?? {};
+// ── gen-3 通用单阶段列表采集 helper ───────────────────────────────────────────
+// 开账号页(window.rose 在)→ 注入 runListFetchInTab(现签 anti-content + mallid override + 分页)
+//   → raw listPath 项原样回传。单阶段 list 类 kind(marketing-activity 等)都复用这个。
+// cfg: { logTag, pageUrl, apiPath, listKey, baseBody, pageNoKey, pageSize, maxPages }
+async function injectListFetch(payload, signal, cfg) {
   if (!payload.mallId) {
-    throw Object.assign(
-      new Error(`payload.mallId missing for scrape:marketing-activity (got ${JSON.stringify(payload)})`),
-      { code: 'BAD_PAYLOAD' },
-    );
+    throw Object.assign(new Error(`payload.mallId missing for ${cfg.logTag} (got ${JSON.stringify(payload)})`), { code: 'BAD_PAYLOAD' });
   }
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+  try {
+    const tab = await chrome.tabs.create({ url: cfg.pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[${cfg.logTag}] tab ${tabId} → ${cfg.pageUrl} (mall=${payload.mallId})`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      throw Object.assign(new Error('agentseller 跳登录,需登录该平台账号'), { code: 'LOGIN_REQUIRED' });
+    }
+    await sleep(2000, signal);
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runListFetchInTab,
+      args: [{
+        apiPath: cfg.apiPath,
+        mallId: String(payload.mallId),
+        listKey: cfg.listKey,
+        baseBody: cfg.baseBody ?? {},
+        pageNoKey: cfg.pageNoKey ?? 'pageNo',
+        pageSize: cfg.pageSize ?? 50,
+        maxPages: Math.min(Number(payload.maxPages) || cfg.maxPages || 40, 200),
+      }],
+    });
+    console.log(`[${cfg.logTag}] 注入页面抓取 ${cfg.apiPath} ...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[${cfg.logTag}] ✗ 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstListResp: result.firstListResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    console.log(`[${cfg.logTag}] ✓ mall=${payload.mallId} rows=${result.rows.length}(raw 回传,后端解析)`, { diag: result.diag, sample: result.rows[0] ?? null });
+    return { rows: result.rows, rawCount: result.rows.length, completedAt: new Date().toISOString(), agent: agentDiag() };
+  } finally {
+    await cleanup();
+  }
+}
 
-  const spec = KIND_TO_FETCH_SPEC['scrape:marketing-activity'];
-  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
-  return {
-    rows: transformed,
-    rawCount: rawItems.length,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
+// MAIN-world 注入函数:通用列表分页(window.rose 现签 + mallid override)。纯函数,序列化注入。
+async function runListFetchInTab(args) {
+  const { apiPath, mallId, listKey, baseBody, pageNoKey, pageSize, maxPages } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
   };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(apiPath, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false && (data.errorCode === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || ''))) {
+        await wait(2000 * (attempt + 1));
+        continue;
+      }
+      return data;
+    }
+    throw new Error('退避重试 6 次仍失败(限流/系统异常)');
+  };
+  const diag = { pagesFetched: 0, total: null, collected: 0 };
+  let firstListResp = null;
+  try {
+    const rows = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post({ ...baseBody, [pageNoKey]: p, pageSize });
+      if (!firstListResp) firstListResp = data;
+      diag.pagesFetched++;
+      const list = (data && data.result && data.result[listKey]) || [];
+      diag.total = (data && data.result && data.result.total != null) ? data.result.total : diag.total;
+      for (const it of list) rows.push(it);
+      diag.collected = rows.length;
+      if (list.length < pageSize) break;
+      if (diag.total != null && rows.length >= diag.total) break;
+    }
+    return { ok: true, rows, diag, firstListResp };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: e && e.code, diag, firstListResp };
+  }
+}
+
+// 2026-06-13 gen-3:营销活动列表(单阶段),复用 injectListFetch。raw activityList 回传,
+//   后端 parseMarketingActivityRows 解析(薄插件)。同 endpoint /api/kiana/gamblers/marketing/enroll/activity/list。
+async function dispatchMarketingActivity(task, signal) {
+  return injectListFetch(task.payload ?? {}, signal, {
+    logTag: 'marketing-activity',
+    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity',
+    apiPath: '/api/kiana/gamblers/marketing/enroll/activity/list',
+    listKey: 'activityList',
+    baseBody: { needSessionItem: true, needCanEnrollCnt: true },
+    pageNoKey: 'pageNo',
+    pageSize: 50,
+  });
 }
 
 // ── scrape:activity-products 专用 wrapper ────────────────────────
