@@ -938,26 +938,28 @@ const KIND_TO_FETCH_SPEC = {
     totalPath: 'result.total',
     transform: (rawItems, payload) => transformLifecycleResponse(rawItems, payload),
   },
-  // scrape:declared-price — 抓商品"申报价/调价单"列表(全托管)
-  // payload: { mallId }
-  // 数据先存 agent_task.result;PriceReview / DeclaredPrice 表 schema 后续设计。
-  // 对照 Sallfox 接口盘点:"Temu 调价单 magnus/mms/price-adjust/*"
-  //   = 官方 bg.full.adjust.price.page.query
+  // scrape:declared-price — 抓"核价单/申报价待确认"列表(核价页同步按钮专用)
+  // payload: { shopType:'full'|'semi', mallId, region }
+  // 2026-06-12 薄插件改造(T-ThinPlugin):核价单数据在 search{Chain|Semi}Supplier(supplierTodoTypeList:[1]
+  //   =价格申报中)的 result.dataList[].skcList[].supplierPriceReviewInfoList[]。
+  //   - 全托(Chain):价在 info/sku 级,siteId 全局(后端落 -1)
+  //   - 半托(Semi):价在 productSkuList[].siteSupplierPriceList[](站点级,真 siteId)
+  //   插件只采集 raw(identity transform,不解析),字段解析全在后端 parsePriceReviewRows + 单测,
+  //   以后字段改只动后端、不重载插件。旧 magnus/mms/price-adjust/product-adjust-query 已废弃。
   'scrape:declared-price': {
-    // 2026-06-06 实测结论:此 SPEC 仅适用全托。半托侧无独立申报价列表接口 —
-    // queryProductSkuPriceAndStatus 是按单 SKU 查价明细(需 productSkuId,不可列表化,空 body 报 3000000);
-    // 全托 product-adjust-query(调价单查询)在半托 agentseller 页面不触发(CAPTURE_FAILED)。
-    // sellfox 半托唯一价格列表是 searchForSemiSupplier,已由 scrape:lifecycle-management(#6)覆盖。
-    // → 半托店的 scrape:declared-price cron 已置 enabled=false。详见 docs §3.6.1。
-    pageUrl: (_payload) => 'https://agentseller.temu.com/price-management/price-adjust',
-    apiUrlPattern: (_payload) => '/api/kiana/magnus/mms/price-adjust/product-adjust-query',
+    pageUrl: (_payload) => 'https://agentseller.temu.com/newon/product-select',
+    apiUrlPattern: (payload) => isSemiPayload(payload)
+      ? '/api/kiana/mms/robin/searchForSemiSupplier'
+      : '/api/kiana/mms/robin/searchForChainSupplier',
     method: 'POST',
     paginationMode: 'pageNo',
     pageSize: 50,
-    buildBody: (_payload) => ({}),
-    listPath: 'result.list',
+    pageNoKey: 'pageNum',        // ★ Temu 用 pageNum 不是 pageNo
+    pageSizeKey: 'pageSize',
+    buildBody: (_payload) => ({ removeStatus: 0, supplierTodoTypeList: [1] }),  // 1 = 价格申报中
+    listPath: 'result.dataList',
     totalPath: 'result.total',
-    transform: (rawItems) => transformPriceAdjustResponse(rawItems),
+    transform: (rawItems) => rawItems,   // 薄插件:raw 原样回传,后端解析
   },
   // scrape:sales-30d — 近 30 天销量 + 库存(SKU 级 snapshot)
   // 全托 / 半托走两套不同 endpoint(数据模型不同,详见 docs/sellfox-plugin-rev-eng.md §3.2):
