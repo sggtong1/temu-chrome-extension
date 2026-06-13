@@ -1381,22 +1381,18 @@ async function dispatchSkuSalesDaily(task, signal) {
 // ── scrape:activity-data 专用 wrapper ────────────────────────────
 // 任务语义:抓本店"已报名活动 SKU 列表+活动价",落到 ActivityEnrollment。
 // payload: { mallId } — API 按 mallid header 隔离店铺,其他不必要
+// 2026-06-13 gen-3:活动报名数据(单阶段),复用 injectListFetch。raw /enroll/list result.list 回传,
+//   后端 parseActivityEnrollmentRows 解析(薄插件)。sessionStatus:2 = 只取进行中场次。
 async function dispatchActivityData(task, signal) {
-  const payload = task.payload ?? {};
-  if (!payload.mallId) {
-    throw Object.assign(
-      new Error(`payload.mallId missing for scrape:activity-data (got ${JSON.stringify(payload)})`),
-      { code: 'BAD_PAYLOAD' },
-    );
-  }
-  const spec = KIND_TO_FETCH_SPEC['scrape:activity-data'];
-  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
-  return {
-    rows: transformed,
-    rawCount: rawItems.length,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
-  };
+  return injectListFetch(task.payload ?? {}, signal, {
+    logTag: 'activity-data',
+    pageUrl: 'https://agentseller.temu.com/activity/marketing-activity/log',
+    apiPath: '/api/kiana/gamblers/marketing/enroll/list',
+    listKey: 'list',
+    baseBody: { sessionStatus: 2 },
+    pageNoKey: 'pageNo',
+    pageSize: 50,
+  });
 }
 
 // ── scrape:flux-analysis 专用 wrapper ────────────────────────────
