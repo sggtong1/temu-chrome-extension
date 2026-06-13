@@ -1104,6 +1104,10 @@ async function dispatchActivityProducts(task, signal) {
 // ── scrape:sales-30d 专用 wrapper ────────────────────────────────
 // 任务语义:全托管 SKU 级近 30 天销量 + 库存 snapshot。落到 ShopSkuSnapshot。
 // payload: { mallId } — 其他都不必要(API 内部按 mallid header 隔离店铺)
+// 2026-06-13 gen-3 注入式重写(原 gen-1 dispatchViaHiddenTab 等页面被动触发 → 半托 detail 冷开
+//   不一定自动发 → capture 不稳;非活跃 mall capture-timeout)。改注入 + window.rose 现签 + mallid override,
+//   一个登录态可采同账号全/半托子店。同 endpoint(listOverall / sale-analysis-detail),无新接口。
+//   raw listPath 项原样回传({rows}),后端 parseSalesRows/parseSemiDailyRows 解析(薄插件)。
 async function dispatchSales30d(task, signal) {
   const payload = task.payload ?? {};
   if (!payload.mallId) {
@@ -1112,20 +1116,116 @@ async function dispatchSales30d(task, signal) {
       { code: 'BAD_PAYLOAD' },
     );
   }
-  const spec = KIND_TO_FETCH_SPEC['scrape:sales-30d'];
-  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
-  const result = {
-    rows: transformed,
-    rawCount: rawItems.length,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
-  };
-  // 半托:同一次 /api/sale/analysis/detail 响应已带 skuSaleDTOList 每日明细,顺带产 dailyRows
-  // 落 shop_sku_daily_snapshot(让产品分析半托页按真实日期区间求和)。全托走独立 scrape:sku-sales-daily。
-  if (isSemiPayload(payload)) {
-    result.dailyRows = transformSemiSalesDailyResponse(rawItems);
+  const semi = isSemiPayload(payload);
+  const pageUrl = semi ? SEMI_SALES_PAGE_URL : 'https://agentseller.temu.com/stock/fully-mgt/sale-manage/main';
+  const apiPath = semi ? SEMI_SALES_API_PATH : '/mms/venom/api/supplier/sales/management/listOverall';
+  const listKey = semi ? 'saleAnalysisDetailDTOList' : 'subOrderList';
+  const baseBody = semi ? { timeType: payload.timeType ?? 4 } : { isLack: 0 };
+  const pageNoKey = semi ? 'pageNum' : 'pageNo';
+  const pageSize = semi ? 30 : 50;
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[sales-30d] tab ${tabId} → ${pageUrl} (mall=${payload.mallId} ${semi ? 'semi' : 'full'})`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) {
+      throw Object.assign(new Error('agentseller 跳登录,需登录该平台账号'), { code: 'LOGIN_REQUIRED' });
+    }
+    await sleep(2000, signal);
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runSalesInTab,
+      args: [{ apiPath, mallId: String(payload.mallId), listKey, baseBody, pageNoKey, pageSize, maxPages: Math.min(Number(payload.maxPages) || 40, 200) }],
+    });
+    console.log(`[sales-30d] 注入页面抓取 ${apiPath} ...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error('[sales-30d] ✗ 页面内 fetch 失败', { error: result.error, code: result.code, diag: result.diag, firstListResp: result.firstListResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+
+    console.log(
+      `[sales-30d] ✓ mall=${payload.mallId} ${semi ? 'semi' : 'full'} rows=${result.rows.length}(raw 回传,后端解析)`,
+      { diag: result.diag, sample: result.rows[0] ?? null },
+    );
+    return {
+      rows: result.rows,
+      rawCount: result.rows.length,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
   }
-  return result;
+}
+
+// ── MAIN-world 注入函数:销量/库存列表分页(window.rose 现签 + mallid override)──────────
+// 纯函数(executeScript 序列化)。全托 listOverall(pageNo/50/{isLack:0})、半托 sale/analysis/detail
+//(pageNum/30/{timeType});listKey 取 result 里的列表数组,raw 原样累加回传。
+async function runSalesInTab(args) {
+  const { apiPath, mallId, listKey, baseBody, pageNoKey, pageSize, maxPages } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(apiPath, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false && (data.errorCode === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || ''))) {
+        await wait(2000 * (attempt + 1));
+        continue;
+      }
+      return data;
+    }
+    throw new Error('退避重试 6 次仍失败(限流/系统异常)');
+  };
+  const diag = { pagesFetched: 0, total: null, collected: 0 };
+  let firstListResp = null;
+  try {
+    const rows = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post({ ...baseBody, [pageNoKey]: p, pageSize });
+      if (!firstListResp) firstListResp = data;
+      diag.pagesFetched++;
+      const list = (data && data.result && data.result[listKey]) || [];
+      diag.total = (data && data.result && data.result.total != null) ? data.result.total : diag.total;
+      for (const it of list) rows.push(it);
+      diag.collected = rows.length;
+      if (list.length < pageSize) break;
+      if (diag.total != null && rows.length >= diag.total) break;
+    }
+    return { ok: true, rows, diag, firstListResp };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: e && e.code, diag, firstListResp };
+  }
 }
 
 // ── scrape:sku-sales-daily 专用 wrapper ──────────────────────────
