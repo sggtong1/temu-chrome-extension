@@ -1058,6 +1058,86 @@ async function dispatch(task, signal, onProgress) {
 // 开账号页(window.rose 在)→ 注入 runListFetchInTab(现签 anti-content + mallid override + 分页)
 //   → raw listPath 项原样回传。单阶段 list 类 kind(marketing-activity 等)都复用这个。
 // cfg: { logTag, pageUrl, apiPath, listKey, baseBody, pageNoKey, pageSize, maxPages }
+// 2026-06-13 gen-3:flux-analysis 两阶段注入(list 翻页 + 每 SPU detail 批量,同 window.rose 现签)。
+// MAIN-world 纯函数(executeScript 序列化,不能引用外部变量)。raw 回传,后端 parseFluxAnalysisRows
+// / parseFluxDetailGroups 解析(薄插件)。
+async function runFluxInTab(args) {
+  const { listApiPath, detailApiPath, mallId, listBody, listPageNoKey, listSize, listKey,
+          region, detailSiteId, detailPageSize, maxPages, concurrency } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const genAntiContent = () => { try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; } };
+  const post = async (apiPath, body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(apiPath, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
+        body: JSON.stringify(body),
+      });
+      if (resp.status === 429) { await wait(2000 * (attempt + 1)); continue; }
+      if (!resp.ok) { const t = await resp.text().catch(() => ''); throw new Error(`HTTP ${resp.status}: ${t.slice(0, 120)}`); }
+      const data = await resp.json();
+      if (data && data.success === false && (data.errorCode === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || ''))) { await wait(2000 * (attempt + 1)); continue; }
+      return data;
+    }
+    throw new Error('退避重试 6 次仍失败(限流/系统异常)');
+  };
+  const diag = { listPages: 0, listCount: 0, total: null, detailCandidates: 0, detailOk: 0, detailFail: 0, detailSkip: 0, detailDays: 0 };
+  let firstListResp = null;
+  try {
+    // Phase 1:list 翻页
+    const listRows = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const data = await post(listApiPath, { ...listBody, [listPageNoKey]: p, pageSize: listSize });
+      if (!firstListResp) firstListResp = data;
+      diag.listPages++;
+      const list = (data && data.result && data.result[listKey]) || [];
+      diag.total = (data && data.result && data.result.total != null) ? data.result.total : diag.total;
+      for (const it of list) listRows.push(it);
+      diag.listCount = listRows.length;
+      if (list.length < listSize) break;
+      if (diag.total != null && listRows.length >= diag.total) break;
+    }
+    // Phase 2:每 SPU detail 批量(曝光>0 且有 goodsId),并发
+    const exposureOf = (r) => Number((r && (r.exposeNum ?? r.exposureNum ?? r.impressionNum ?? r.impressionCount)) || 0);
+    const candidates = listRows.filter((r) => r && r.goodsId != null && exposureOf(r) > 0);
+    diag.detailCandidates = candidates.length;
+    const detailRows = [];
+    let idx = 0;
+    const worker = async () => {
+      while (idx < candidates.length) {
+        const r = candidates[idx++];
+        const goodsId = r.goodsId;
+        if (goodsId == null) { diag.detailSkip++; continue; }
+        try {
+          const items = [];
+          for (let dp = 1; dp <= 10; dp++) {
+            const dd = await post(detailApiPath, { goodsId: Number(goodsId), siteId: detailSiteId, statTimeDimension: 1, pageNum: dp, pageSize: detailPageSize });
+            const dlist = (dd && dd.result && dd.result.list) || [];
+            for (const x of dlist) items.push(x);
+            const dtotal = (dd && dd.result && dd.result.total) || 0;
+            if (dlist.length < detailPageSize) break;
+            if (dtotal && items.length >= dtotal) break;
+          }
+          detailRows.push({
+            productSpuId: r.productSpuId ?? r.productId ?? null,
+            productName: r.goodsName ?? r.productName ?? null,
+            pictureUrl: r.goodsImageUrl ?? r.pictureUrl ?? null,
+            goodsId, region, items,
+          });
+          diag.detailDays += items.length; diag.detailOk++;
+        } catch (e) {
+          diag.detailFail++;
+          if (e && /HTTP 429/.test(String(e.message))) { idx = candidates.length; return; }
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, concurrency || 3) }, () => worker()));
+    return { ok: true, listRows, detailRows, diag, firstListResp };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), code: e && e.code, diag, firstListResp };
+  }
+}
+
 async function injectListFetch(payload, signal, cfg) {
   if (!payload.mallId) {
     throw Object.assign(new Error(`payload.mallId missing for ${cfg.logTag} (got ${JSON.stringify(payload)})`), { code: 'BAD_PAYLOAD' });
@@ -1428,108 +1508,61 @@ async function dispatchFluxAnalysis(task, signal) {
       { code: 'BAD_REGION' },
     );
   }
-  const spec = {
-    ...KIND_TO_FETCH_SPEC['scrape:flux-analysis'],
-    apiUrlPattern: listApi,
-    pageUrl,
-  };
-  const { rawItems, transformed: listRows } = await dispatchViaHiddenTab(spec, payload, signal);
-
-  // ── Phase 2:同 session 批量 fetch detail ────────────────────────
-  // dispatchViaHiddenTab 跑完后 mallId session 已 cached(setCachedSession),拿来直接 POST detail。
-  const session = await getCachedSession(payload.mallId);
-  let detailRows = [];
-  let detailStats = { candidates: 0, success: 0, failed: 0, skipped: 0 };
-  if (!session) {
-    console.warn(`[Temu后台] flux-analysis: list 完成但 session 丢失(罕见),跳过 detail`);
-  } else {
-    const candidates = listRows.filter((r) => Number(r?.exposureNum ?? 0) > 0 && r?.platformProductId);
-    detailStats.candidates = candidates.length;
-    const detailUrl = `${session.origin}${detailApi}`;
-    const detailHeaders = { ...session.headers, 'content-type': 'application/json' };
-    const detailPageSize = payload.detailPageSize ?? 30;   // 一次 30 天够覆盖 weekly + 月度对比窗口
-    const CONCURRENCY = 3;
-    let idx = 0;
-    async function worker() {
-      while (idx < candidates.length) {
-        if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
-        const i = idx++;
-        const r = candidates[i];
-        const goodsId = r?.platformPayload?.goodsId
-          ?? r?.platformPayload?.productSpuId
-          ?? null;
-        if (!goodsId) { detailStats.skipped++; continue; }
-        try {
-          const body = {
-            goodsId: Number(goodsId),
-            siteId: payload.siteId ?? -1,
-            statTimeDimension: 1,
-            pageNum: 1,
-            pageSize: detailPageSize,
-          };
-          const resp = await fetch(detailUrl, {
-            method: 'POST',
-            credentials: 'include',
-            headers: detailHeaders,
-            body: JSON.stringify(body),
-          });
-          if (resp.status === 429) {
-            const retryAfterSec = Number(resp.headers.get('Retry-After')) || 0;
-            throw rateLimitedError({
-              retryAfterMs: retryAfterSec ? retryAfterSec * 1000 : null,
-              httpStatus: 429,
-              msg: `detail HTTP 429 Too Many Requests`,
-            });
-          }
-          if (!resp.ok) throw new Error(`detail HTTP ${resp.status}`);
-          const data = await resp.json();
-          const rl = detectRateLimitInBody(data);
-          if (rl) {
-            throw rateLimitedError({
-              retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200,
-              msg: `Temu rate-limited (detail): ${rl.reason}`,
-            });
-          }
-          const dayItems = data?.result?.list ?? [];
-          const rows = transformFluxAnalysisDetailResponse(dayItems, {
-            region,
-            productSpuId: r.platformProductId,
-            productName:  r.productName,
-            pictureUrl:   r.pictureUrl,
-            goodsId,
-          });
-          detailRows.push(...rows);
-          detailStats.success++;
-        } catch (e) {
-          if (e?.code === 'RATE_LIMITED') {
-            // 限流时直接停止其余 detail fetch — list 仍正常返回,detail 部分留给下次任务
-            console.warn(`[Temu后台] detail rate-limited at SPU ${i + 1}/${candidates.length},停止 detail batch`);
-            idx = candidates.length;       // 让其他 worker 也退出
-            detailStats.failed++;
-            return;
-          }
-          console.warn(`[Temu后台] detail fetch fail spu=${r.platformProductId}: ${e.message}`);
-          detailStats.failed++;
-        }
-      }
+  // gen-3:开账号页注入 runFluxInTab,一次完成 list 翻页 + 每 SPU detail 批量(raw 回传,薄插件)
+  const semiList = semi;
+  const listBody = semiList
+    ? { timeDimension: payload?.statisticType ?? 5, sortMode: 2, sortType: 5 }
+    : { statisticType: payload?.statisticType ?? 5,
+        siteId: payload?.siteId ?? REGION_TO_SITE_ID[region],
+        ...(payload?.quickFilter ? { quickFilter: payload.quickFilter } : {}) };
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 8 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+  try {
+    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    tabId = tab.id;
+    console.log(`[flux-analysis] tab ${tabId} → ${pageUrl} (mall=${payload.mallId}, region=${region}, semi=${semi})`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error('agentseller 跳登录,需登录该平台账号'), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', func: runFluxInTab,
+      args: [{
+        listApiPath: listApi, detailApiPath: detailApi, mallId: String(payload.mallId),
+        listBody, listPageNoKey: semiList ? 'pageNumber' : 'pageNo',
+        listSize: semiList ? 100 : 50, listKey: semiList ? 'pageItems' : 'list',
+        region, detailSiteId: payload.siteId ?? -1,
+        detailPageSize: payload.detailPageSize ?? 30,
+        maxPages: Math.min(Number(payload.maxPages) || 40, 200),
+        concurrency: 3,
+      }],
+    });
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[flux-analysis] ✗ 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstListResp: result.firstListResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
     }
-    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-    console.log(`[Temu后台] flux-analysis detail batch: ` +
-      `${detailStats.success}/${detailStats.candidates} ok, ${detailStats.failed} failed, ` +
-      `${detailStats.skipped} no-goodsId — ${detailRows.length} day-rows`);
+    console.log(`[flux-analysis] ✓ mall=${payload.mallId} list=${result.listRows.length} detailSPU=${result.detailRows.length}(raw 回传,后端解析)`, { diag: result.diag });
+    return {
+      rows: result.listRows,            // raw list items → 后端 parseFluxAnalysisRows
+      detailRows: result.detailRows,    // 每 SPU 分组 { items } → 后端 parseFluxDetailGroups
+      detailStats: { candidates: result.diag.detailCandidates, success: result.diag.detailOk, failed: result.diag.detailFail, skipped: result.diag.detailSkip },
+      rawCount: result.listRows.length,
+      statisticType: payload.statisticType ?? 5,
+      siteId: payload.siteId ?? 0,
+      region,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
   }
-
-  return {
-    rows: listRows,
-    detailRows,
-    detailStats,
-    rawCount: rawItems.length,
-    statisticType: payload.statisticType ?? 5,
-    siteId: payload.siteId ?? 0,
-    region,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
-  };
 }
 
 // ── scrape:flux-analysis-detail 专用 wrapper ─────────────────────
@@ -1553,23 +1586,17 @@ async function dispatchFluxAnalysisDetail(task, signal) {
       { code: 'BAD_REGION' },
     );
   }
-  const spec = {
-    ...KIND_TO_FETCH_SPEC['scrape:flux-analysis-detail'],
-    apiUrlPattern: detailApi,
-    // ★ 关键:flux-analysis-full 列表页默认只发 /list 不发 /detail,所以 capture
-    //   阶段必须等 list 请求(同 mallId session 跨 path 通用)。fetch 仍走 detail。
-    captureApiUrlPattern: REGION_TO_FLUX_LIST_API[region],
+  // gen-3:注入单 SPU detail 翻页(pageNum/pageSize),raw result.list 回传,后端 parseFluxDetailRows 解析
+  const goodsId = Number(payload.goodsId ?? payload.productId);
+  return injectListFetch(payload, signal, {
+    logTag: 'flux-detail',
     pageUrl,
-  };
-  const { rawItems, transformed } = await dispatchViaHiddenTab(spec, payload, signal);
-  return {
-    rows: transformed,
-    rawCount: rawItems.length,
-    productId: payload.productId,
-    region: payload.region ?? 'global',
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
-  };
+    apiPath: detailApi,
+    listKey: 'list',
+    baseBody: { goodsId, siteId: payload.siteId ?? -1, statTimeDimension: payload.statTimeDimension ?? 1 },
+    pageNoKey: 'pageNum',
+    pageSize: payload.pageSize ?? 30,
+  });
 }
 
 // ── scrape:order-amounts 专用 wrapper ────────────────────────────
