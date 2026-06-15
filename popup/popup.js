@@ -1,7 +1,7 @@
 // Popup main script.
 //
-// 当前状态：UI 骨架 + mock 数据，所有真实 chrome.runtime 通信处都打了
-// `// TODO[agent-bridge]` 标记，等后端 agent_tasks 队列上线后接通。
+// 数据全部来自 ERP /api/shops + /api/agent/tasks(经 service_worker 派单中枢),
+// 未连上 ERP / 未完成账号匹配时面板为空(走空状态),不再有 mock 占位数据。
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -505,7 +505,7 @@ async function runOnboard() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// 2. 模块定义 + Mock 进度
+// 2. 模块定义 + 进度渲染
 //    真实数据从 background message 来：{ shops: [...], modules: [...] }
 // ──────────────────────────────────────────────────────────────
 // 模块定义只保留 key + label;count/total 由 computeModuleCounts() 按真实任务算
@@ -617,51 +617,7 @@ function updateFetchButton() {
 // 3. 进度区（演示数据）
 //    每店铺 -> 多任务，每任务有 status: ok/running/failed/pending
 // ──────────────────────────────────────────────────────────────
-function mockShops(custody) {
-  if (custody === 'full') return [
-    {
-      id: 's1',
-      name: '测试店铺-全托主店',
-      window: '2026-04-16 ~ 2026-05-15',
-      expanded: true,
-      tasks: [
-        { name: '待处理款项',  region: '全球', status: 'ok',      result: '获取成功' },
-        { name: '结算中款项',  region: '全球', status: 'ok',      result: '获取成功' },
-        { name: '已到账款项',  region: '全球', status: 'ok',      result: '获取成功' },
-        { name: '待处理款项',  region: '美区', status: 'ok',      result: '获取成功' },
-        { name: '结算中款项',  region: '美区', status: 'ok',      result: '获取成功' },
-        { name: '已到账款项',  region: '美区', status: 'running', result: '获取中…' },
-        { name: '待处理款项',  region: '欧区', status: 'pending', result: '待获取' },
-        { name: '结算中款项',  region: '欧区', status: 'pending', result: '待获取' },
-        { name: '已到账款项',  region: '欧区', status: 'pending', result: '待获取' },
-      ],
-    },
-    {
-      id: 's2',
-      name: '测试店铺-全托备用店',
-      window: '2026-02-16 ~ 2026-05-15',
-      expanded: false,
-      tasks: [
-        { name: '活动数据', region: '美区', status: 'ok', result: '获取成功' },
-        { name: '营销活动', region: '美区', status: 'failed', result: '账号匹配失败' },
-        { name: '申报价格', region: '欧区', status: 'ok', result: '获取成功' },
-      ],
-    },
-  ];
-  return [
-    {
-      id: 's3',
-      name: '半托测试店',
-      window: '2026-05-01 ~ 2026-05-15',
-      expanded: true,
-      tasks: [
-        { name: '订单数据', region: '美区', status: 'ok', result: '获取成功' },
-        { name: '申报价格', region: '美区', status: 'ok', result: '获取成功' },
-      ],
-    },
-  ];
-}
-let allShops = mockShops(activeCustody); // 当前 custody 下全部店
+let allShops = [];   // 当前 custody 下全部店(来自 /api/shops;未连上 ERP / 未匹配时为空)
 let shops = allShops;                    // allShops 再按本机 scope 过滤(主面板 + 领单源)
 
 // 按 selectedShops(per-browser scope,账号匹配自动写入)过滤出本机负责的店。null=全部。
@@ -670,9 +626,9 @@ function applyShopScope(list) {
   if (selectedShops === null) return list;
   return list.filter((s) => selectedShops.includes(s.id));
 }
-// 重建视图:allShops(当前 custody 全部)→ shops(本机已匹配)。连不上时 fallback mock。
+// 重建视图:allShops(当前 custody 全部)→ shops(本机已匹配)。未连上 ERP 时为空(走空状态)。
 function refreshShopViews() {
-  allShops = _connected ? buildShopsFromApi(activeCustody) : mockShops(activeCustody);
+  allShops = _connected ? buildShopsFromApi(activeCustody) : [];
   shops = applyShopScope(allShops);
 }
 
@@ -806,7 +762,7 @@ function selectCustody(c) {
   activeCustody = c;
   $$('.custody-tab').forEach((b) => b.classList.toggle('active', b.dataset.custody === c));
   $('#custody-pill').textContent = c === 'full' ? '全托模式' : '半托模式';
-  // 优先用真实数据，离线时 fallback 到 mock。
+  // 用真实数据重建视图(未连上 ERP 时为空)。
   // 不再重置 selectedShops —— 它是跨 full/semi 的持久 scope,对不上的 ID 会被 applyShopScope 自然滤掉。
   refreshShopViews();
   renderModules();
