@@ -41,11 +41,21 @@ CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpA
   if (cfg.custody) selectCustody(cfg.custody);
   refreshAccountChip();
   pingServer();
-  // 开屏门控:还没匹配过(无 scope)→ 跑账号匹配引导;已匹配过 → 直接进面板。
+  // 开屏门控:已匹配(有 scope)→ 进面板;无 scope → 本会话首次自动匹配一次,
+  // 若本会话已试过且失败 → 停在失败页等手动「立即刷新」,不自动重跑(避免反复弹 tab)。
   if (selectedShops && selectedShops.length > 0) {
     enterPanel();
   } else {
-    runOnboard();
+    readOnboardFailKind().then((failKind) => {
+      if (failKind) {
+        showOnboard();
+        resetOnboardSteps();
+        setStep('match', 'fail', '账号匹配失败');
+        setOnboardTip((ONBOARD_FAIL_TIPS[failKind] || tipFailNotLoggedIn)());
+      } else {
+        runOnboard();
+      }
+    });
   }
 });
 
@@ -428,7 +438,21 @@ async function matchShopsToErp(mallIdList) {
     .map((s) => s.id);
 }
 
+// 会话级"本次已自动匹配且失败"标记(chrome.storage.session,浏览器重启自动清)。
+// scope 为空时:本会话首次打开自动匹配一次;失败后下次再开 popup 不再自动重跑,
+// 停在失败页等用户手动「立即刷新」—— 避免没绑店的客户端反复弹 kjmh tab 影响操作。
+const ONBOARD_FAIL_TIPS = { login: tipFailNotLoggedIn, binding: tipFailNoBinding, api: tipFailApi };
+function readOnboardFailKind() {
+  return new Promise((resolve) => {
+    try { CHROME.storage.session.get(['onboardFailKind'], (r) => { void chrome.runtime?.lastError; resolve(r?.onboardFailKind || null); }); }
+    catch { resolve(null); }
+  });
+}
+function markOnboardFail(kind) { try { CHROME.storage.session.set({ onboardFailKind: kind }); } catch {} }
+function clearOnboardFail() { try { CHROME.storage.session.remove('onboardFailKind'); } catch {} }
+
 async function runOnboard() {
+  clearOnboardFail();   // 新一轮尝试(开屏首次 / 手动刷新 / 点账号名),先清旧失败标记
   showOnboard();
   resetOnboardSteps();
   setOnboardTip(tipDetecting());
@@ -438,6 +462,7 @@ async function runOnboard() {
   if (!m?.ok) {
     setStep('match', 'fail', '账号匹配失败');
     setOnboardTip(tipFailNotLoggedIn());
+    markOnboardFail('login');
     return;
   }
 
@@ -450,17 +475,20 @@ async function runOnboard() {
     console.warn('[onboard] /api/shops 失败:', e?.message);
     setStep('match', 'fail', '账号匹配失败');
     setOnboardTip(tipFailApi());
+    markOnboardFail('api');
     return;
   }
   if (!matched.length) {
     setStep('match', 'fail', '账号匹配失败');
     setOnboardTip(tipFailNoBinding());
+    markOnboardFail('binding');
     return;
   }
 
   // 写 scope(popup 面板 + SW claim 共用)
   selectedShops = matched;
   CHROME.storage.local.set({ selectedShopIds: matched });
+  clearOnboardFail();   // 匹配成功,清失败标记
   setStep('match', 'ok', `已匹配 ${matched.length} 家店`);
 
   // step2-4:区域授权(SW 逐区域 SSO,进度事件已驱动 stepper;最终 results 兜底收尾)
