@@ -54,9 +54,10 @@ CHROME.storage.local.get(['apiUrl', 'token', 'custody', 'selectedShopIds', 'erpA
 // ──────────────────────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
   if (!cfg.apiUrl) throw new Error('未配置 ERP API');
-  // 超时:连不上 ERP 时让 fetch 快速失败(8s),而不是无限挂起 → 上层能进失败 UI。
+  // 超时:连不上 ERP 时让 fetch 快速失败,而不是无限挂起 → 上层能进失败 UI。
+  // 默认放宽到 15s(公网网关偶发首字节慢;列表瘦身后体量已很小,基本秒回)。
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 8000);
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs || 15000);
   let res;
   try {
     res = await fetch(cfg.apiUrl + path, {
@@ -120,6 +121,7 @@ const MODULE_TO_KIND = {
   'activity-data':  'scrape:activity-data',
   'marketing-act':  'scrape:marketing-activity',
   'flux-analysis':  'scrape:flux-analysis',
+  'orders':         'scrape:order-amounts',
   'promo':          'scrape:promo',
 };
 
@@ -234,6 +236,12 @@ async function createTasksForSelected() {
   if (!cfg.apiUrl) throw new Error('请先配置 ERP API 地址');
   const kinds = [...SELECTED].map((m) => MODULE_TO_KIND[m]).filter(Boolean);
   if (kinds.length === 0) throw new Error('请至少勾选一个模块');
+
+  // 店铺列表还没从 ERP 拉回来(网络慢/未连上)→ 给出明确提示,别误导成"未绑定/scope 问题"。
+  // (历史坑:_apiShops 为空时直接报"没有可派单的店铺",让人误查绑定/scope,实则是列表没加载。)
+  if (_apiShops.length === 0) {
+    throw new Error('店铺列表还没加载出来(ERP 网络慢或未连上),请等面板里出现店铺后再获取');
+  }
 
   // 决定派到哪些店铺:当前 custody ∩ 本机 scope ∩ active(与主面板显示一致)。
   // selectedShops 跨 full/semi,这里叠加 custody 过滤,避免把全托模块派给半托店。
