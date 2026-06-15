@@ -13,7 +13,7 @@
 //   apiUrl              ERP 网关，如 https://duoshou.868818.xyz
 //   token               Bearer token，dev 期就用 "demo"
 //   pluginInstanceId    本插件实例 ID（首次自动生成，持久化）
-//   selectedShopIds     限定派单到这些店铺（null = 不限）
+//   selectedShopIds     限定派单到这些店铺（空/null = 本机未完成账号匹配 → 不领单）
 // ────────────────────────────────────────────────────────────────────
 
 import {
@@ -647,6 +647,13 @@ export async function pollOnce() {
     console.warn('· 轮询跳过:未配置 ERP API 地址(popup 顶部"切换账号"填)');
     return;
   }
+  // ★ 账号匹配 gate:scope 为空 = 本机还没匹配成功(或无已绑店),不领单。
+  //   否则会把整个 org 所有店的任务领过来跑,而本机登录账号并不拥有这些店 → 全失败。
+  //   匹配成功后 onboarding 写入 selectedShopIds,下一轮(10s 内)自动开始领单。
+  if (!cfg.selectedShopIds || cfg.selectedShopIds.length === 0) {
+    console.log('· 轮询跳过:本机未完成账号匹配(无 scope),不领单');
+    return;
+  }
 
   const pluginInstanceId = await ensurePluginInstanceId();
 
@@ -656,7 +663,7 @@ export async function pollOnce() {
       method: 'POST',
       body: JSON.stringify({
         pluginInstanceId,
-        shopIds: cfg.selectedShopIds && cfg.selectedShopIds.length > 0 ? cfg.selectedShopIds : undefined,
+        shopIds: cfg.selectedShopIds,   // gate 已保证非空;只领本机匹配到的店
         kinds: SUPPORTED_KINDS,                    // capability dispatch — server 只派我会的 kind
         buildId: AGENT_BUILD_ID,
         extensionId: chrome.runtime?.id,
