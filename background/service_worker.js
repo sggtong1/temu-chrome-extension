@@ -1,7 +1,6 @@
 import { getSkuCost, dbUpsert } from './db.js';
 import { transformListResponse, transformSemiUsListResponse } from './transform/list_transform.js';
 import { parseSalesResponse, parseOrdersResponse, buildSkuRows } from './transform/sku_transform.js';
-import { transformPromoResponse } from './transform/promo_transform.js';
 import { transformActivityResponse } from './transform/activity_transform.js';
 import {
   startAgent,
@@ -61,11 +60,6 @@ function moduleUrl(module, mallId, siteType, region) {
     // activity is full_managed only; content script fetches the API directly after load
     const uid = shopFromCache(mallId)?.uniqueId ?? '';
     return `https://agentseller.temu.com/activity/marketing-activity/log?mallId=${mallId}&uId=${uid}`;
-  }
-  if (module === 'promo') {
-    // Ad report page lives on a separate subdomain (ads.temu.com), not the
-    // seller-center base. mallId can still be appended for context.
-    return `https://ads.temu.com/data-report.html?mallId=${mallId}`;
   }
   return null;
 }
@@ -668,7 +662,7 @@ function rearmCaptureTimer(mod) {
   if (_captureTimer) clearTimeout(_captureTimer);
   // Sales/activity may paginate hundreds of pages; we rearm on each
   // PAGINATION_PROGRESS so the timer only fires when truly idle.
-  const timeoutMs = (mod === 'sales' || mod === 'activity' || mod === 'promo' || mod === 'list') ? 300_000 : 60_000;
+  const timeoutMs = (mod === 'sales' || mod === 'activity' || mod === 'list') ? 300_000 : 60_000;
   _captureTimer = setTimeout(async () => {
     console.warn(`[temu] timeout waiting for ${mod} (${timeoutMs/1000}s)`);
     await sendStatusToTab(mod, 'error');
@@ -840,35 +834,6 @@ async function processModule(module, rawData) {
     _state.originalModules = _state.originalModules.filter(m => m !== 'activity');
   }
 
-  if (module === 'promo') {
-    const rows = transformPromoResponse(rawData, ctx);
-    if (rows.length > 0) {
-      // Per-row summary so we can tell whether ALL rows are 0 (real problem)
-      // or just some (normal data distribution). Print 总花费/曝光量/点击量
-      // for each row.
-      console.log(`[temu] promo: ${rows.length} rows transformed. Per-row metric snapshot:`);
-      for (const row of rows) {
-        console.log(`  ad_id=${row.ad_id} 总花费=${row['总花费']} 曝光量=${row['曝光量']} 点击量=${row['点击量']} 子订单量=${row['子订单量']} ROAS=${row.ROAS}`);
-      }
-      const allZero = rows.every(r => r['总花费'] === 0 && r['曝光量'] === 0 && r['点击量'] === 0);
-      if (allZero) {
-        // All rows zero — suspect time-slice issue. Dump raw for first ad.
-        const adList = rawData?.result?.ads_detail ?? [];
-        if (adList[0]) {
-          console.warn('[temu] promo ALL ROWS ZERO — first ad summary.spend RAW:', JSON.stringify(adList[0]?.summary?.spend ?? null));
-          console.warn('[temu] promo top-level used_budget=' + adList[0]?.used_budget + ' roas=' + adList[0]?.roas);
-        }
-      }
-      const { count, error } = await dbUpsert(
-        apiUrl, 'ad_spend_daily', rows,
-        '日期,店铺名称,商品id,平台'  // unique constraint, not the bigint id PK
-      );
-      if (error) { console.error('[temu] promo upsert error:', error); throw new Error(error); }
-      console.log(`[temu] promo: upsert OK, count=${count}`);
-    } else {
-      console.log('[temu] promo: 0 rows (no ads in range)');
-    }
-  }
 }
 
 async function sendStatusToTab(module, status) {
