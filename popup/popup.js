@@ -91,7 +91,13 @@ const KIND_LABELS = {
   'scrape:sales-30d':        '获取近30天销量',
   'scrape:declared-price':   '获取申报价格',
   'scrape:marketing-activity': '获取营销活动',
-  'scrape:promo':            '获取广告报表',
+  'scrape:order-amounts':    '获取订单数据',
+  'scrape:returns':          '获取退货退款',
+  'scrape:semi-ad':          '获取广告数据',
+  'scrape:settle-flow':      '获取结算流水',
+  'scrape:logistics-bill':   '获取物流对账账单',
+  'scrape:reverse-logistics-bill': '获取退货面单费',
+  'scrape:violation-appeals': '获取违规罚款',
   'submit:activity-enroll':  '提交活动报名',
   'submit:price-confirm':    '提交价格确认',
   'submit:price-reject':     '提交价格驳回',
@@ -122,7 +128,25 @@ const MODULE_TO_KIND = {
   'marketing-act':  'scrape:marketing-activity',
   'flux-analysis':  'scrape:flux-analysis',
   'orders':         'scrape:order-amounts',
-  'promo':          'scrape:promo',
+  'returns':        'scrape:returns',
+  'semi-ad':        'scrape:semi-ad',
+  'settle-flow':    'scrape:settle-flow',
+  'logistics-bill': 'scrape:logistics-bill',
+  'reverse-logistics-bill': 'scrape:reverse-logistics-bill',
+  'violation-appeals':      'scrape:violation-appeals',
+};
+
+// 手动派单的区域扇出:endpoint 带 -us/-eu 子域的 kind 要分 3 区各采一次
+// (没卖货的区域返 0 行无害,与后端定时口径一致);单一固定域名(ads.temu.com / 主域)
+// 的 kind 不分区,只派 1 次(用右上角下拉的 region)。
+const KIND_REGIONS = {
+  'scrape:flux-analysis':          ['global', 'us', 'eu'],
+  'scrape:order-amounts':          ['global', 'us', 'eu'],
+  'scrape:returns':                ['global', 'us', 'eu'],
+  'scrape:settle-flow':            ['global', 'us', 'eu'],
+  'scrape:logistics-bill':         ['global', 'us', 'eu'],
+  'scrape:reverse-logistics-bill': ['global', 'us', 'eu'],
+  'scrape:violation-appeals':      ['global', 'us', 'eu'],
 };
 
 // 反向:kind → module key(给 renderProgress 过滤 + computeModuleCounts 计数用)
@@ -266,22 +290,27 @@ async function createTasksForSelected() {
       continue;
     }
     for (const kind of kinds) {
-      const t = await apiFetch('/api/agent/tasks', {
-        method: 'POST',
-        body: JSON.stringify({
-          shopId,
-          kind,
-          payload: {
-            mallId: shop.platformShopId,
-            siteType: shop.shopType,
-            region,
-            startDate: dates.startDate,
-            endDate: dates.endDate,
-          },
-          priority: 5,
-        }),
-      });
-      tasks.push(t);
+      // 区域相关 kind(endpoint 有 -us/-eu 子域)扇出全球/美国/欧区各派一次;
+      // 不分区的 kind 用右上角下拉选的 region 派 1 次。
+      const regions = KIND_REGIONS[kind] || [region];
+      for (const rgn of regions) {
+        const t = await apiFetch('/api/agent/tasks', {
+          method: 'POST',
+          body: JSON.stringify({
+            shopId,
+            kind,
+            payload: {
+              mallId: shop.platformShopId,
+              siteType: shop.shopType,
+              region: rgn,
+              startDate: dates.startDate,
+              endDate: dates.endDate,
+            },
+            priority: 5,
+          }),
+        });
+        tasks.push(t);
+      }
     }
   }
   return tasks;
@@ -463,10 +492,18 @@ const MODULES_BY_CUSTODY = {
     { key: 'flux-analysis', label: '获取流量分析' },
   ],
   semi: [
-    { key: 'sales-30d',     label: '获取近 30 天销量' },
-    { key: 'declare-price', label: '获取申报价格' },
-    { key: 'orders',        label: '获取订单数据' },
-    { key: 'promo',         label: '获取促销数据' },
+    { key: 'sales-30d',              label: '获取近 30 天销量' },
+    { key: 'declare-price',          label: '获取申报价格' },
+    { key: 'marketing-act',          label: '获取营销活动' },
+    { key: 'activity-data',          label: '获取活动数据' },
+    { key: 'flux-analysis',          label: '获取流量分析' },
+    { key: 'orders',                 label: '获取订单数据' },
+    { key: 'returns',                label: '获取退货退款' },
+    { key: 'semi-ad',                label: '获取广告数据' },
+    { key: 'settle-flow',            label: '获取结算流水' },
+    { key: 'logistics-bill',         label: '获取物流对账账单' },
+    { key: 'reverse-logistics-bill', label: '获取退货面单费' },
+    { key: 'violation-appeals',      label: '获取违规罚款' },
   ],
 };
 
