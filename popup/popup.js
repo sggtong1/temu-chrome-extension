@@ -982,11 +982,6 @@ function updateLoginBanner(domains) {
   }
 })();
 
-$('#open-options').addEventListener('click', (e) => {
-  e.preventDefault();
-  CHROME.runtime.openOptionsPage();
-});
-
 // ──────────────────────────────────────────────────────────────
 // 6. 操作日志 modal — 真实拉 /api/agent/tasks?limit=50,每行 = 一次任务执行
 // ──────────────────────────────────────────────────────────────

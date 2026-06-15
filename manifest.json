@@ -78,10 +78,6 @@
     },
     "default_popup": "popup/popup.html"
   },
-  "options_ui": {
-    "page": "options/options.html",
-    "open_in_tab": true
-  },
   "icons": {
     "48": "icons/icon-48.png"
   },
