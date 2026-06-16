@@ -1154,7 +1154,7 @@ async function injectListFetch(payload, signal, cfg) {
   let tabId = null;
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
   try {
-    const tab = await chrome.tabs.create({ url: cfg.pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: cfg.pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[${cfg.logTag}] tab ${tabId} → ${cfg.pageUrl} (mall=${payload.mallId})`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -1318,7 +1318,7 @@ async function dispatchSales30d(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[sales-30d] tab ${tabId} → ${pageUrl} (mall=${payload.mallId} ${semi ? 'semi' : 'full'})`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -1527,7 +1527,7 @@ async function dispatchFluxAnalysis(task, signal) {
   let tabId = null;
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[flux-analysis] tab ${tabId} → ${pageUrl} (mall=${payload.mallId}, region=${region}, semi=${semi})`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -1629,7 +1629,7 @@ async function dispatchOrderAmounts(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[order-amounts] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -1782,7 +1782,7 @@ async function dispatchReturns(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[returns] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -1923,7 +1923,7 @@ async function dispatchSemiAd(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: SEMI_AD_PAGE_URL, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: SEMI_AD_PAGE_URL, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[semi-ad] tab ${tabId} → ${SEMI_AD_PAGE_URL}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -2299,7 +2299,7 @@ async function dispatchLogisticsBill(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[logistics-bill] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -2451,7 +2451,7 @@ async function dispatchViolationAppeals(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[violation-appeals] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -2597,7 +2597,7 @@ async function dispatchReverseLogisticsBill(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[reverse-logistics-bill] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -2753,7 +2753,7 @@ async function dispatchSettleFlow(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[settle-flow] tab ${tabId} → ${pageUrl}`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -3079,7 +3079,7 @@ async function runOneSettlementVariant(variant, { beginTime, endTime, mallId }, 
   };
 
   try {
-    const tab = await chrome.tabs.create({ url: variant.pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: variant.pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${variant.pageUrl}`);
 
@@ -3181,7 +3181,7 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
   };
 
   try {
-    const tab = await chrome.tabs.create({ url: downloadUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: downloadUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${downloadUrl.slice(0, 150)}`);
 
@@ -3752,7 +3752,7 @@ async function dispatchDeclaredPrice(task, signal) {
   const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
     tabId = tab.id;
     console.log(`[declared-price] tab ${tabId} → ${pageUrl} (mall=${payload.mallId} ${semi ? 'semi' : 'full'})`);
     await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
@@ -4142,7 +4142,7 @@ async function captureSessionViaTab(spec, payload, signal) {
 
   try {
     const resolvedPageUrl = typeof spec.pageUrl === 'function' ? spec.pageUrl(payload) : spec.pageUrl;
-    const tab = await chrome.tabs.create({ url: resolvedPageUrl, active: true, pinned: false });
+    const tab = await chrome.tabs.create({ url: resolvedPageUrl, active: false, pinned: false });
     tabId = tab.id;
 
     // 等 tab 加载完
