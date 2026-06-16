@@ -436,6 +436,19 @@ export async function runSsoForRegion(tabId, regionKey, userId, signal, mallId =
   }
   await sleep(500, signal);
 
+  // 3.5 现有 session 已有效则直接判在线,跳过 SSO 重登。
+  //     根因修复:原先无脑跑 loginByCode、按其成败判在线/过期,但「能否 SSO 重登」
+  //     ≠「登录态是否有效」——美区现有 cookie 能采(orders 采集成功),但 loginByCode
+  //     失败(targetMallId 取 kjmh 单一 mallId、美区店是另一个 mall 等)→ 被误报"去登录"。
+  //     子域业务页(/labor/bill)没被跳登录,即说明该子域 session 有效 → 在线。
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && !isLoginFlowUrl(t.url)) {
+      step(`✓ ${regionName} 现有登录态有效(子域业务页未跳登录),跳过 SSO`);
+      return { ok: true, reason: 'session-valid', finalUrl: t.url, actions };
+    }
+  } catch {}
+
   // 4. 在子域 page context (same origin) fetch loginByCode
   step('4. 调用子域 loginByCode 完成登录');
   let loginResult;
@@ -733,13 +746,19 @@ async function executeTask(task, pluginInstanceId) {
     const count = Array.isArray(result?.rows) ? result.rows.length : '-';
     console.log(`四、✓ 完成 [${tid}] ${label} (${count} 条)`);
   } catch (e) {
-    // mismatch:true → endpoint 写错 / 无权限,让 backend 早退 + 触发防雪崩
+    // 含成功路径 reportResult 抛出(如 413 上报失败)→ 一律按失败处理。
+    // failed 上报是小 payload(无 raw result),不会再撞 413;但仍 try/catch 兜底,
+    // 防失败上报本身再抛(网络断)把 catch 冲出去。
     const errorCode = e.mismatch ? 'ENDPOINT_MISMATCH' : (e.code || 'UNKNOWN');
-    await reportResult(task.id, pluginInstanceId, {
-      status: 'failed',
-      errorCode,
-      errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
-    });
+    try {
+      await reportResult(task.id, pluginInstanceId, {
+        status: 'failed',
+        errorCode,
+        errorMessage: `[${AGENT_BUILD_ID}] ${String(e.message || e)}`.slice(0, 1500),
+      });
+    } catch (e2) {
+      console.error(`[Temu后台] failed 上报也失败 [${tid}]: ${e2.message}`);
+    }
     console.error(`四、✗ 失败 [${tid}] ${label}: ${e.message}`);
   } finally {
     clearInterval(heartbeatTimer);
@@ -4597,15 +4616,14 @@ function sleep(ms, signal) {
 }
 
 // ── 上报 ─────────────────────────────────────────────────────────
+// ⚠️ 失败必须抛出(不能吞):否则成功路径上报失败(如 raw payload 撞 VPS nginx
+// client_max_body_size 返 413)会被静默,任务被当 success → 面板误显成功但数据没进后端。
+// 抛出后 executeTask 的 catch 会改报 failed(小 payload,不会 413),面板/后端如实显失败。
 async function reportResult(taskId, pluginInstanceId, payload) {
-  try {
-    await api(`/api/agent/tasks/${taskId}/result`, {
-      method: 'POST',
-      body: JSON.stringify({ pluginInstanceId, ...payload }),
-    });
-  } catch (e) {
-    console.error(`[Temu后台] result ${taskId} 上报失败:`, e.message);
-  }
+  await api(`/api/agent/tasks/${taskId}/result`, {
+    method: 'POST',
+    body: JSON.stringify({ pluginInstanceId, ...payload }),
+  });
 }
 
 async function sendHeartbeat(taskId, pluginInstanceId) {
