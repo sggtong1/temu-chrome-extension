@@ -159,6 +159,20 @@ const KIND_REGIONS = {
   'scrape:violation-appeals':      ['global', 'us', 'eu'],
 };
 
+const MANUAL_MAX_RANGE_DAYS = 31;
+const MANUAL_REPORT_TYPES_BY_CUSTODY = {
+  full: [
+    { key: 'account-funds', label: '账户资金结算数据' },
+    { key: 'sales-30d',     label: '近30天历史销量' },
+    { key: 'settle-report', label: '结算报表' },
+  ],
+  semi: [
+    { key: 'orders',      label: '订单数据' },
+    { key: 'returns',     label: '退货退款' },
+    { key: 'settle-flow', label: '结算流水' },
+  ],
+};
+
 // 反向:kind → module key(给 renderProgress 过滤 + computeModuleCounts 计数用)
 const KIND_TO_MODULE = Object.fromEntries(
   Object.entries(MODULE_TO_KIND).map(([m, k]) => [k, m])
@@ -260,16 +274,18 @@ function dateRangeToDates(dateRange) {
   switch (dateRange) {
     case 'today': return { startDate: end, endDate: end };
     case '7d':    return { startDate: back(6),  endDate: end };
+    case '15d':   return { startDate: back(14), endDate: end };
     case '30d':   return { startDate: back(29), endDate: end };
     case '90d':   return { startDate: back(89), endDate: end };
     default:      return { startDate: back(6),  endDate: end };  // safe default
   }
 }
 
-async function createTasksForSelected() {
+async function createTasksForSelected(options = {}) {
   if (!cfg.apiUrl) throw new Error('请先配置 ERP API 地址');
-  const kinds = [...SELECTED].map((m) => MODULE_TO_KIND[m]).filter(Boolean);
-  if (kinds.length === 0) throw new Error('请至少勾选一个模块');
+  const moduleKeys = Array.isArray(options.moduleKeys) && options.moduleKeys.length ? options.moduleKeys : (activeModule ? [activeModule] : []);
+  const kinds = moduleKeys.map((m) => MODULE_TO_KIND[m]).filter(Boolean);
+  if (kinds.length === 0) throw new Error('请至少选择一个报告类型');
 
   // 店铺列表还没从 ERP 拉回来(网络慢/未连上)→ 给出明确提示,别误导成"未绑定/scope 问题"。
   // (历史坑:_apiShops 为空时直接报"没有可派单的店铺",让人误查绑定/scope,实则是列表没加载。)
@@ -283,13 +299,13 @@ async function createTasksForSelected() {
     .filter((s) => s.platform === 'temu'
       && s.shopType === activeCustody
       && s.status === 'active'
+      && (!options.shopId || s.id === options.shopId)
       && (selectedShops === null || selectedShops.includes(s.id)))
     .map((s) => s.id);
   if (targetIds.length === 0) throw new Error('当前没有可派单的店铺(检查右上角店铺范围 / 是否在 ERP 绑定)');
 
-  const region = $('#region')?.value || 'global';
-  const dateRange = $('#date-range')?.value || '7d';
-  const dates = dateRangeToDates(dateRange);
+  const region = options.region || $('#region')?.value || 'global';
+  const dates = options.dates || dateRangeToDates('7d');
   const shopById = new Map(_apiShops.map((s) => [s.id, s]));
 
   const tasks = [];
@@ -561,13 +577,17 @@ function computeModuleCounts() {
   );
 }
 
-// 默认空,逼用户主动勾选,意图明确;chrome.storage 里有记忆值则恢复
-const SELECTED = new Set();
 let activeCustody = 'full';
 let activeModule = null;
 
+function ensureActiveModule() {
+  const list = MODULES_BY_CUSTODY[activeCustody] || [];
+  if (!list.some((m) => m.key === activeModule)) activeModule = list[0]?.key ?? null;
+}
+
 function renderModules() {
   const list = MODULES_BY_CUSTODY[activeCustody];
+  ensureActiveModule();
   const counts = computeModuleCounts();
   const ul = $('#module-list');
   ul.innerHTML = '';
@@ -575,41 +595,43 @@ function renderModules() {
     const li = document.createElement('li');
     li.className = 'module-item' + (m.key === activeModule ? ' active' : '');
     li.dataset.key = m.key;
+    li.tabIndex = 0;
+    li.setAttribute('role', 'button');
+    li.setAttribute('aria-pressed', m.key === activeModule ? 'true' : 'false');
     const c = counts[m.key];
     const countText = c ? `${c.count}/${c.total}` : '';
     li.innerHTML = `
-      <input type="checkbox" ${SELECTED.has(m.key) ? 'checked' : ''} data-key="${m.key}" />
       <span class="module-label">${m.label}</span>
       <span class="module-count">${countText}</span>
     `;
-    li.addEventListener('click', (e) => {
-      if (e.target instanceof HTMLInputElement) return;
-      // 再点同一个 → 取消过滤
-      activeModule = activeModule === m.key ? null : m.key;
+    const selectModule = () => {
+      activeModule = m.key;
       renderModules();
       renderProgress();
-    });
-    li.querySelector('input').addEventListener('change', (e) => {
-      const k = e.target.dataset.key;
-      e.target.checked ? SELECTED.add(k) : SELECTED.delete(k);
       updateFetchButton();
+    };
+    li.addEventListener('click', selectModule);
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectModule();
+      }
     });
     ul.appendChild(li);
   }
   updateFetchButton();
 }
 
-// 手动获取按钮文案 / 状态 — 让用户一眼看清"会派多少类"
+// 手动获取按钮文案 / 状态 — 当前左侧高亮项作为默认报告类型
 function updateFetchButton() {
   const btn = document.getElementById('btn-fetch');
   if (!btn) return;
-  const n = SELECTED.size;
-  if (n === 0) {
+  if (!activeModule) {
     btn.disabled = true;
-    btn.textContent = '请先勾选模块';
+    btn.textContent = '请选择报告类型';
   } else {
     btn.disabled = false;
-    btn.textContent = `手动获取 (${n} 项)`;
+    btn.textContent = '手动获取';
   }
 }
 
@@ -774,22 +796,136 @@ $$('.custody-tab').forEach((b) => b.addEventListener('click', () => selectCustod
 // ──────────────────────────────────────────────────────────────
 // 5. 操作按钮
 // ──────────────────────────────────────────────────────────────
-$('#btn-fetch').addEventListener('click', async () => {
-  $('#btn-fetch').disabled = true;
-  $('#btn-fetch').textContent = '派单中…';
+function getManualReportTypes() {
+  return MANUAL_REPORT_TYPES_BY_CUSTODY[activeCustody] || MANUAL_REPORT_TYPES_BY_CUSTODY.full;
+}
+
+function getManualTargetShops() {
+  return _apiShops.filter((s) => s.platform === 'temu'
+    && s.shopType === activeCustody
+    && s.status === 'active'
+    && (selectedShops === null || selectedShops.includes(s.id)));
+}
+
+function setManualError(message = '') {
+  const el = $('#manual-fetch-error');
+  if (el) el.textContent = message;
+}
+
+function parseDateOnly(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || '');
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function manualRangeDays(from, to) {
+  const a = parseDateOnly(from);
+  const b = parseDateOnly(to);
+  if (!a || !b) return null;
+  return Math.floor((b.getTime() - a.getTime()) / 86_400_000) + 1;
+}
+
+function setManualDateRange(rangeKey) {
+  const dates = dateRangeToDates(rangeKey);
+  $('#manual-date-from').value = dates.startDate;
+  $('#manual-date-to').value = dates.endDate;
+  setManualError('');
+}
+
+function selectedManualModuleKeys() {
+  return $$('#manual-report-types input[type="checkbox"]:checked').map((input) => input.value);
+}
+
+function validateManualFetch() {
+  if (selectedManualModuleKeys().length === 0) return '请至少选择一个报告类型';
+  const from = $('#manual-date-from').value;
+  const to = $('#manual-date-to').value;
+  if (!from || !to) return '请选择时间范围';
+  const days = manualRangeDays(from, to);
+  if (days == null) return '时间范围格式不正确';
+  if (days <= 0) return '开始日期不能晚于结束日期';
+  if (days > MANUAL_MAX_RANGE_DAYS) return '单次时间范围不能超过 31 天';
+  return '';
+}
+
+function openManualFetchModal() {
+  ensureActiveModule();
+  const shops = getManualTargetShops();
+  const shopSelect = $('#manual-shop');
+  shopSelect.innerHTML = [
+    '<option value="">全部可派店铺</option>',
+    ...shops.map((s) => {
+      const name = s.displayName || s.platformShopId || s.id.slice(0, 8);
+      return `<option value="${s.id}">${name}</option>`;
+    }),
+  ].join('');
+  shopSelect.disabled = shops.length === 0;
+
+  const reportTypes = getManualReportTypes();
+  const preferred = reportTypes.some((item) => item.key === activeModule) ? activeModule : reportTypes[0]?.key;
+  $('#manual-report-types').innerHTML = reportTypes.map((item) => `
+    <label class="manual-report-row">
+      <input type="checkbox" value="${item.key}" ${item.key === preferred ? 'checked' : ''} />
+      <span>${item.label}</span>
+    </label>
+  `).join('');
+
+  setManualDateRange('7d');
+  setManualError(shops.length === 0 ? '当前没有可派单的店铺' : '');
+  $('#manual-fetch-modal').hidden = false;
+}
+
+function closeManualFetchModal() {
+  $('#manual-fetch-modal').hidden = true;
+  setManualError('');
+}
+
+async function submitManualFetch() {
+  const err = validateManualFetch();
+  if (err) {
+    setManualError(err);
+    return;
+  }
+  const btn = $('#manual-fetch-submit');
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '派单中…';
   try {
-    const created = await createTasksForSelected();
+    const created = await createTasksForSelected({
+      shopId: $('#manual-shop').value || null,
+      moduleKeys: selectedManualModuleKeys(),
+      dates: {
+        startDate: $('#manual-date-from').value,
+        endDate: $('#manual-date-to').value,
+      },
+    });
     $('#last-sync').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     // 通知 service_worker 立刻拉一次（不等下个 10s 周期）
     try { chrome.runtime?.sendMessage?.({ type: 'AGENT_PULL_NOW' }); } catch {}
     console.log(`[popup] 已创建 ${created.length} 个任务`);
+    closeManualFetchModal();
     // 短延迟后刷新真实进度
     setTimeout(refreshFromApi, 600);
   } catch (e) {
-    alert('派单失败：' + e.message);
+    setManualError('派单失败:' + e.message);
   } finally {
-    updateFetchButton();
+    btn.disabled = false;
+    btn.textContent = originalText;
   }
+}
+
+$('#btn-fetch').addEventListener('click', () => openManualFetchModal());
+$('#manual-fetch-close').addEventListener('click', closeManualFetchModal);
+$('#manual-fetch-cancel').addEventListener('click', closeManualFetchModal);
+$('#manual-fetch-submit').addEventListener('click', submitManualFetch);
+$('#manual-fetch-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'manual-fetch-modal') closeManualFetchModal();
+});
+$$('.manual-shortcut').forEach((btn) => {
+  btn.addEventListener('click', () => setManualDateRange(btn.dataset.manualRange));
+});
+['manual-date-from', 'manual-date-to'].forEach((id) => {
+  document.getElementById(id)?.addEventListener('change', () => setManualError(validateManualFetch()));
 });
 
 $('#btn-refresh').addEventListener('click', () => {

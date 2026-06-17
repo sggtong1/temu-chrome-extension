@@ -96,7 +96,7 @@
         <div class="empty-state" id="empty-state" hidden>
           <div class="empty-illust">📭</div>
           <div class="empty-title">还没有任务</div>
-          <div class="empty-sub">先勾选模块，再点"手动获取"</div>
+          <div class="empty-sub">先选择左侧报告类型，再点"手动获取"</div>
         </div>
       </section>
     </main>
@@ -153,6 +153,48 @@
     <div class="pop-foot">
       <span class="hint">凭证从浏览器 cookie 读取，登录 / 退出 Temu 即时生效</span>
       <button class="btn-secondary" id="online-pop-refresh">重新检测</button>
+    </div>
+  </div>
+
+  <!-- ============ 手动获取 Modal ============ -->
+  <div class="modal-mask" id="manual-fetch-modal" hidden>
+    <div class="modal modal-manual">
+      <header class="modal-head">
+        <h3>手动获取</h3>
+        <button class="modal-close" id="manual-fetch-close">×</button>
+      </header>
+      <div class="modal-body modal-pad manual-form">
+        <div class="manual-form-row">
+          <label class="manual-label" for="manual-shop">店铺:</label>
+          <select class="form-input manual-select" id="manual-shop"></select>
+        </div>
+        <div class="manual-form-row manual-form-row-top">
+          <label class="manual-label">报告类型:</label>
+          <div class="manual-report-list" id="manual-report-types"></div>
+        </div>
+        <div class="manual-form-row manual-form-row-top">
+          <label class="manual-label">时间范围:</label>
+          <div class="manual-date-box">
+            <div class="manual-date-fields">
+              <input class="form-input manual-date-input" id="manual-date-from" type="date" />
+              <span class="manual-date-sep">至</span>
+              <input class="form-input manual-date-input" id="manual-date-to" type="date" />
+            </div>
+            <div class="manual-shortcuts">
+              <button type="button" class="manual-shortcut" data-manual-range="today">今天</button>
+              <button type="button" class="manual-shortcut" data-manual-range="7d">近 7 天</button>
+              <button type="button" class="manual-shortcut" data-manual-range="15d">近 15 天</button>
+              <button type="button" class="manual-shortcut" data-manual-range="30d">近 30 天</button>
+            </div>
+            <div class="manual-range-hint">单次时间范围最长 31 天</div>
+          </div>
+        </div>
+        <div class="form-hint err" id="manual-fetch-error"></div>
+      </div>
+      <footer class="modal-foot">
+        <button class="btn-secondary" id="manual-fetch-cancel">取消</button>
+        <button class="btn-primary" id="manual-fetch-submit">确定</button>
+      </footer>
     </div>
   </div>
 
