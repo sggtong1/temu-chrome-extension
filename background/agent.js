@@ -3,8 +3,8 @@
 //
 // 长轮询 ERP 后端的 /api/agent/tasks 队列：
 //   1. chrome.alarms 每 10s 触发 pollOnce()
-//   2. pollOnce → POST /api/agent/tasks/claim   原子领最多 N 个任务
-//   3. 每个 task 异步 executeTask()
+//   2. pollOnce → POST /api/agent/tasks/claim   原子领 1 个任务
+//   3. 串行 await executeTask()
 //      - 启 60s heartbeat 续租
 //      - dispatch(task) 根据 kind 派发执行（先 stub，后续接 transform）
 //      - 完成 → POST /:id/result (success | failed)
@@ -36,14 +36,14 @@ import {
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
-const CLAIM_LIMIT      = 3;       // 每次最多领 3 个
+const CLAIM_LIMIT      = 1;       // 每次只领 1 个,避免半托区域任务并发开多个 tab
 const LEASE_SECONDS    = 300;     // 5min 租约
 const ALARM_NAME       = 'agent-poll';
 
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-violation-20260611b';
+const AGENT_BUILD_ID   = 'agent-settlement-report-20260617a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -61,6 +61,9 @@ const SUPPORTED_KINDS = [
   'scrape:returns',
   'scrape:logistics-bill',
   'scrape:reverse-logistics-bill',
+  'scrape:epr-goods-fee',
+  'scrape:epr-package-fee',
+  'scrape:epr-platform-fee',
   'scrape:settle-flow',
   'scrape:violation-appeals',
   'scrape:semi-ad',
@@ -428,7 +431,7 @@ export async function runSsoForRegion(tabId, regionKey, userId, signal, mallId =
   //    Sellfox 走法:content script 注入到所有子域,所以子域 page 上调用 loginByCode 是同源,不会被 CORS 拦。
   step('3. 跳转子域(切换 page origin 为 ' + region.host + ')');
   try {
-    await chrome.tabs.update(tabId, { url: `${baseUrl}/labor/bill` });
+    await chrome.tabs.update(tabId, { url: baseUrl });
     await waitTabComplete(tabId, signal, 15_000);
   } catch (e) {
     step(`✗ 跳转子域失败: ${e?.message}`);
@@ -440,7 +443,7 @@ export async function runSsoForRegion(tabId, regionKey, userId, signal, mallId =
   //     根因修复:原先无脑跑 loginByCode、按其成败判在线/过期,但「能否 SSO 重登」
   //     ≠「登录态是否有效」——美区现有 cookie 能采(orders 采集成功),但 loginByCode
   //     失败(targetMallId 取 kjmh 单一 mallId、美区店是另一个 mall 等)→ 被误报"去登录"。
-  //     子域业务页(/labor/bill)没被跳登录,即说明该子域 session 有效 → 在线。
+  //     子域首页没被跳登录,即说明该子域 session 有效 → 在线。
   try {
     const t = await chrome.tabs.get(tabId);
     if (t?.url && !isLoginFlowUrl(t.url)) {
@@ -653,8 +656,16 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+let _pollInFlight = false;
+
 // ── 派单轮询 ──────────────────────────────────────────────────────
 export async function pollOnce() {
+  if (_pollInFlight) {
+    console.log(`· 轮询跳过:上一轮任务仍在执行 (build=${AGENT_BUILD_ID})`);
+    return;
+  }
+  _pollInFlight = true;
+  try {
   const cfg = await getCfg();
   if (!cfg.apiUrl) {
     console.warn('· 轮询跳过:未配置 ERP API 地址(popup 顶部"切换账号"填)');
@@ -696,7 +707,10 @@ export async function pollOnce() {
     return;
   }
   console.log(`一、领取 ${tasks.length} 个任务:`, tasks.map((t) => taskKindLabel(t.kind)).join(' / '));
-  for (const t of tasks) executeTask(t, pluginInstanceId);
+  for (const t of tasks) await executeTask(t, pluginInstanceId);
+  } finally {
+    _pollInFlight = false;
+  }
 }
 
 // kind → 中文展示名
@@ -713,6 +727,9 @@ const KIND_LABELS = {
   'scrape:returns':            '退货退款',
   'scrape:logistics-bill':     '物流对账账单',
   'scrape:reverse-logistics-bill': '退货面单费',
+  'scrape:epr-goods-fee':      '商品环保费',
+  'scrape:epr-package-fee':    '物流包装环保费',
+  'scrape:epr-platform-fee':   '代付服务费',
   'scrape:settle-flow':        '结算流水(已到账)',
   'scrape:violation-appeals':  '违规罚款',
   'scrape:semi-ad':            '半托广告数据',
@@ -1058,6 +1075,9 @@ async function dispatch(task, signal, onProgress) {
     case 'scrape:returns':              return dispatchReturns(task, signal);
     case 'scrape:logistics-bill':       return dispatchLogisticsBill(task, signal);
     case 'scrape:reverse-logistics-bill': return dispatchReverseLogisticsBill(task, signal);
+    case 'scrape:epr-goods-fee':        return dispatchEprFee(task, signal, 'goods');
+    case 'scrape:epr-package-fee':      return dispatchEprFee(task, signal, 'package');
+    case 'scrape:epr-platform-fee':     return dispatchEprFee(task, signal, 'platform');
     case 'scrape:settle-flow':          return dispatchSettleFlow(task, signal);
     case 'scrape:violation-appeals':    return dispatchViolationAppeals(task, signal);
     case 'scrape:semi-ad':              return dispatchSemiAd(task, signal);
@@ -2293,11 +2313,15 @@ async function dispatchActivityEnroll(task, signal) {
 //   priceCurrencyFormat{amountYuan,currencyCode}/deductTime/serviceProviderName
 // payload: { mallId, region?, dateFrom?, dateTo?, settleStatus? }
 const REGION_TO_LOGISTICS_PAGE_URL = {
-  global: 'https://agentseller.temu.com/labor/stml-logistics',
-  us:     'https://agentseller-us.temu.com/labor/stml-logistics',
-  eu:     'https://agentseller-eu.temu.com/labor/stml-logistics',
+  global: 'https://agentseller.temu.com',
+  us:     'https://agentseller-us.temu.com',
+  eu:     'https://agentseller-eu.temu.com',
 };
-const LOGISTICS_BILL_LIST_PATH = '/api/udp/yuanbenchu/seller_central/recon_bill/list';
+const REGION_TO_LOGISTICS_BILL_LIST_PATH = {
+  global: '/api/yuanbenchu/seller_central/recon_bill/list',
+  eu:     '/api/yuanbenchu/seller_central/recon_bill/list',
+  us:     '/api/udp/yuanbenchu/seller_central/recon_bill/list',
+};
 
 async function dispatchLogisticsBill(task, signal) {
   const payload = task.payload ?? {};
@@ -2305,6 +2329,8 @@ async function dispatchLogisticsBill(task, signal) {
   const region = payload.region ?? 'us';
   const pageUrl = REGION_TO_LOGISTICS_PAGE_URL[region];
   if (!pageUrl) throw Object.assign(new Error(`logistics page not configured for region=${region}`), { code: 'BAD_REGION' });
+  const listPath = REGION_TO_LOGISTICS_BILL_LIST_PATH[region];
+  if (!listPath) throw Object.assign(new Error(`logistics list path not configured for region=${region}`), { code: 'BAD_REGION' });
 
   // deductTime 窗口:dateFrom/dateTo(YYYY-MM-DD,北京日)→ epoch ms;缺省近 15 天
   // ★ 显式 +08:00 后缀(SW/页面 new Date 无 TZ 串按 UTC 解析的老坑,R2 时区约定)
@@ -2331,7 +2357,7 @@ async function dispatchLogisticsBill(task, signal) {
       world: 'MAIN',
       func: runLogisticsBillInTab,
       args: [{
-        listPath: LOGISTICS_BILL_LIST_PATH,
+        listPath,
         settleStatus: payload.settleStatus ?? 1,   // 实抓页面默认 1;其他值未验证
         deductTimeBegin, deductTimeEnd,
         rowCount: 100,
@@ -2348,7 +2374,8 @@ async function dispatchLogisticsBill(task, signal) {
     // ★ 注入函数跑页面 MAIN world,console 不进 SW → diag/样本 return 回来这里结构化打日志
     if (!result.ok) {
       console.error(`[logistics-bill] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
-      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+      const firstResp = result.firstResp ? ` firstResp=${JSON.stringify(result.firstResp).slice(0, 500)}` : '';
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}${firstResp}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
     }
     const pages = result.pages ?? [];
     console.log(
@@ -2587,14 +2614,14 @@ async function runViolationAppealsInTab(args) {
 // 任务语义:抓半托退货面单费(逆向物流对账,商家承担)。raw 回传,后端
 // parseReverseLogisticsBillRows 解析(薄插件)。endpoint/字段 2026-06-11 实抓确认:
 //   POST /portal/udp/sunce/seller/center/bill/list
-//   body { deductTimeBegin/End(epoch ms), pageSize, scrollContextString }
+//   body { deductTimeBegin/End(epoch ms), pageSize, scrollContextString, sellerPortalBizType }
 //   响应 result.list[]:reconciliationId/parentOrderSn(直给)/wayBillSn/deductType/
 //   totalCharge(元串)/deductTime/sign/remark(退货面单费（全段）)
 // payload: { mallId, region?, dateFrom?, dateTo? }
 const REGION_TO_REVERSE_LOGISTICS_PAGE_URL = {
-  global: 'https://agentseller.temu.com/labor/stml-reverse-logistics',
-  us:     'https://agentseller-us.temu.com/labor/stml-reverse-logistics',
-  eu:     'https://agentseller-eu.temu.com/labor/stml-reverse-logistics',
+  global: 'https://agentseller.temu.com',
+  us:     'https://agentseller-us.temu.com',
+  eu:     'https://agentseller-eu.temu.com',
 };
 const REVERSE_LOGISTICS_BILL_LIST_PATH = '/portal/udp/sunce/seller/center/bill/list';
 
@@ -2604,6 +2631,10 @@ async function dispatchReverseLogisticsBill(task, signal) {
   const region = payload.region ?? 'us';
   const pageUrl = REGION_TO_REVERSE_LOGISTICS_PAGE_URL[region];
   if (!pageUrl) throw Object.assign(new Error(`reverse logistics page not configured for region=${region}`), { code: 'BAD_REGION' });
+  const sellerPortalBizType = payload.sellerPortalBizType == null ? 2 : Number(payload.sellerPortalBizType);
+  if (![2, 3].includes(sellerPortalBizType)) {
+    throw Object.assign(new Error(`invalid sellerPortalBizType=${payload.sellerPortalBizType} for scrape:reverse-logistics-bill`), { code: 'BAD_PAYLOAD' });
+  }
 
   // deductTime 窗口:dateFrom/dateTo(YYYY-MM-DD,北京日)→ epoch ms;缺省近 15 天
   const now = Date.now();
@@ -2634,9 +2665,10 @@ async function dispatchReverseLogisticsBill(task, signal) {
         pageSize: 100,
         maxPages: 50,
         mallId: String(payload.mallId),
+        sellerPortalBizType,
       }],
     });
-    console.log(`[reverse-logistics-bill] region=${region} 注入页面抓取(scrollContextString 翻页)...`);
+    console.log(`[reverse-logistics-bill] region=${region} bizType=${sellerPortalBizType} 注入页面抓取(scrollContextString 翻页)...`);
     const result = await Promise.race([
       scriptPromise.then(([r]) => r?.result),
       new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
@@ -2644,15 +2676,16 @@ async function dispatchReverseLogisticsBill(task, signal) {
     if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
     if (!result.ok) {
       console.error(`[reverse-logistics-bill] ✗ region=${region} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
-      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+      const firstResp = result.firstResp ? ` firstResp=${JSON.stringify(result.firstResp).slice(0, 500)}` : '';
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}${firstResp}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
     }
     const pages = result.pages ?? [];
     console.log(
-      `[reverse-logistics-bill] ✓ region=${region} pages=${pages.length} bills=${result.billCount}`,
+      `[reverse-logistics-bill] ✓ region=${region} bizType=${sellerPortalBizType} pages=${pages.length} bills=${result.billCount}`,
       { diag: result.diag, sampleBill: pages[0]?.result?.list?.[0] ?? null },
     );
     return {
-      region, pages,
+      region, sellerPortalBizType, pages,
       billCount: result.billCount ?? 0,
       diag: result.diag,
       completedAt: new Date().toISOString(),
@@ -2667,7 +2700,7 @@ async function dispatchReverseLogisticsBill(task, signal) {
 // anti-content 策略同正向 logistics-bill:先裸发,403/40001 升级 window.rose 显式签,
 // 429/20002 退避重试。
 async function runReverseLogisticsBillInTab(args) {
-  const { listPath, deductTimeBegin, deductTimeEnd, pageSize, maxPages, mallId } = args;
+  const { listPath, deductTimeBegin, deductTimeEnd, pageSize, maxPages, mallId, sellerPortalBizType } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   let signMode = 'none';
   const genAntiContent = () => {
@@ -2716,7 +2749,7 @@ async function runReverseLogisticsBillInTab(args) {
     let scrollContextString = null;
     let billCount = 0;
     for (let p = 1; p <= maxPages; p++) {
-      const data = await post({ deductTimeBegin, deductTimeEnd, pageSize, scrollContextString });
+      const data = await post({ deductTimeBegin, deductTimeEnd, pageSize, scrollContextString, sellerPortalBizType });
       if (!firstResp) firstResp = data;
       diag.pagesFetched++;
       const list = data?.result?.list ?? [];
@@ -2729,6 +2762,221 @@ async function runReverseLogisticsBillInTab(args) {
     diag.billsCollected = billCount;
     diag.signMode = signMode;
     return { ok: true, pages, billCount, diag };
+  } catch (e) {
+    diag.signMode = signMode;
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+  }
+}
+
+// ── scrape:epr-* 专用 wrapper ───────────────────────────────────────
+// 已确认接口来自 sellfox 反编译记录,当前只接欧区:
+//   goods:    POST /api/merchant/eprfee/goods/page-query
+//   package:  POST /api/merchant/eprfee/package/query
+//   platform: POST /api/merchant/eprfee/platform/deducted/page-query
+// 打开的 tab 始终是 agentseller-eu 的业务页,不是 endpoint 落地页。
+const EPR_EU_PAGE_URL = 'https://agentseller-eu.temu.com';
+const EPR_FEE_CONFIG = {
+  goods: {
+    label: '商品环保费',
+    listPath: '/api/merchant/eprfee/goods/page-query',
+    queryTypes: [2, 4],
+    body: ({ financeStartTime, financeEndTime, pageNum, pageSize, queryType }) => ({
+      financeStartTime, financeEndTime, pageNum, pageSize, queryType,
+    }),
+    list: (data, queryType) => queryType === 4
+      ? (data?.result?.refundedEprFeeInfoList ?? data?.result?.dataList ?? [])
+      : (data?.result?.deductedEprFeeInfoList ?? data?.result?.dataList ?? []),
+  },
+  package: {
+    label: '物流包装环保费',
+    listPath: '/api/merchant/eprfee/package/query',
+    queryTypes: [2],
+    body: ({ financeStartTime, financeEndTime, pageNum, pageSize, queryType }) => ({
+      financeStartTime, financeEndTime, pageNum, pageSize, queryType,
+    }),
+    list: (data) => data?.result?.deductedEprFeeInfoList ?? data?.result?.dataList ?? [],
+  },
+  platform: {
+    label: '代付服务费',
+    listPath: '/api/merchant/eprfee/platform/deducted/page-query',
+    queryTypes: [null],
+    body: ({ financeDateStart, financeDateEnd, pageNum, pageSize }) => ({
+      financeDateStart, financeDateEnd, pageNum, pageSize,
+    }),
+    list: (data) => data?.result?.dataList ?? [],
+  },
+};
+
+async function dispatchEprFee(task, signal, feeType) {
+  const payload = task.payload ?? {};
+  const cfg = EPR_FEE_CONFIG[feeType];
+  if (!cfg) throw Object.assign(new Error(`unsupported epr fee type=${feeType}`), { code: 'BAD_PAYLOAD' });
+  if (!payload.mallId) throw Object.assign(new Error(`payload.mallId missing for ${task.kind}`), { code: 'BAD_PAYLOAD' });
+  const region = payload.region ?? 'eu';
+  if (region !== 'eu') {
+    throw Object.assign(new Error(`EPR ${feeType} endpoint only confirmed for eu, got region=${region}`), { code: 'BAD_REGION' });
+  }
+
+  const now = Date.now();
+  const dateFrom = payload.dateFrom ?? payload.startDate ?? (() => {
+    const d = new Date(now - 30 * 86_400_000 + 8 * 3600_000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  })();
+  const dateTo = payload.dateTo ?? payload.endDate ?? (() => {
+    const d = new Date(now + 8 * 3600_000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  })();
+  const financeStartTime = new Date(`${dateFrom}T00:00:00+08:00`).getTime();
+  const financeEndTime = new Date(`${dateTo}T23:59:59.999+08:00`).getTime();
+  if (!Number.isFinite(financeStartTime) || !Number.isFinite(financeEndTime)) {
+    throw Object.assign(new Error('invalid dateFrom/dateTo for epr fee'), { code: 'BAD_PAYLOAD' });
+  }
+
+  const TAB_LOAD_TIMEOUT_MS = 30_000;
+  const SCRIPT_TIMEOUT_MS = 5 * 60_000;
+  let tabId = null;
+  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
+
+  try {
+    const tab = await chrome.tabs.create({ url: EPR_EU_PAGE_URL, active: false, pinned: false });
+    tabId = tab.id;
+    console.log(`[epr-fee] ${cfg.label} tab ${tabId} → ${EPR_EU_PAGE_URL}`);
+    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
+    const t = await chrome.tabs.get(tabId);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`eu EPR 页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);
+
+    const scriptPromise = chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: runEprFeeInTab,
+      args: [{
+        feeType,
+        listPath: cfg.listPath,
+        financeStartTime,
+        financeEndTime,
+        financeDateStart: dateFrom,
+        financeDateEnd: dateTo,
+        pageSize: 100,
+        maxPages: 100,
+        mallId: String(payload.mallId),
+      }],
+    });
+    console.log(`[epr-fee] ${cfg.label} region=eu 注入页面抓取 window=${dateFrom}~${dateTo} ...`);
+    const result = await Promise.race([
+      scriptPromise.then(([r]) => r?.result),
+      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('SCRIPT_TIMEOUT'), { code: 'SCRIPT_TIMEOUT' })), SCRIPT_TIMEOUT_MS)),
+    ]);
+    if (!result) throw Object.assign(new Error('executeScript 无返回'), { code: 'NO_RESULT' });
+    if (!result.ok) {
+      console.error(`[epr-fee] ✗ ${cfg.label} 页面内 fetch 失败`, { error: result.error, code: result.code, diag: result.diag, firstResp: result.firstResp });
+      throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
+    }
+    console.log(`[epr-fee] ✓ ${cfg.label} pages=${result.pages?.length ?? 0} rows=${result.rowCount ?? 0}`, { diag: result.diag });
+    return {
+      region: 'eu',
+      feeType,
+      pages: result.pages ?? [],
+      rowCount: result.rowCount ?? 0,
+      window: { dateFrom, dateTo },
+      diag: result.diag,
+      completedAt: new Date().toISOString(),
+      agent: agentDiag(),
+    };
+  } finally {
+    await cleanup();
+  }
+}
+
+async function runEprFeeInTab(args) {
+  const { feeType, listPath, financeStartTime, financeEndTime, financeDateStart, financeDateEnd, pageSize, maxPages, mallId } = args;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const configs = {
+    goods: {
+      queryTypes: [2, 4],
+      body: ({ pageNum, queryType }) => ({ financeStartTime, financeEndTime, pageNum, pageSize, queryType }),
+      list: (data, queryType) => queryType === 4
+        ? (data?.result?.refundedEprFeeInfoList ?? data?.result?.dataList ?? [])
+        : (data?.result?.deductedEprFeeInfoList ?? data?.result?.dataList ?? []),
+    },
+    package: {
+      queryTypes: [2],
+      body: ({ pageNum, queryType }) => ({ financeStartTime, financeEndTime, pageNum, pageSize, queryType }),
+      list: (data) => data?.result?.deductedEprFeeInfoList ?? data?.result?.dataList ?? [],
+    },
+    platform: {
+      queryTypes: [null],
+      body: ({ pageNum }) => ({ financeDateStart, financeDateEnd, pageNum, pageSize }),
+      list: (data) => data?.result?.dataList ?? [],
+    },
+  };
+  const cfg = configs[feeType];
+  if (!cfg) return { ok: false, code: 'BAD_FEE_TYPE', error: `unknown feeType=${feeType}` };
+
+  let signMode = 'none';
+  const genAntiContent = () => {
+    try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+  };
+  const post = async (body) => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const headers = { 'content-type': 'application/json', 'mallid': String(mallId) };
+      if (signMode === 'rose') {
+        const ac = genAntiContent();
+        if (ac) headers['anti-content'] = ac;
+      }
+      const resp = await fetch(listPath, { method: 'POST', credentials: 'include', headers, body: JSON.stringify(body) });
+      if (resp.status === 429) {
+        const ra = Number(resp.headers.get('Retry-After')) || 0;
+        await wait(ra ? ra * 1000 : 2000 * (attempt + 1));
+        continue;
+      }
+      if (resp.status === 403) {
+        if (signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP 403: ${txt.slice(0, 120)}`);
+      }
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 120)}`);
+      }
+      const data = await resp.json();
+      if (data && data.success === false) {
+        const code = Number(data.errorCode);
+        if (code === 40001 && signMode === 'none' && typeof window.rose === 'function') { signMode = 'rose'; continue; }
+        if (code === 20002 || /系统异常|请稍后|刷新重试/.test(data.errorMsg || '')) {
+          await wait(2000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`errorCode=${data.errorCode}: ${String(data.errorMsg ?? '').slice(0, 120)}`);
+      }
+      return data;
+    }
+    throw new Error(`${listPath.slice(0, 50)}: 退避重试 6 次仍失败(限流/系统异常)`);
+  };
+
+  const diag = { pagesFetched: 0, rowsCollected: 0, signMode, totals: [] };
+  let firstResp = null;
+  try {
+    const pages = [];
+    let rowCount = 0;
+    for (const queryType of cfg.queryTypes) {
+      for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+        const data = await post(cfg.body({ pageNum, queryType }));
+        if (!firstResp) firstResp = data;
+        diag.pagesFetched++;
+        const list = cfg.list(data, queryType);
+        const total = data?.result?.total ?? data?.result?.totalCount ?? data?.result?.totalItemNum ?? null;
+        if (pageNum === 1) diag.totals.push({ queryType, total });
+        rowCount += list.length;
+        pages.push({ feeType, queryType, pageNum, response: data });
+        if (list.length < pageSize) break;
+        if (total != null && pageNum * pageSize >= Number(total)) break;
+        await wait(300);
+      }
+    }
+    diag.rowsCollected = rowCount;
+    diag.signMode = signMode;
+    return { ok: true, pages, rowCount, diag };
   } catch (e) {
     diag.signMode = signMode;
     return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
@@ -2904,10 +3152,10 @@ async function runSettleFlowInTab(args) {
 // region 用 popup 同款短 key('global'/'eu'/'us'/'kjmh'),保证 updateLoginHealth() 写的
 // key 跟 popup 读的 key 一致(否则实测结果永远显示不出来)
 const SETTLEMENT_VARIANTS = [
-  { drIndex: 0, name: '卖家中心', origin: 'https://seller.kuajingmaihuo.com', pageUrl: 'https://seller.kuajingmaihuo.com/labor/bill', taskType: 19, region: 'kjmh' },
-  { drIndex: 1, name: '全球',     origin: 'https://agentseller.temu.com',    pageUrl: 'https://agentseller.temu.com/labor/bill',    taskType: 31, region: 'global' },
-  { drIndex: 2, name: '欧洲',     origin: 'https://agentseller-eu.temu.com', pageUrl: 'https://agentseller-eu.temu.com/labor/bill', taskType: 31, region: 'eu' },
-  { drIndex: 3, name: '美国',     origin: 'https://agentseller-us.temu.com', pageUrl: 'https://agentseller-us.temu.com/labor/bill', taskType: 31, region: 'us' },
+  { drIndex: 0, name: '卖家中心', origin: 'https://seller.kuajingmaihuo.com', pageUrl: 'https://seller.kuajingmaihuo.com/main', taskType: 19, region: 'kjmh' },
+  { drIndex: 1, name: '全球',     origin: 'https://agentseller.temu.com',    pageUrl: 'https://agentseller.temu.com',    taskType: 31, region: 'global' },
+  { drIndex: 2, name: '欧洲',     origin: 'https://agentseller-eu.temu.com', pageUrl: 'https://agentseller-eu.temu.com', taskType: 31, region: 'eu' },
+  { drIndex: 3, name: '美国',     origin: 'https://agentseller-us.temu.com', pageUrl: 'https://agentseller-us.temu.com', taskType: 31, region: 'us' },
 ];
 
 async function dispatchSettlement(task, signal, onProgress) {
@@ -2935,15 +3183,23 @@ async function dispatchSettlement(task, signal, onProgress) {
   }
 
   // 架构(2026-05-24h 重构):
-  //   1. 在 kjmh 上 create + poll + 下载 drIndex=0(卖家中心)— 唯一的 create
+  //   1. 在 kjmh 上 create + poll + 下载 drIndex=0(卖家中心),并拿跨域票据
   //   2. kjmh exportRow 含 agentSellerExportParams + agentSellerExportSign(跨域票据)
-  //   3. 对 drIndex 1/2/3:打开 agentseller-{region}.temu.com/labor/bill-download-with-detail?params=&sign=
-  //      让页面 mount → MAIN world hook fetch 收集 XHR → 找到 fileUrl 或返回诊断
-  // 注:暂不支持 payload.drIndex(因为 agentseller 依赖 kjmh row 的票据,必须先跑 kjmh)
+  //   3. 对 drIndex 1/2/3:打开 agentseller-{region}.temu.com 域名页
+  //      在 MAIN world 直接调用 download API → 找到 fileUrl 并下载 xlsx
+  // payload.drIndex 指定单个结算区域时,仍先跑 kjmh 拿票据,但 result 只返回目标区域。
+  const requestedDrIndex = payload.drIndex == null ? null : Number(payload.drIndex);
+  if (requestedDrIndex != null && !SETTLEMENT_VARIANTS.some((v) => v.drIndex === requestedDrIndex)) {
+    throw Object.assign(new Error(`invalid settlement drIndex=${payload.drIndex}`), { code: 'BAD_PAYLOAD' });
+  }
   const kjmhVariant = SETTLEMENT_VARIANTS[0];
-  const agentVariants = SETTLEMENT_VARIANTS.slice(1);
+  const agentVariants = requestedDrIndex == null
+    ? SETTLEMENT_VARIANTS.slice(1)
+    : (requestedDrIndex === 0 ? [] : SETTLEMENT_VARIANTS.filter((v) => v.drIndex === requestedDrIndex));
+  const includeKjmhResult = requestedDrIndex == null || requestedDrIndex === 0;
+  const totalExpected = (includeKjmhResult ? 1 : 0) + agentVariants.length;
 
-  console.log(`[Temu后台] settlement: kjmh + ${agentVariants.length} agentseller variants, mall=${mallIdToSend}`);
+  console.log(`[Temu后台] settlement: ${requestedDrIndex == null ? 'all variants' : `drIndex=${requestedDrIndex}`} via kjmh ticket, mall=${mallIdToSend}`);
 
   const variants = [];
   let kjmhRow = null;
@@ -2954,7 +3210,7 @@ async function dispatchSettlement(task, signal, onProgress) {
     onProgress({
       variants,
       okCount: variants.filter(v => v.ok).length,
-      totalCount: 1 + agentVariants.length,
+      totalCount: totalExpected,
       currentlyRunning: extra.runningName ?? null,
       phase: extra.phase ?? 'running',
       dateFrom: payload.dateFrom,
@@ -2974,7 +3230,7 @@ async function dispatchSettlement(task, signal, onProgress) {
       entry.exportRowKeys = Object.keys(kjmhRow);
       delete entry.exportRow;
     }
-    variants.push(entry);
+    if (includeKjmhResult) variants.push(entry);
     if (r.ok) {
       console.log(`[Temu后台] settlement[卖家中心]: ✓ ok bytes=${r.fileBytes} polls=${r.polls}`);
       console.log(`[Temu后台] settlement[卖家中心]: kjmh row keys=${entry.exportRowKeys?.join(',')}`);
@@ -2982,10 +3238,11 @@ async function dispatchSettlement(task, signal, onProgress) {
       console.warn(`[Temu后台] settlement[卖家中心]: ✗ phase=${r.phase} code=${r.code} error=${String(r.error ?? '').slice(0, 250)}`);
     }
   } catch (e) {
-    variants.push({
+    const entry = {
       drIndex: 0, name: '卖家中心', region: kjmhVariant.region, taskType: kjmhVariant.taskType,
       ok: false, code: e?.code ?? 'VARIANT_FAILED', error: String(e?.message ?? e),
-    });
+    };
+    if (includeKjmhResult) variants.push(entry);
     console.warn(`[Temu后台] settlement[卖家中心]: ✗ throw ${e?.message ?? e}`);
   }
   push();  // kjmh 完成,推一次
@@ -3177,14 +3434,11 @@ async function runOneSettlementVariant(variant, { beginTime, endTime, mallId }, 
   }
 }
 
-// ── agentseller-{region} 跨域 download 诊断版本(2026-05-24h)──────
-// 用 kjmh row 拿到的 params + sign 拼 /labor/bill-download-with-detail URL
-// 打开 hidden tab → MAIN world hook fetch → 等 15s 让 page mount + 自动调 XHR
-// 返回:{ ok: false, code: 'DIAG_COLLECTED', captured: [...] }
-// 后续根据 captured 内容知道 fileUrl 哪儿来,再升级到真实下载
+// ── agentseller-{region} 跨域 download ──────────────────────────────
+// 不再打开 /labor/bill-download-with-detail 落地页;只打开对应域名页,再在 MAIN
+// world 直接调用 /api/merchant/file/export/download 下载 xlsx。
 async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, signal) {
   const TAB_LOAD_TIMEOUT_MS = 30_000;
-  const downloadUrl = `${variant.origin}/labor/bill-download-with-detail?params=${encodeURIComponent(params)}&sign=${encodeURIComponent(sign)}`;
 
   let tabId = null;
   let onUpdatedListener = null;
@@ -3200,9 +3454,9 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
   };
 
   try {
-    const tab = await chrome.tabs.create({ url: downloadUrl, active: false, pinned: false });
+    const tab = await chrome.tabs.create({ url: variant.pageUrl, active: false, pinned: false });
     tabId = tab.id;
-    console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${downloadUrl.slice(0, 150)}`);
+    console.log(`[Temu后台] settlement[${variant.name}]: tab ${tabId} → ${variant.pageUrl}`);
 
     await new Promise((resolve, reject) => {
       const startedAt = Date.now();
@@ -3236,8 +3490,7 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
         await updateLoginHealth(variant.region, 'expired', `auto-login failed: ${loginResult.reason}`);
         return { ok: false, phase: 'login', code: 'LOGIN_REQUIRED', error: `${variant.region} auto-login ${loginResult.reason}` };
       }
-      // download tab 跳回的 redirectUrl 是任务 download URL,这里直接 navigate 回去触发 fetch
-      await chrome.tabs.update(tabId, { url: downloadUrl });
+      await chrome.tabs.update(tabId, { url: variant.pageUrl });
       await waitTabComplete(tabId, signal, 30_000);
       t = await chrome.tabs.get(tabId);
       if (t?.url && isLoginFlowUrl(t.url)) {
@@ -3250,10 +3503,10 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: hookAndDownloadXlsx,
-      args: [{ waitMs: 120_000 }],  // 欧洲一个月 25k 行,server 生成可能 1-3 min;给 page 2 min 等 fileUrl
+      func: downloadAgentsellerXlsxFromTicket,
+      args: [{ params, sign, mallId: String(mallId ?? '') }],
     });
-    const SCRIPT_TIMEOUT_MS_INNER = 6 * 60_000; // 总外层 6 分钟覆盖 wait + xlsx download
+    const SCRIPT_TIMEOUT_MS_INNER = 6 * 60_000;
     const result = await Promise.race([
       scriptPromise.then(([r]) => r?.result),
       new Promise((_, reject) => setTimeout(
@@ -3268,6 +3521,105 @@ async function runAgentsellerVariantDiag(variant, { params, sign, mallId }, sign
   } finally {
     await cleanup();
   }
+}
+
+// MAIN world:用 kjmh row 的 agentSellerExportParams/Sign 在 agentseller 域直接换 fileUrl。
+// 必须是纯函数(executeScript 序列化)
+function downloadAgentsellerXlsxFromTicket(args) {
+  return (async () => {
+    const { params, sign, mallId } = args;
+    const attempts = [];
+    const decodeParams = () => {
+      const vals = [params];
+      try { vals.push(decodeURIComponent(params)); } catch {}
+      for (const v of vals) {
+        if (!v) continue;
+        try {
+          if (String(v).trim().startsWith('{')) return JSON.parse(v);
+        } catch {}
+        try {
+          return JSON.parse(atob(v));
+        } catch {}
+      }
+      return null;
+    };
+    const decoded = decodeParams();
+    const genAntiContent = () => {
+      try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
+    };
+    const trim = (v, n = 500) => String(v ?? '').slice(0, n);
+    const tryDownload = async (body, label) => {
+      const headers = {
+        'content-type': 'application/json',
+        'mallid': String(mallId),
+      };
+      const ac = genAntiContent();
+      if (ac) headers['anti-content'] = ac;
+      if (sign) {
+        headers.sign = String(sign);
+        headers['x-sign'] = String(sign);
+      }
+      const resp = await fetch('/api/merchant/file/export/download', {
+        method: 'POST',
+        credentials: 'include',
+        headers,
+        body: JSON.stringify(body),
+      });
+      const text = await resp.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch {}
+      attempts.push({ label, status: resp.status, bodyKeys: body && typeof body === 'object' ? Object.keys(body).slice(0, 20) : [], resp: trim(text) });
+      if (!resp.ok) return null;
+      return json?.result?.fileUrl || json?.fileUrl || null;
+    };
+
+    try {
+      const bodies = [];
+      if (decoded && typeof decoded === 'object') {
+        bodies.push({ label: 'decoded+sign', body: { ...decoded, sign } });
+        bodies.push({ label: 'decoded', body: decoded });
+        if (decoded.id != null || decoded.taskType != null) {
+          bodies.push({ label: 'id-taskType+sign', body: { id: decoded.id, taskType: decoded.taskType, sign } });
+          bodies.push({ label: 'id-taskType', body: { id: decoded.id, taskType: decoded.taskType } });
+        }
+      }
+      bodies.push({ label: 'params-sign', body: { params, sign } });
+      bodies.push({ label: 'agentSeller-fields', body: { agentSellerExportParams: params, agentSellerExportSign: sign } });
+      bodies.push({ label: 'export-fields', body: { exportParams: params, exportSign: sign } });
+
+      let fileUrl = null;
+      for (const candidate of bodies) {
+        fileUrl = await tryDownload(candidate.body, candidate.label);
+        if (fileUrl) break;
+      }
+      if (!fileUrl) {
+        return { ok: false, phase: 'download', code: 'DOWNLOAD_NO_URL', error: 'agentseller download did not return fileUrl', attempts };
+      }
+
+      const blobResp = await fetch(fileUrl, { method: 'GET', credentials: 'include' });
+      if (!blobResp.ok) {
+        return { ok: false, phase: 'blob', code: 'BLOB_FAILED', error: `HTTP ${blobResp.status}`, attempts };
+      }
+      const contentType = blobResp.headers.get('content-type') || '';
+      const buf = await blobResp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const isXlsx = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+      if (!isXlsx) {
+        const preview = String.fromCharCode.apply(null, bytes.subarray(0, Math.min(200, bytes.length)));
+        return { ok: false, phase: 'blob', code: 'NOT_XLSX', error: `non-xlsx (ct=${contentType}, bytes=${bytes.length}): ${preview.slice(0, 150)}`, attempts };
+      }
+      const CHUNK = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      const filenameMatch = fileUrl.match(/\/([^/?]+\.xlsx)/);
+      const filename = filenameMatch ? filenameMatch[1] : `agentseller-${Date.now()}.xlsx`;
+      return { ok: true, xlsxBase64: btoa(binary), filename, fileBytes: buf.byteLength, fileUrl, attempts };
+    } catch (e) {
+      return { ok: false, phase: 'unexpected', code: 'UNEXPECTED', error: String(e?.message ?? e), attempts };
+    }
+  })();
 }
 
 // MAIN world:hook fetch,拦截 /file/export/download 的响应拿 fileUrl → fetch xlsx → base64

@@ -96,7 +96,7 @@ async function apiFetch(path, opts = {}) {
 
 const KIND_LABELS = {
   'scrape:activity-data':    '获取活动数据',
-  'scrape:settlement':       '获取结算数据',
+  'scrape:settlement':       '结算报表',
   'scrape:flux-analysis':    '获取流量分析',
   'scrape:sales-30d':        '获取近30天销量',
   'scrape:declared-price':   '获取申报价格',
@@ -104,10 +104,13 @@ const KIND_LABELS = {
   'scrape:order-amounts':    '获取订单数据',
   'scrape:returns':          '获取退货退款',
   'scrape:semi-ad':          '获取广告数据',
-  'scrape:settle-flow':      '获取结算流水',
-  'scrape:logistics-bill':   '获取物流对账账单',
-  'scrape:reverse-logistics-bill': '获取退货面单费',
-  'scrape:violation-appeals': '获取违规罚款',
+  'scrape:settle-flow':      '账务明细',
+  'scrape:logistics-bill':   '发货面单费',
+  'scrape:reverse-logistics-bill': '退货面单费',
+  'scrape:epr-goods-fee':    '商品环保费',
+  'scrape:epr-package-fee':  '物流包装环保费',
+  'scrape:epr-platform-fee': '代付服务费',
+  'scrape:violation-appeals': '违规罚款',
   'submit:activity-enroll':  '提交活动报名',
   'submit:price-confirm':    '提交价格确认',
   'submit:price-reject':     '提交价格驳回',
@@ -121,30 +124,214 @@ const STATUS_TO_UI = {
   cancelled: { cls: 'pending', label: '已取消' },
 };
 const REGION_LABEL = {
-  us: '美区', eu: '欧区', jp: '日区', mx: '墨区', global: '全球', cn: '跨境', pa: '托管',
+  us: '美区', eu: '欧区', jp: '日区', mx: '墨区', global: '全球', kjmh: '卖家中心', cn: '跨境', pa: '托管',
 };
 function regionFromTask(t) {
   const r = t.payload?.region || t.payload?.site || '';
   return REGION_LABEL[r] || r || '-';
 }
 
-// 模块 key → backend task kind
-const MODULE_TO_KIND = {
-  'account-funds':  'scrape:settlement',
-  'sales-30d':      'scrape:sales-30d',
-  'settle-report':  'scrape:settlement',
-  'declare-price':  'scrape:declared-price',
-  'activity-data':  'scrape:activity-data',
-  'marketing-act':  'scrape:marketing-activity',
-  'flux-analysis':  'scrape:flux-analysis',
-  'orders':         'scrape:order-amounts',
-  'returns':        'scrape:returns',
-  'semi-ad':        'scrape:semi-ad',
-  'settle-flow':    'scrape:settle-flow',
-  'logistics-bill': 'scrape:logistics-bill',
-  'reverse-logistics-bill': 'scrape:reverse-logistics-bill',
-  'violation-appeals':      'scrape:violation-appeals',
+const SEMI_SETTLEMENT_REPORT_KINDS = [
+  'scrape:settlement',
+  'scrape:logistics-bill',
+  'scrape:reverse-logistics-bill',
+  'scrape:epr-goods-fee',
+  'scrape:epr-package-fee',
+  'scrape:epr-platform-fee',
+];
+const FULL_SETTLEMENT_REPORT_KINDS = ['scrape:settlement'];
+const SETTLEMENT_REPORT_MODULE_KEY = 'settle-report';
+const SETTLEMENT_REPORT_TASK_API = '/api/agent/settlement-report/tasks';
+const SETTLEMENT_REPORT_STATUS_API = '/api/agent/settlement-report/status';
+// 后端聚合接口落地后切 true；当前先复用现有 agent task kinds，保证入库解析不变。
+const USE_RESERVED_SETTLEMENT_REPORT_API = false;
+const USE_RESERVED_SETTLEMENT_REPORT_STATUS_API = false;
+
+// 模块 key → backend task kind(s)。settle-report 在不同托管模式下对应不同 kind 集合。
+const MODULE_TO_KINDS = {
+  'sales-30d':      ['scrape:sales-30d'],
+  'settle-report':  { full: FULL_SETTLEMENT_REPORT_KINDS, semi: SEMI_SETTLEMENT_REPORT_KINDS },
+  'declare-price':  ['scrape:declared-price'],
+  'activity-data':  ['scrape:activity-data'],
+  'marketing-act':  ['scrape:marketing-activity'],
+  'flux-analysis':  ['scrape:flux-analysis'],
+  'orders':         ['scrape:order-amounts'],
+  'returns':        ['scrape:returns'],
+  'semi-ad':        ['scrape:semi-ad'],
 };
+
+const REGION_ORDER = ['kjmh', 'global', 'eu', 'us', 'cn', 'pa', 'jp', 'mx'];
+const KIND_ORDER = [
+  'scrape:settlement',
+  'scrape:settle-flow',
+  'scrape:logistics-bill',
+  'scrape:reverse-logistics-bill',
+  'scrape:epr-goods-fee',
+  'scrape:epr-package-fee',
+  'scrape:epr-platform-fee',
+  'scrape:violation-appeals',
+  'scrape:sales-30d',
+  'scrape:declared-price',
+  'scrape:marketing-activity',
+  'scrape:activity-data',
+  'scrape:flux-analysis',
+  'scrape:order-amounts',
+  'scrape:returns',
+  'scrape:semi-ad',
+];
+
+function moduleKinds(moduleKey, custody = activeCustody) {
+  const spec = MODULE_TO_KINDS[moduleKey];
+  if (!spec) return [];
+  if (Array.isArray(spec)) return spec;
+  return spec[custody] || spec.default || [];
+}
+
+function moduleKeyForKind(kind, custody = activeCustody) {
+  const modules = MODULES_BY_CUSTODY[custody] || [];
+  const hit = modules.find((m) => moduleKinds(m.key, custody).includes(kind));
+  return hit?.key || null;
+}
+
+function taskRegionKey(task) {
+  return task.payload?.region || task.payload?.site || '';
+}
+
+function taskProjectKey(task) {
+  const payload = task?.payload || {};
+  if (payload.settlementProjectKey) return String(payload.settlementProjectKey);
+  const region = taskRegionKey(task);
+  if (task.kind === 'scrape:settlement' && payload.drIndex != null) {
+    const byDr = { 0: 'kjmh', 1: 'global', 2: 'eu', 3: 'us' };
+    const r = byDr[Number(payload.drIndex)] || region;
+    return r ? `account-${r}` : '';
+  }
+  if (task.kind === 'scrape:reverse-logistics-bill' && payload.sellerPortalBizType != null) {
+    const suffix = Number(payload.sellerPortalBizType) === 3 ? 'temu' : 'merchant';
+    return region ? `return-${suffix}-${region}` : '';
+  }
+  if (task.kind === 'scrape:epr-goods-fee' && region) return `epr-product-${region}`;
+  if (task.kind === 'scrape:epr-package-fee' && region) return `epr-package-${region}`;
+  if (task.kind === 'scrape:epr-platform-fee' && region) return `epr-service-${region}`;
+  return '';
+}
+
+function taskRangeInfo(task) {
+  const p = task?.payload || {};
+  const from = p.dateFrom || p.startDate || p.orderCreateTimeStart || p.deductDateFrom || '';
+  const to = p.dateTo || p.endDate || p.orderCreateTimeEnd || p.deductDateTo || from || '';
+  const label = from && to ? `${from}~${to}` : '未指定时间范围';
+  return {
+    from,
+    to,
+    key: from || to ? `${from || '-'}..${to || '-'}` : 'unknown',
+    label,
+  };
+}
+
+function indexOrEnd(list, value) {
+  const i = list.indexOf(value);
+  return i >= 0 ? i : list.length;
+}
+
+function displayTaskName(task) {
+  const base = KIND_LABELS[task.kind] || task.kind;
+  const region = regionFromTask(task);
+  return region && region !== '-' ? `${base}（${region}）` : base;
+}
+
+function settlementPath(path) {
+  return `【${path}】`;
+}
+
+const SETTLEMENT_ACCOUNT_DR_INDEX = { kjmh: 0, global: 1, eu: 2, us: 3 };
+const SETTLEMENT_EPR_KIND_BY_TYPE = {
+  product: 'scrape:epr-goods-fee',
+  package: 'scrape:epr-package-fee',
+  service: 'scrape:epr-platform-fee',
+};
+
+const SETTLEMENT_REPORT_PROJECTS = [
+  {
+    key: 'account-kjmh',
+    label: '账务明细（Temu卖家中心）',
+    path: settlementPath('卖家履约中心/账户资金/对账中心/账务明细/导出：账务详情'),
+    kind: 'scrape:settlement',
+    region: 'kjmh',
+    drIndex: SETTLEMENT_ACCOUNT_DR_INDEX.kjmh,
+  },
+  ...['global', 'eu', 'us'].flatMap((region) => {
+    const label = REGION_LABEL[region];
+    const base = [
+      {
+        key: `account-${region}`,
+        label: `账务明细（${label}）`,
+        path: settlementPath('卖家履约中心/账户资金/对账中心/账务明细/导出：账务详情'),
+        kind: 'scrape:settlement',
+        region,
+        drIndex: SETTLEMENT_ACCOUNT_DR_INDEX[region],
+      },
+      {
+        key: `shipping-label-${region}`,
+        label: `发货面单费（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/发货面单费'),
+        kind: 'scrape:logistics-bill',
+        region,
+      },
+      {
+        key: `return-merchant-${region}`,
+        label: `退货面单费(退至商家仓)（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/退货面单费'),
+        kind: 'scrape:reverse-logistics-bill',
+        region,
+        sellerPortalBizType: 2,
+      },
+      {
+        key: `return-temu-${region}`,
+        label: `退货面单费(退至Temu仓)（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/退货面单费'),
+        kind: 'scrape:reverse-logistics-bill',
+        region,
+        sellerPortalBizType: 3,
+      },
+    ];
+    if (region === 'us') return base;
+    const eprKind = (type) => region === 'eu' ? SETTLEMENT_EPR_KIND_BY_TYPE[type] : null;
+    const eprReserved = region !== 'eu';
+    return base.concat([
+      {
+        key: `epr-product-${region}`,
+        label: `商品环保费（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/EPR费用管理'),
+        kind: eprKind('product'),
+        region,
+        eprFeeType: 'product',
+        reserved: eprReserved,
+        reservedReason: eprReserved ? '待抓包' : undefined,
+      },
+      {
+        key: `epr-package-${region}`,
+        label: `物流包装环保费（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/EPR费用管理'),
+        kind: eprKind('package'),
+        region,
+        eprFeeType: 'package',
+        reserved: eprReserved,
+        reservedReason: eprReserved ? '待抓包' : undefined,
+      },
+      {
+        key: `epr-service-${region}`,
+        label: `代付服务费（${label}）`,
+        path: settlementPath('Temu seller central/账户资金/EPR费用管理'),
+        kind: eprKind('service'),
+        region,
+        eprFeeType: 'service',
+        reserved: eprReserved,
+        reservedReason: eprReserved ? '待抓包' : undefined,
+      },
+    ]);
+  }),
+];
 
 // 手动派单的区域扇出:endpoint 带 -us/-eu 子域的 kind 要分 3 区各采一次
 // (没卖货的区域返 0 行无害,与后端定时口径一致);单一固定域名(ads.temu.com / 主域)
@@ -162,21 +349,15 @@ const KIND_REGIONS = {
 const MANUAL_MAX_RANGE_DAYS = 31;
 const MANUAL_REPORT_TYPES_BY_CUSTODY = {
   full: [
-    { key: 'account-funds', label: '账户资金结算数据' },
     { key: 'sales-30d',     label: '近30天历史销量' },
     { key: 'settle-report', label: '结算报表' },
   ],
   semi: [
-    { key: 'orders',      label: '订单数据' },
-    { key: 'returns',     label: '退货退款' },
-    { key: 'settle-flow', label: '结算流水' },
+    { key: 'orders',        label: '订单数据' },
+    { key: 'returns',       label: '退货退款' },
+    { key: 'settle-report', label: '结算报表' },
   ],
 };
-
-// 反向:kind → module key(给 renderProgress 过滤 + computeModuleCounts 计数用)
-const KIND_TO_MODULE = Object.fromEntries(
-  Object.entries(MODULE_TO_KIND).map(([m, k]) => [k, m])
-);
 
 let _apiShops = [];          // /api/shops 返回
 let _apiTasks = [];          // /api/agent/tasks 返回
@@ -214,24 +395,41 @@ function buildShopsFromApi(custodyFilter = activeCustody) {
   return _apiShops
     .filter((s) => s.platform === 'temu' && (custodyFilter == null || s.shopType === custodyFilter))
     .map((s) => {
-      // 按 kind 合并:同 kind 多次任务只留最新一条 + 执行时间。
+      // 按 kind + region + 时间范围合并:同一批同类任务只留最新一条 + 执行时间。
       // _apiTasks 已按 createdAt desc(后端默认),所以第一遇到的就是最新。
-      const byKind = new Map();
+      const byTaskKey = new Map();
       for (const t of _apiTasks) {
         if (t.shopId !== s.id) continue;
-        if (!byKind.has(t.kind)) byKind.set(t.kind, t);
+        const range = taskRangeInfo(t);
+        const key = `${t.kind}::${taskRegionKey(t)}::${taskProjectKey(t)}::${range.key}`;
+        if (!byTaskKey.has(key)) byTaskKey.set(key, t);
       }
-      const tasks = Array.from(byKind.values()).map((t) => {
+      const tasks = Array.from(byTaskKey.values()).map((t) => {
         const ui = STATUS_TO_UI[t.status] || STATUS_TO_UI.pending;
+        const range = taskRangeInfo(t);
         return {
           taskId: t.id,
-          name: KIND_LABELS[t.kind] || t.kind,
+          kind: t.kind,
+          regionKey: taskRegionKey(t),
+          projectKey: taskProjectKey(t),
+          drIndex: t.payload?.drIndex,
+          sellerPortalBizType: t.payload?.sellerPortalBizType,
+          eprFeeType: t.payload?.eprFeeType,
+          rangeKey: range.key,
+          rangeLabel: range.label,
+          dateFrom: range.from,
+          dateTo: range.to,
+          name: displayTaskName(t),
           region: regionFromTask(t),
           status: ui.cls,
           result: ui.label,
           execAt: t.completedAt || t.claimedAt || t.createdAt || null,
           errorMessage: t.errorMessage,
         };
+      }).sort((a, b) => {
+        const regionDelta = indexOrEnd(REGION_ORDER, a.regionKey) - indexOrEnd(REGION_ORDER, b.regionKey);
+        if (regionDelta !== 0) return regionDelta;
+        return indexOrEnd(KIND_ORDER, a.kind) - indexOrEnd(KIND_ORDER, b.kind);
       });
       return {
         id: s.id,
@@ -240,6 +438,91 @@ function buildShopsFromApi(custodyFilter = activeCustody) {
         window: '',
         expanded: true,
         tasks,
+      };
+    });
+}
+
+function matchesSettlementProject(project, task) {
+  if (!project.kind || task.kind !== project.kind) return false;
+  if (task.projectKey) return task.projectKey === project.key;
+  if (project.drIndex != null && task.drIndex != null && Number(task.drIndex) !== Number(project.drIndex)) return false;
+  if (project.sellerPortalBizType != null && task.sellerPortalBizType != null && Number(task.sellerPortalBizType) !== Number(project.sellerPortalBizType)) return false;
+  if (project.eprFeeType && task.eprFeeType && task.eprFeeType !== project.eprFeeType) return false;
+  if (project.matchRegions) return project.matchRegions.includes(task.regionKey || '');
+  if (project.region) return task.regionKey === project.region;
+  return true;
+}
+
+function buildSettlementProjectTasks(shop) {
+  const fallbackRange = { key: 'unknown', label: '未指定时间范围', from: '', to: '' };
+  return buildSettlementProjectTasksForRange(shop, fallbackRange);
+}
+
+function aggregateStatus(tasks) {
+  if (!tasks.length) return { status: 'pending', result: '待获取', execAt: null, errorMessage: null };
+  const s = summary(tasks);
+  const execAtList = tasks
+    .map((task) => task.execAt)
+    .filter(Boolean)
+    .sort();
+  const execAt = execAtList.length ? execAtList[execAtList.length - 1] : null;
+  const failed = tasks.find((task) => task.status === 'failed');
+  return {
+    status: s.cls,
+    result: s.text,
+    execAt,
+    errorMessage: failed?.errorMessage || null,
+  };
+}
+
+function buildSettlementProjectTasksForRange(shop, range) {
+  const rangeTasks = shop.tasks.filter((task) => task.rangeKey === range.key && SEMI_SETTLEMENT_REPORT_KINDS.includes(task.kind));
+  return SETTLEMENT_REPORT_PROJECTS.map((project) => {
+    const realTask = rangeTasks.find((task) => matchesSettlementProject(project, task));
+    return {
+      taskId: realTask?.taskId || null,
+      kind: project.kind,
+      rangeKey: range.key,
+      rangeLabel: range.label,
+      regionKey: project.region || '',
+      projectKey: project.key,
+      projectLabel: project.label,
+      projectPath: project.path,
+      reserved: project.reserved === true,
+      name: `${project.label} ${project.path}`,
+      region: project.region ? (REGION_LABEL[project.region] || project.region) : '-',
+      status: realTask?.status || 'pending',
+      result: realTask?.result || project.reservedReason || '待获取',
+      execAt: realTask?.execAt || null,
+      errorMessage: realTask?.errorMessage || null,
+    };
+  });
+}
+
+function buildSettlementReportBatches(shop) {
+  const byRange = new Map();
+  for (const task of shop.tasks) {
+    if (!SEMI_SETTLEMENT_REPORT_KINDS.includes(task.kind)) continue;
+    if (!byRange.has(task.rangeKey)) {
+      byRange.set(task.rangeKey, {
+        key: task.rangeKey,
+        label: task.rangeLabel,
+        from: task.dateFrom,
+        to: task.dateTo,
+      });
+    }
+  }
+  return Array.from(byRange.values())
+    .sort((a, b) => String(b.from || b.to || '').localeCompare(String(a.from || a.to || '')))
+    .map((range) => {
+      const tasks = buildSettlementProjectTasksForRange(shop, range);
+      return {
+        id: `${shop.id}::${range.key}`,
+        shopId: shop.id,
+        shopName: shop.name,
+        range,
+        tasks,
+        summary: summary(tasks),
       };
     });
 }
@@ -284,8 +567,8 @@ function dateRangeToDates(dateRange) {
 async function createTasksForSelected(options = {}) {
   if (!cfg.apiUrl) throw new Error('请先配置 ERP API 地址');
   const moduleKeys = Array.isArray(options.moduleKeys) && options.moduleKeys.length ? options.moduleKeys : (activeModule ? [activeModule] : []);
-  const kinds = moduleKeys.map((m) => MODULE_TO_KIND[m]).filter(Boolean);
-  if (kinds.length === 0) throw new Error('请至少选择一个报告类型');
+  const validModuleKeys = moduleKeys.filter((m) => moduleKinds(m).length > 0);
+  if (validModuleKeys.length === 0) throw new Error('请至少选择一个报告类型');
 
   // 店铺列表还没从 ERP 拉回来(网络慢/未连上)→ 给出明确提示,别误导成"未绑定/scope 问题"。
   // (历史坑:_apiShops 为空时直接报"没有可派单的店铺",让人误查绑定/scope,实则是列表没加载。)
@@ -315,31 +598,110 @@ async function createTasksForSelected(options = {}) {
       console.warn('[popup] shop not in _apiShops, skip:', shopId);
       continue;
     }
-    for (const kind of kinds) {
-      // 区域相关 kind(endpoint 有 -us/-eu 子域)扇出全球/美国/欧区各派一次;
-      // 不分区的 kind 用右上角下拉选的 region 派 1 次。
-      const regions = KIND_REGIONS[kind] || [region];
-      for (const rgn of regions) {
-        const t = await apiFetch('/api/agent/tasks', {
-          method: 'POST',
-          body: JSON.stringify({
-            shopId,
-            kind,
-            payload: {
-              mallId: shop.platformShopId,
-              siteType: shop.shopType,
-              region: rgn,
-              startDate: dates.startDate,
-              endDate: dates.endDate,
-            },
-            priority: 5,
-          }),
-        });
-        tasks.push(t);
+    for (const moduleKey of validModuleKeys) {
+      if (moduleKey === SETTLEMENT_REPORT_MODULE_KEY) {
+        const created = await createSettlementReportTasks({ shop, dates, region, custody: activeCustody });
+        tasks.push(...created);
+      } else {
+        const created = await createAgentTasksForKinds({ shop, kinds: moduleKinds(moduleKey), dates, region });
+        tasks.push(...created);
       }
     }
   }
   return tasks;
+}
+
+async function createAgentTask({ shop, kind, region, dates, priority = 5, extraPayload = {} }) {
+  return apiFetch('/api/agent/tasks', {
+    method: 'POST',
+    body: JSON.stringify({
+      shopId: shop.id,
+      kind,
+      payload: {
+        mallId: shop.platformShopId,
+        siteType: shop.shopType,
+        region,
+        startDate: dates.startDate,
+        endDate: dates.endDate,
+        dateFrom: dates.startDate,
+        dateTo: dates.endDate,
+        ...extraPayload,
+      },
+      priority,
+    }),
+  });
+}
+
+function settlementProjectPayload(project) {
+  const payload = {
+    settlementProjectKey: project.key,
+    settlementProjectLabel: project.label,
+  };
+  if (project.batchIndex != null) payload.settlementBatchIndex = project.batchIndex;
+  if (project.drIndex != null) payload.drIndex = project.drIndex;
+  if (project.sellerPortalBizType != null) payload.sellerPortalBizType = project.sellerPortalBizType;
+  if (project.eprFeeType) payload.eprFeeType = project.eprFeeType;
+  return payload;
+}
+
+async function createSettlementProjectTasks({ shop, dates, priority = 5 }) {
+  const tasks = [];
+  const settlementBatchKey = `${shop.id}:${dates.startDate}:${dates.endDate}:semi-settlement-report`;
+  for (const [batchIndex, rawProject] of SETTLEMENT_REPORT_PROJECTS.entries()) {
+    const project = { ...rawProject, batchIndex };
+    if (!project.kind || project.reserved) continue;
+    tasks.push(await createAgentTask({
+      shop,
+      kind: project.kind,
+      region: project.region || 'global',
+      dates,
+      priority,
+      extraPayload: {
+        ...settlementProjectPayload(project),
+        settlementBatchKey,
+      },
+    }));
+  }
+  return tasks;
+}
+
+async function createAgentTasksForKinds({ shop, kinds, dates, region, priority = 5 }) {
+  const tasks = [];
+  for (const kind of kinds) {
+    // 区域相关 kind(endpoint 有 -us/-eu 子域)扇出全球/美国/欧区各派一次;
+    // 不分区的 kind 用右上角下拉选的 region 派 1 次。
+    const regions = KIND_REGIONS[kind] || [region];
+    for (const rgn of regions) {
+      tasks.push(await createAgentTask({ shop, kind, region: rgn, dates, priority }));
+    }
+  }
+  return tasks;
+}
+
+async function createSettlementReportTasks({ shop, dates, region, custody }) {
+  if (USE_RESERVED_SETTLEMENT_REPORT_API) {
+    const resp = await apiFetch(SETTLEMENT_REPORT_TASK_API, {
+      method: 'POST',
+      body: JSON.stringify({
+        shopId: shop.id,
+        mallId: shop.platformShopId,
+        custody,
+        region,
+        startDate: dates.startDate,
+        endDate: dates.endDate,
+      }),
+    });
+    return Array.isArray(resp) ? resp : (resp?.tasks || resp?.items || []);
+  }
+  if (custody === 'semi') {
+    return createSettlementProjectTasks({ shop, dates });
+  }
+  return createAgentTasksForKinds({
+    shop,
+    kinds: moduleKinds(SETTLEMENT_REPORT_MODULE_KEY, custody),
+    dates,
+    region,
+  });
 }
 
 // 左上角显示 ERP 登录账号(手机号)—— 与 Temu 平台账号无关,暂为写死/配置值。
@@ -527,7 +889,6 @@ async function runOnboard() {
 // 模块定义只保留 key + label;count/total 由 computeModuleCounts() 按真实任务算
 const MODULES_BY_CUSTODY = {
   full: [
-    { key: 'account-funds', label: '获取账号资金' },
     { key: 'sales-30d',     label: '获取近 30 天销量' },
     { key: 'settle-report', label: '获取结算报表' },
     { key: 'declare-price', label: '获取申报价格' },
@@ -544,10 +905,7 @@ const MODULES_BY_CUSTODY = {
     { key: 'orders',                 label: '获取订单数据' },
     { key: 'returns',                label: '获取退货退款' },
     { key: 'semi-ad',                label: '获取广告数据' },
-    { key: 'settle-flow',            label: '获取结算流水' },
-    { key: 'logistics-bill',         label: '获取物流对账账单' },
-    { key: 'reverse-logistics-bill', label: '获取退货面单费' },
-    { key: 'violation-appeals',      label: '获取违规罚款' },
+    { key: 'settle-report',          label: '获取结算报表' },
   ],
 };
 
@@ -555,20 +913,36 @@ const MODULES_BY_CUSTODY = {
 function computeModuleCounts() {
   const wanted = activeCustody === 'full' ? 'full' : 'semi';
   // 与主面板一致:只统计本机 scope(selectedShops)内的店。null=全部。
-  const shopIds = new Set(
-    _apiShops
-      .filter((s) => s.platform === 'temu' && s.shopType === wanted)
-      .filter((s) => selectedShops === null || selectedShops.includes(s.id))
-      .map((s) => s.id),
-  );
+  const scopedShops = _apiShops
+    .filter((s) => s.platform === 'temu' && s.shopType === wanted)
+    .filter((s) => selectedShops === null || selectedShops.includes(s.id));
+  const shopIds = new Set(scopedShops.map((s) => s.id));
   const counts = {};
+
+  if (wanted === 'semi') {
+    for (const shop of buildShopsFromApi('semi').filter((s) => shopIds.has(s.id))) {
+      const bucket = (counts[SETTLEMENT_REPORT_MODULE_KEY] ||= { keys: new Set(), succ: new Set() });
+      for (const batch of buildSettlementReportBatches(shop)) {
+        const dedupeKey = batch.id;
+        bucket.keys.add(dedupeKey);
+        if (batch.summary.cls === 'ok') bucket.succ.add(dedupeKey);
+      }
+    }
+  }
+
+  const projectBackedKinds = new Set(
+    wanted === 'semi'
+      ? SETTLEMENT_REPORT_PROJECTS.map((p) => p.kind).filter(Boolean)
+      : [],
+  );
   for (const t of _apiTasks) {
     if (!shopIds.has(t.shopId)) continue;
-    const moduleKey = KIND_TO_MODULE[t.kind];
+    if (wanted === 'semi' && projectBackedKinds.has(t.kind)) continue;
+    const moduleKey = moduleKeyForKind(t.kind, wanted);
     if (!moduleKey) continue;
-    // 按 (shopId, kind) 合并 — 同一 task 多次重试只算 1
+    // 按 (shopId, kind, region, 时间范围) 合并 — 同一批任务多次重试只算 1
     const bucket = (counts[moduleKey] ||= { keys: new Set(), succ: new Set() });
-    const dedupeKey = `${t.shopId}::${t.kind}`;
+    const dedupeKey = `${t.shopId}::${t.kind}::${taskRegionKey(t)}::${taskProjectKey(t)}::${taskRangeInfo(t).key}`;
     bucket.keys.add(dedupeKey);
     if (t.status === 'success') bucket.succ.add(dedupeKey);
   }
@@ -579,6 +953,8 @@ function computeModuleCounts() {
 
 let activeCustody = 'full';
 let activeModule = null;
+const expandedSettlementBatches = new Set();
+const collapsedSettlementBatches = new Set();
 
 function ensureActiveModule() {
   const list = MODULES_BY_CUSTODY[activeCustody] || [];
@@ -678,57 +1054,167 @@ function taskIcon(status) {
   return { glyph: '⏰', cls: 'pending' };
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderTaskNameHtml(task) {
+  if (task.projectLabel) {
+    return `
+      <span class="task-main">${escapeHtml(task.projectLabel)}</span>
+      <span class="task-path">${escapeHtml(task.projectPath || '')}</span>
+    `;
+  }
+  return escapeHtml(task.name);
+}
+
+function isSettlementBatchExpanded(batch, index) {
+  if (expandedSettlementBatches.has(batch.id)) return true;
+  if (collapsedSettlementBatches.has(batch.id)) return false;
+  return index === 0;
+}
+
+function bindRetryButtons(root) {
+  root.querySelectorAll('.task-retry').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const taskId = btn.dataset.taskId;
+      if (!taskId) return;
+      btn.classList.add('busy');
+      btn.textContent = '↻ 重试中…';
+      try {
+        // 通过 raw rawTask 找到原 kind/payload 重新建一个
+        const orig = _apiTasks.find((t) => t.id === taskId);
+        if (!orig) throw new Error('找不到原任务');
+        await apiFetch('/api/agent/tasks', {
+          method: 'POST',
+          body: JSON.stringify({
+            shopId: orig.shopId,
+            kind: orig.kind,
+            payload: orig.payload || {},
+            priority: 8,  // 重试给高优
+          }),
+        });
+        try { chrome.runtime?.sendMessage?.({ type: 'AGENT_PULL_NOW' }); } catch {}
+        setTimeout(refreshFromApi, 500);
+      } catch (e2) {
+        alert('重试派单失败: ' + e2.message);
+        btn.classList.remove('busy');
+        btn.textContent = '↻ 重试';
+      }
+    });
+  });
+}
+
+function renderTaskRows(tasks) {
+  return tasks.map((t) => {
+    const i = taskIcon(t.status);
+    const retryBtn = t.status === 'failed' && t.taskId
+      ? `<button class="task-retry" data-task-id="${escapeHtml(t.taskId)}" title="重新执行此任务">↻ 重试</button>`
+      : '';
+    const ts = fmtExecAt(t.execAt);
+    return `
+      <div class="task-row">
+        <span class="task-icon ${i.cls}">${i.glyph}</span>
+        <span class="task-name" title="${escapeHtml(t.name)}">${renderTaskNameHtml(t)}</span>
+        <span class="task-result ${i.cls}">${escapeHtml(t.result)}</span>
+        <span class="task-exec-at" title="${escapeHtml(t.execAt || '')}">${escapeHtml(ts)}</span>
+        ${retryBtn}
+      </div>
+    `;
+  }).join('');
+}
+
+function renderSettlementReportProgress(area, onlyFailed) {
+  let totalRendered = 0;
+  for (const shop of shops) {
+    const batches = buildSettlementReportBatches(shop);
+    batches.forEach((batch, index) => {
+      const visibleTasks = onlyFailed
+        ? batch.tasks.filter((task) => task.status === 'failed')
+        : batch.tasks;
+      if (onlyFailed && visibleTasks.length === 0) return;
+
+      const s = batch.summary;
+      const pct = s.total > 0 ? Math.round((s.ok / s.total) * 100) : 0;
+      const expanded = isSettlementBatchExpanded(batch, index);
+      const block = document.createElement('div');
+      block.className = 'shop-block settlement-batch';
+      block.innerHTML = `
+        <div class="shop-head ${expanded ? 'expanded' : ''}">
+          <span class="shop-caret">▶</span>
+          <span class="shop-status ${s.cls}">${s.text}</span>
+          <span class="shop-name">${escapeHtml(batch.shopName)} (${escapeHtml(batch.range.label)})</span>
+          <span class="shop-progress-bar"><span class="shop-progress-bar-fill" style="width:${pct}%"></span></span>
+          <span class="shop-progress-text">${s.total ? `${s.ok}/${s.total}` : ''}</span>
+        </div>
+        ${expanded ? `<div class="task-list">${renderTaskRows(visibleTasks)}</div>` : ''}
+      `;
+      block.querySelector('.shop-head').addEventListener('click', () => {
+        if (isSettlementBatchExpanded(batch, index)) {
+          collapsedSettlementBatches.add(batch.id);
+          expandedSettlementBatches.delete(batch.id);
+        } else {
+          expandedSettlementBatches.add(batch.id);
+          collapsedSettlementBatches.delete(batch.id);
+        }
+        renderProgress();
+      });
+      bindRetryButtons(block);
+      area.appendChild(block);
+      totalRendered++;
+    });
+  }
+  return totalRendered;
+}
+
 function renderProgress() {
   const area = $('#progress-area');
   area.innerHTML = '';
   const onlyFailed = $('#only-failed').checked;
-  // 拿到当前选中模块对应的 kind（activeModule 是 module key）
-  const filterKind = activeModule ? MODULE_TO_KIND[activeModule] : null;
+  // 拿到当前选中模块对应的 kind 集合（activeModule 是 module key）
+  const filterKinds = activeModule ? moduleKinds(activeModule) : [];
+
+  if (activeModule === SETTLEMENT_REPORT_MODULE_KEY && activeCustody === 'semi') {
+    const totalRendered = renderSettlementReportProgress(area, onlyFailed);
+    $('#empty-state').hidden = totalRendered > 0;
+    area.hidden = totalRendered === 0;
+    return;
+  }
 
   let totalRendered = 0;
   for (const shop of shops) {
     let tasksToShow = shop.tasks;
     // 模块过滤（点左侧某个模块 → 只看这个模块的任务）
-    if (filterKind) {
-      tasksToShow = tasksToShow.filter((t) => {
-        // 真 API 任务有 taskId + 我们存了原 kind 在 _apiTasks 里查
-        const orig = _apiTasks.find((x) => x.id === t.taskId);
-        return orig?.kind === filterKind;
-      });
+    if (filterKinds.length) {
+      tasksToShow = tasksToShow.filter((t) => filterKinds.includes(t.kind));
     }
     if (onlyFailed) tasksToShow = tasksToShow.filter((t) => t.status === 'failed');
-    if ((filterKind || onlyFailed) && tasksToShow.length === 0) continue;
+    if ((filterKinds.length || onlyFailed) && tasksToShow.length === 0) continue;
 
     const block = document.createElement('div');
     block.className = 'shop-block';
     // ★ 用 tasksToShow 而非 shop.tasks — 否则用户筛选某模块时
     //   header 状态会汇总全量任务的失败(跟可见行不一致,出现"1 条成功 / 部分失败"的歧义)
     const s = summary(tasksToShow);
+    const pct = s.total > 0 ? Math.round((s.ok / s.total) * 100) : 0;
 
     block.innerHTML = `
       <div class="shop-head ${shop.expanded ? 'expanded' : ''}">
         <span class="shop-caret">▶</span>
         <span class="shop-status ${s.cls}">${s.text}</span>
         <span class="shop-name">${shop.name}</span>
+        <span class="shop-progress-bar"><span class="shop-progress-bar-fill" style="width:${pct}%"></span></span>
+        <span class="shop-progress-text">${s.total ? `${s.ok}/${s.total}` : ''}</span>
       </div>
       ${shop.expanded ? `
         <div class="task-list">
-          ${tasksToShow.map((t) => {
-            const i = taskIcon(t.status);
-            const retryBtn = t.status === 'failed'
-              ? `<button class="task-retry" data-shop="${shop.id}" data-idx="${shop.tasks.indexOf(t)}" title="重新执行此任务">↻ 重试</button>`
-              : '';
-            const ts = fmtExecAt(t.execAt);
-            return `
-              <div class="task-row">
-                <span class="task-icon ${i.cls}">${i.glyph}</span>
-                <span class="task-name">${t.name}</span>
-                <span class="task-result ${i.cls}">${t.result}</span>
-                <span class="task-exec-at" title="${t.execAt || ''}">${ts}</span>
-                ${retryBtn}
-              </div>
-            `;
-          }).join('')}
+          ${renderTaskRows(tasksToShow)}
         </div>
       ` : ''}
     `;
@@ -736,39 +1222,7 @@ function renderProgress() {
       shop.expanded = !shop.expanded;
       renderProgress();
     });
-    block.querySelectorAll('.task-retry').forEach((btn) => {
-      btn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const shopId = btn.dataset.shop;
-        const idx = Number(btn.dataset.idx);
-        const targetShop = shops.find((s) => s.id === shopId);
-        if (!targetShop) return;
-        const task = targetShop.tasks[idx];
-        if (!task) return;
-        btn.classList.add('busy');
-        btn.textContent = '↻ 重试中…';
-        try {
-          // 通过 raw rawTask 找到原 kind/payload 重新建一个
-          const orig = _apiTasks.find((t) => t.id === task.taskId);
-          if (!orig) throw new Error('找不到原任务');
-          await apiFetch('/api/agent/tasks', {
-            method: 'POST',
-            body: JSON.stringify({
-              shopId: orig.shopId,
-              kind: orig.kind,
-              payload: orig.payload || {},
-              priority: 8,  // 重试给高优
-            }),
-          });
-          try { chrome.runtime?.sendMessage?.({ type: 'AGENT_PULL_NOW' }); } catch {}
-          setTimeout(refreshFromApi, 500);
-        } catch (e2) {
-          alert('重试派单失败: ' + e2.message);
-          btn.classList.remove('busy');
-          btn.textContent = '↻ 重试';
-        }
-      });
-    });
+    bindRetryButtons(block);
     area.appendChild(block);
     totalRendered++;
   }
@@ -944,7 +1398,7 @@ $('#link-online').addEventListener('click', async (e) => {
 
 $('#online-pop-close').addEventListener('click', () => { $('#online-pop').hidden = true; });
 $('#online-pop-refresh').addEventListener('click', async () => {
-  // 真"实测":让 SW 开 4 个 hidden tab 跑 /labor/bill,看是否跳登录页 → 写 loginHealth
+  // 真"实测":让 SW 开 4 个 hidden tab 到各域名首页,看是否跳登录页 → 写 loginHealth
   // 平均耗时 5-15s,期间按钮 disabled + 加载中
   const btn = $('#online-pop-refresh');
   if (!btn) return;
