@@ -36,14 +36,26 @@ import {
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
-const CLAIM_LIMIT      = 1;       // 每次只领 1 个,避免半托区域任务并发开多个 tab
+// 一次领多个:结算报表注入类子项(发货/退货面单费、EPR)按区共用一个 tab 并发采集
+// (见 acquireRegionTab / closeRegionTabPool),不再每子项一个 tab。非池化任务仍逐个串行跑。
+const CLAIM_LIMIT      = 12;      // 够一次领齐 3 区结算报表的注入子项(各区共用 1 tab)
 const LEASE_SECONDS    = 300;     // 5min 租约
 const ALARM_NAME       = 'agent-poll';
+
+// 结算报表里"同区同源、注入式 fetch"的子项 —— 这些可共用一个区域 tab 并发采。
+// (scrape:settlement 账务明细是跨域导出流程,不在此列,仍走自己的多 tab 流程。)
+const POOLABLE_SETTLEMENT_KINDS = new Set([
+  'scrape:logistics-bill',
+  'scrape:reverse-logistics-bill',
+  'scrape:epr-goods-fee',
+  'scrape:epr-package-fee',
+  'scrape:epr-platform-fee',
+]);
 
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-reverse-logistics-region-path-20260622a';
+const AGENT_BUILD_ID   = 'agent-region-tab-pool-20260622b';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -707,7 +719,19 @@ export async function pollOnce() {
     return;
   }
   console.log(`一、领取 ${tasks.length} 个任务:`, tasks.map((t) => taskKindLabel(t.kind)).join(' / '));
-  for (const t of tasks) await executeTask(t, pluginInstanceId);
+  try {
+    // 非池化任务:逐个串行(各自开关 tab,行为不变)
+    const others = tasks.filter((t) => !POOLABLE_SETTLEMENT_KINDS.has(t.kind));
+    for (const t of others) await executeTask(t, pluginInstanceId);
+    // 池化任务(结算报表注入子项):同区共用一个 tab 并发跑;一轮跑完统一关 tab
+    const poolable = tasks.filter((t) => POOLABLE_SETTLEMENT_KINDS.has(t.kind));
+    if (poolable.length) {
+      console.log(`三、结算报表 ${poolable.length} 子项 → 按区共享 tab 并发采集`);
+      await Promise.allSettled(poolable.map((t) => executeTask(t, pluginInstanceId)));
+    }
+  } finally {
+    await closeRegionTabPool();
+  }
   } finally {
     _pollInFlight = false;
   }
@@ -2304,6 +2328,44 @@ async function dispatchActivityEnroll(task, signal) {
   };
 }
 
+// ── 区域共享 tab 池 ──────────────────────────────────────────────────
+// 结算报表的注入式子项(发货/退货面单费、EPR)同区同源(agentseller[-region].temu.com),
+// 本来每子项各开一个 tab。改成按 origin 共用一个 tab:首个子项开 tab(等加载/查登录/WAF 就绪),
+// 同区其余子项复用同一 tab,在其中并发 executeScript 抓取。一轮跑完 closeRegionTabPool 统一关。
+// → 整个结算报表只开 3 个 tab(global/eu/us 各一)。
+const _regionTabPool = new Map();   // origin → { tabId, ready: Promise<number> }
+async function acquireRegionTab(pageUrl, signal) {
+  const origin = new URL(pageUrl).origin;
+  const existing = _regionTabPool.get(origin);
+  if (existing) return existing.ready;   // 复用(或等待首个 caller 把 tab 开好)
+  const entry = { tabId: null, ready: null };
+  entry.ready = (async () => {
+    const tab = await chrome.tabs.create({ url: origin + '/', active: false, pinned: false });
+    entry.tabId = tab.id;
+    console.log(`[region-tab] 开 ${origin} → tab ${tab.id}`);
+    await waitTabComplete(tab.id, signal, 30_000);
+    const t = await chrome.tabs.get(tab.id);
+    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${origin} 跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
+    await sleep(2000, signal);   // 等页面 WAF SDK 就绪
+    return tab.id;
+  })();
+  _regionTabPool.set(origin, entry);
+  try {
+    return await entry.ready;
+  } catch (e) {
+    // 开 tab 失败(如跳登录):清出池 + 关掉半开的 tab,让本区其余子项各自如实失败
+    _regionTabPool.delete(origin);
+    if (entry.tabId != null) { try { await chrome.tabs.remove(entry.tabId); } catch {} }
+    throw e;
+  }
+}
+async function closeRegionTabPool() {
+  for (const entry of _regionTabPool.values()) {
+    if (entry.tabId != null) { try { await chrome.tabs.remove(entry.tabId); } catch {} }
+  }
+  _regionTabPool.clear();
+}
+
 // ── scrape:logistics-bill 专用 wrapper ───────────────────────────────
 // 任务语义:抓半托物流对账账单(发货面单费等包裹级费用)。raw 回传,后端
 // parseLogisticsBillRows 解析(薄插件)。endpoint/字段 2026-06-11 实抓确认:
@@ -2338,19 +2400,12 @@ async function dispatchLogisticsBill(task, signal) {
   const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 15 * 86_400_000;
   const deductTimeEnd   = payload.dateTo   ? new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime() : now;
 
-  const TAB_LOAD_TIMEOUT_MS = 30_000;
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
-  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
-    tabId = tab.id;
-    console.log(`[logistics-bill] tab ${tabId} → ${pageUrl}`);
-    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
-    const t = await chrome.tabs.get(tabId);
-    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 物流对账页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
-    await sleep(2000, signal);   // 让页面 WAF SDK 就绪
+    tabId = await acquireRegionTab(pageUrl, signal);   // 区域共享 tab(等加载/查登录/WAF 已在池内做)
+    console.log(`[logistics-bill] region=${region} 用共享 tab ${tabId}`);
 
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
@@ -2390,7 +2445,7 @@ async function dispatchLogisticsBill(task, signal) {
       agent: agentDiag(),
     };
   } finally {
-    await cleanup();
+    // tab 由区域池统一关闭(closeRegionTabPool),此处不关
   }
 }
 
@@ -2652,19 +2707,12 @@ async function dispatchReverseLogisticsBill(task, signal) {
   const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 15 * 86_400_000;
   const deductTimeEnd   = payload.dateTo   ? new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime() : now;
 
-  const TAB_LOAD_TIMEOUT_MS = 30_000;
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
-  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: pageUrl, active: false, pinned: false });
-    tabId = tab.id;
-    console.log(`[reverse-logistics-bill] tab ${tabId} → ${pageUrl}`);
-    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
-    const t = await chrome.tabs.get(tabId);
-    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`${region} 逆向物流页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
-    await sleep(2000, signal);
+    tabId = await acquireRegionTab(pageUrl, signal);   // 区域共享 tab(等加载/查登录/WAF 已在池内做)
+    console.log(`[reverse-logistics-bill] region=${region} 用共享 tab ${tabId}`);
 
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
@@ -2703,7 +2751,7 @@ async function dispatchReverseLogisticsBill(task, signal) {
       agent: agentDiag(),
     };
   } finally {
-    await cleanup();
+    // tab 由区域池统一关闭(closeRegionTabPool),此处不关
   }
 }
 
@@ -2843,19 +2891,12 @@ async function dispatchEprFee(task, signal, feeType) {
     throw Object.assign(new Error('invalid dateFrom/dateTo for epr fee'), { code: 'BAD_PAYLOAD' });
   }
 
-  const TAB_LOAD_TIMEOUT_MS = 30_000;
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
-  const cleanup = async () => { if (tabId != null) { try { await chrome.tabs.remove(tabId); } catch {} tabId = null; } };
 
   try {
-    const tab = await chrome.tabs.create({ url: EPR_EU_PAGE_URL, active: false, pinned: false });
-    tabId = tab.id;
-    console.log(`[epr-fee] ${cfg.label} tab ${tabId} → ${EPR_EU_PAGE_URL}`);
-    await waitTabComplete(tabId, signal, TAB_LOAD_TIMEOUT_MS);
-    const t = await chrome.tabs.get(tabId);
-    if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`eu EPR 页跳登录,需重新登录半托店`), { code: 'LOGIN_REQUIRED' });
-    await sleep(2000, signal);
+    tabId = await acquireRegionTab(EPR_EU_PAGE_URL, signal);   // 区域共享 tab(eu;等加载/查登录/WAF 已在池内做)
+    console.log(`[epr-fee] ${cfg.label} 用共享 tab ${tabId}`);
 
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
@@ -2895,7 +2936,7 @@ async function dispatchEprFee(task, signal, feeType) {
       agent: agentDiag(),
     };
   } finally {
-    await cleanup();
+    // tab 由区域池统一关闭(closeRegionTabPool),此处不关
   }
 }
 
