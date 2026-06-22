@@ -43,7 +43,7 @@ const ALARM_NAME       = 'agent-poll';
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-settlement-report-20260617a';
+const AGENT_BUILD_ID   = 'agent-reverse-logistics-region-path-20260622a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2623,7 +2623,16 @@ const REGION_TO_REVERSE_LOGISTICS_PAGE_URL = {
   us:     'https://agentseller-us.temu.com',
   eu:     'https://agentseller-eu.temu.com',
 };
-const REVERSE_LOGISTICS_BILL_LIST_PATH = '/portal/udp/sunce/seller/center/bill/list';
+// 退货面单费列表 path 按区分(同发货面单费一样要分区,早期硬编码美区 udp 路径
+// 导致欧区/全球 403 "No Permission to Access")。
+//   - 美区:半托美国本土平台 sunce/center/bill(2026-06-11 实抓)
+//   - 欧区/全球:selene 退货列表(2026-06-22 用户实抓确认)。同一 path,
+//     商家仓 vs 第三方仓靠 body.sellerPortalBizType(2/3)区分。
+const REGION_TO_REVERSE_LOGISTICS_BILL_LIST_PATH = {
+  us:     '/portal/udp/sunce/seller/center/bill/list',
+  eu:     '/portal/selene/seller/return/list',
+  global: '/portal/selene/seller/return/list',
+};
 
 async function dispatchReverseLogisticsBill(task, signal) {
   const payload = task.payload ?? {};
@@ -2631,6 +2640,8 @@ async function dispatchReverseLogisticsBill(task, signal) {
   const region = payload.region ?? 'us';
   const pageUrl = REGION_TO_REVERSE_LOGISTICS_PAGE_URL[region];
   if (!pageUrl) throw Object.assign(new Error(`reverse logistics page not configured for region=${region}`), { code: 'BAD_REGION' });
+  const listPath = REGION_TO_REVERSE_LOGISTICS_BILL_LIST_PATH[region];
+  if (!listPath) throw Object.assign(new Error(`reverse logistics list path not configured for region=${region}`), { code: 'BAD_REGION' });
   const sellerPortalBizType = payload.sellerPortalBizType == null ? 2 : Number(payload.sellerPortalBizType);
   if (![2, 3].includes(sellerPortalBizType)) {
     throw Object.assign(new Error(`invalid sellerPortalBizType=${payload.sellerPortalBizType} for scrape:reverse-logistics-bill`), { code: 'BAD_PAYLOAD' });
@@ -2660,7 +2671,7 @@ async function dispatchReverseLogisticsBill(task, signal) {
       world: 'MAIN',
       func: runReverseLogisticsBillInTab,
       args: [{
-        listPath: REVERSE_LOGISTICS_BILL_LIST_PATH,
+        listPath,
         deductTimeBegin, deductTimeEnd,
         pageSize: 100,
         maxPages: 50,
