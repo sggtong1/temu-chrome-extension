@@ -55,7 +55,7 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-region-tab-pool-20260622b';
+const AGENT_BUILD_ID   = 'agent-logistics-selene-20260622c';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2379,10 +2379,15 @@ const REGION_TO_LOGISTICS_PAGE_URL = {
   us:     'https://agentseller-us.temu.com',
   eu:     'https://agentseller-eu.temu.com',
 };
+// 发货面单费列表(2026-06-22 用户实抓确认):selene recon/list,按区同 path 不同域名。
+//   旧的 yuanbenchu/recon_bill 接口换掉 —— 全球那个是跨区聚合账本(把别区包裹也捞进来、
+//   响应结构还不同导致 fee_type 误标),美区 udp 那个只返近期。selene 才是正解:
+//   body 无时间窗,settleStatus:2(已结算)+ scrollContext 翻页 → 返回全部已结算记录。
+//   响应 result.list[],费用类型在 remark(发货面单费（揽收/全段/尾程派送）),金额 priceCurrencyFormat.amountYuan。
 const REGION_TO_LOGISTICS_BILL_LIST_PATH = {
-  global: '/api/yuanbenchu/seller_central/recon_bill/list',
-  eu:     '/api/yuanbenchu/seller_central/recon_bill/list',
-  us:     '/api/udp/yuanbenchu/seller_central/recon_bill/list',
+  global: '/portal/selene/seller/portal/recon/list',
+  eu:     '/portal/selene/seller/portal/recon/list',
+  us:     '/portal/selene/seller/portal/recon/list',
 };
 
 async function dispatchLogisticsBill(task, signal) {
@@ -2394,12 +2399,7 @@ async function dispatchLogisticsBill(task, signal) {
   const listPath = REGION_TO_LOGISTICS_BILL_LIST_PATH[region];
   if (!listPath) throw Object.assign(new Error(`logistics list path not configured for region=${region}`), { code: 'BAD_REGION' });
 
-  // deductTime 窗口:dateFrom/dateTo(YYYY-MM-DD,北京日)→ epoch ms;缺省近 15 天
-  // ★ 显式 +08:00 后缀(SW/页面 new Date 无 TZ 串按 UTC 解析的老坑,R2 时区约定)
-  const now = Date.now();
-  const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 15 * 86_400_000;
-  const deductTimeEnd   = payload.dateTo   ? new Date(`${payload.dateTo}T23:59:59.999+08:00`).getTime() : now;
-
+  // selene recon/list 无时间窗:settleStatus:2(已结算)+ scrollContext 翻页,返回全部已结算记录。
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
 
@@ -2413,10 +2413,9 @@ async function dispatchLogisticsBill(task, signal) {
       func: runLogisticsBillInTab,
       args: [{
         listPath,
-        settleStatus: payload.settleStatus ?? 1,   // 实抓页面默认 1;其他值未验证
-        deductTimeBegin, deductTimeEnd,
+        settleStatus: payload.settleStatus ?? 2,   // selene:2=已结算(实抓确认)
         rowCount: 100,
-        maxPages: 50,
+        maxPages: 100,                             // 无时间窗全量翻页(总量可能大)
         mallId: String(payload.mallId),
       }],
     });
@@ -2435,7 +2434,7 @@ async function dispatchLogisticsBill(task, signal) {
     const pages = result.pages ?? [];
     console.log(
       `[logistics-bill] ✓ region=${region} pages=${pages.length} bills=${result.billCount}`,
-      { diag: result.diag, sampleBill: pages[0]?.result?.sellerBillList?.[0] ?? null },
+      { diag: result.diag, sampleBill: pages[0]?.result?.list?.[0] ?? null },
     );
     return {
       region, pages,
@@ -2453,7 +2452,7 @@ async function dispatchLogisticsBill(task, signal) {
 // anti-content 策略:先裸发(订单页实测 kirogi 不带签也通);403/40001 再尝试
 // window.rose 显式签(若页面有);429/20002 退避重试。diag.signMode 记录最终生效模式。
 async function runLogisticsBillInTab(args) {
-  const { listPath, settleStatus, deductTimeBegin, deductTimeEnd, rowCount, maxPages, mallId } = args;
+  const { listPath, settleStatus, rowCount, maxPages, mallId } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   let signMode = 'none';   // none | rose
   const genAntiContent = () => {
@@ -2503,10 +2502,10 @@ async function runLogisticsBillInTab(args) {
     let scrollContext = null;
     let billCount = 0;
     for (let p = 1; p <= maxPages; p++) {
-      const data = await post({ settleStatus, deductTimeBegin, deductTimeEnd, rowCount, scrollContext });
+      const data = await post({ settleStatus, rowCount, scrollContext });
       if (!firstResp) firstResp = data;
       diag.pagesFetched++;
-      const list = data?.result?.sellerBillList ?? [];
+      const list = data?.result?.list ?? [];
       billCount += list.length;
       pages.push(data);
       scrollContext = data?.result?.scrollContext ?? data?.result?.nextScrollContext ?? null;
