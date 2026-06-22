@@ -55,7 +55,7 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-logistics-selene-20260622c';
+const AGENT_BUILD_ID   = 'agent-logistics-selene-settled-20260622d';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2399,7 +2399,13 @@ async function dispatchLogisticsBill(task, signal) {
   const listPath = REGION_TO_LOGISTICS_BILL_LIST_PATH[region];
   if (!listPath) throw Object.assign(new Error(`logistics list path not configured for region=${region}`), { code: 'BAD_REGION' });
 
-  // selene recon/list 无时间窗:settleStatus:2(已结算)+ scrollContext 翻页,返回全部已结算记录。
+  // selene recon/list:settleStatus:1=已扣费(实测必须带 deductTime 窗口,否则报
+  //   "Deduction start time and end time cannot be empty");2=待处理(无需窗口、无费用名)。
+  //   我们要实际已扣的费用 → settleStatus:1 + 窗口。窗口结束固定 now(end 用过去日期接口返 0 的老坑),
+  //   开始用 dateFrom 或默认近 90 天 —— 这样 [dateFrom, now] 能把历史已扣记录全捞回。
+  const now = Date.now();
+  const deductTimeBegin = payload.dateFrom ? new Date(`${payload.dateFrom}T00:00:00+08:00`).getTime() : now - 90 * 86_400_000;
+  const deductTimeEnd   = now;
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
 
@@ -2413,9 +2419,10 @@ async function dispatchLogisticsBill(task, signal) {
       func: runLogisticsBillInTab,
       args: [{
         listPath,
-        settleStatus: payload.settleStatus ?? 2,   // selene:2=已结算(实抓确认)
+        settleStatus: payload.settleStatus ?? 1,   // selene:1=已扣费(实测;需 deductTime 窗口)
+        deductTimeBegin, deductTimeEnd,
         rowCount: 100,
-        maxPages: 100,                             // 无时间窗全量翻页(总量可能大)
+        maxPages: 100,
         mallId: String(payload.mallId),
       }],
     });
@@ -2452,7 +2459,7 @@ async function dispatchLogisticsBill(task, signal) {
 // anti-content 策略:先裸发(订单页实测 kirogi 不带签也通);403/40001 再尝试
 // window.rose 显式签(若页面有);429/20002 退避重试。diag.signMode 记录最终生效模式。
 async function runLogisticsBillInTab(args) {
-  const { listPath, settleStatus, rowCount, maxPages, mallId } = args;
+  const { listPath, settleStatus, deductTimeBegin, deductTimeEnd, rowCount, maxPages, mallId } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   let signMode = 'none';   // none | rose
   const genAntiContent = () => {
@@ -2502,7 +2509,7 @@ async function runLogisticsBillInTab(args) {
     let scrollContext = null;
     let billCount = 0;
     for (let p = 1; p <= maxPages; p++) {
-      const data = await post({ settleStatus, rowCount, scrollContext });
+      const data = await post({ settleStatus, deductTimeBegin, deductTimeEnd, rowCount, scrollContext });
       if (!firstResp) firstResp = data;
       diag.pagesFetched++;
       const list = data?.result?.list ?? [];
