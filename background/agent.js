@@ -55,7 +55,7 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-logistics-selene-settled-20260622d';
+const AGENT_BUILD_ID   = 'agent-semiad-bjtz-20260624a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2027,7 +2027,7 @@ async function dispatchSemiAd(task, signal) {
 async function runSemiAdInTab(args) {
   const { reportPath, windowDays, pageSize, maxPages, dayDelayMs } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  const diag = { daysQueried: 0, pagesFetched: 0, rows: 0 };
+  const diag = { daysQueried: 0, pagesFetched: 0, rows: 0, beijingDates: [] };
   let firstResp = null;
   const post = async (body) => {
     const resp = await fetch(reportPath, {
@@ -2045,13 +2045,17 @@ async function runSemiAdInTab(args) {
     selected_site_id_list: null, ad_phase: -1, columns_type: 21,
   };
   try {
-    const now = new Date();
+    // ★ 北京日切(不依赖采集机本地时区):把 now 平移 +8h 当 UTC 读 → 取北京墙钟日期;
+    //   窗口边界用显式 +08:00 算 epoch。ads_report 按所传 [start,end] 真实时间区间求和
+    //   (实测:传北京整天窗口即返北京日合计),故对齐订单北京日,与 promo 的 cstDateBoundaryMs 同源。
+    //   修复前用本地时区切日 → 非北京机(或 PT)采集机会把广告日错位一天(见 ERP T-AdTz)。
+    const nowMs = Date.now();
     const dayReports = [];
     for (let d = 0; d < windowDays; d++) {
-      const day = new Date(now.getTime() - d * 86400000);
-      const y = day.getFullYear(), m = String(day.getMonth() + 1).padStart(2, '0'), dd = String(day.getDate()).padStart(2, '0');
+      const bj = new Date(nowMs - d * 86400000 + 8 * 3600000);
+      const y = bj.getUTCFullYear(), m = String(bj.getUTCMonth() + 1).padStart(2, '0'), dd = String(bj.getUTCDate()).padStart(2, '0');
       const reportDate = `${y}-${m}-${dd}`;
-      const startMs = new Date(`${reportDate}T00:00:00`).getTime();
+      const startMs = new Date(`${reportDate}T00:00:00+08:00`).getTime();
       const endMs = startMs + 86400000 - 1;
       const pages = [];
       for (let p = 1; p <= maxPages; p++) {
@@ -2063,6 +2067,7 @@ async function runSemiAdInTab(args) {
         if (!data?.result?.has_more) break;
       }
       dayReports.push({ reportDate, pages });
+      diag.beijingDates.push(reportDate);
       diag.daysQueried++;
       if (dayDelayMs) await wait(dayDelayMs);
     }
