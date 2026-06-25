@@ -749,6 +749,15 @@ html, body {
   font-size: 11px;
   color: #9ca3af;
 }
+/* 所选报告类型无需时间时,置灰整个时间范围区(仍可见,提示将忽略) */
+.manual-date-disabled .manual-date-fields,
+.manual-date-disabled .manual-shortcuts {
+  opacity: 0.45;
+  pointer-events: none;
+}
+#manual-date-need-hint {
+  color: #d97706;
+}
 #manual-fetch-error {
   margin-left: 82px;
   min-height: 18px;

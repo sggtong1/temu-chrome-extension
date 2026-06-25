@@ -172,7 +172,7 @@
           <label class="manual-label">报告类型:</label>
           <div class="manual-report-list" id="manual-report-types"></div>
         </div>
-        <div class="manual-form-row manual-form-row-top">
+        <div class="manual-form-row manual-form-row-top" id="manual-date-row">
           <label class="manual-label">时间范围:</label>
           <div class="manual-date-box">
             <div class="manual-date-fields">
@@ -187,6 +187,7 @@
               <button type="button" class="manual-shortcut" data-manual-range="30d">近 30 天</button>
             </div>
             <div class="manual-range-hint">单次时间范围最长 31 天</div>
+            <div class="manual-range-hint" id="manual-date-need-hint" hidden>所选报告类型无需时间范围，将忽略此项</div>
           </div>
         </div>
         <div class="form-hint err" id="manual-fetch-error"></div>

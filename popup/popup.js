@@ -99,6 +99,7 @@ const KIND_LABELS = {
   'scrape:settlement':       '结算报表',
   'scrape:flux-analysis':    '获取流量分析',
   'scrape:sales-30d':        '获取近30天销量',
+  'scrape:sku-sales-daily':  '获取每日销量明细',
   'scrape:declared-price':   '获取申报价格',
   'scrape:marketing-activity': '获取营销活动',
   'scrape:order-amounts':    '获取订单数据',
@@ -147,6 +148,10 @@ const SETTLEMENT_REPORT_STATUS_API = '/api/agent/settlement-report/status';
 const USE_RESERVED_SETTLEMENT_REPORT_API = false;
 const USE_RESERVED_SETTLEMENT_REPORT_STATUS_API = false;
 
+// 手动专属模块 key:逐日销量回填(全托)。日常逐日销量已合并进 sales-30d(「获取近30天销量」),
+// 此模块只在手动采集下拉里出现,用于按任意历史区间补数(querySkuSalesNumber,需传日期)。
+const DAILY_BACKFILL_MODULE_KEY = 'sku-daily-backfill';
+
 // 模块 key → backend task kind(s)。settle-report 在不同托管模式下对应不同 kind 集合。
 const MODULE_TO_KINDS = {
   'sales-30d':      ['scrape:sales-30d'],
@@ -158,6 +163,7 @@ const MODULE_TO_KINDS = {
   'orders':         ['scrape:order-amounts'],
   'returns':        ['scrape:returns'],
   'semi-ad':        ['scrape:semi-ad'],
+  [DAILY_BACKFILL_MODULE_KEY]: ['scrape:sku-sales-daily'],
 };
 
 const REGION_ORDER = ['kjmh', 'global', 'eu', 'us', 'cn', 'pa', 'jp', 'mx'];
@@ -347,17 +353,20 @@ const KIND_REGIONS = {
 };
 
 const MANUAL_MAX_RANGE_DAYS = 31;
-const MANUAL_REPORT_TYPES_BY_CUSTODY = {
-  full: [
-    { key: 'sales-30d',     label: '近30天历史销量' },
-    { key: 'settle-report', label: '结算报表' },
-  ],
-  semi: [
-    { key: 'orders',        label: '订单数据' },
-    { key: 'returns',       label: '退货退款' },
-    { key: 'settle-report', label: '结算报表' },
-  ],
-};
+
+// 手动获取里需要「时间范围」参数的模块 —— 只有结算报表家族真正按 deductTime /
+// orderCreateTime 窗口采集;其余采集都是固定窗口(sales=timeType、returns=windowDays、
+// semi-ad=windowDays、orders=maxPages 翻页、flux/declare/activity/marketing 无日期),
+// 选了时间也无视。报告类型下拉直接复用左侧全部采集模块(见 getManualReportTypes)。
+// 模块级:需要用户选时间范围的模块 —— 结算报表家族 + 逐日销量回填(按区间取 querySkuSalesNumber)。
+const MODULE_NEEDS_DATE = new Set([SETTLEMENT_REPORT_MODULE_KEY, DAILY_BACKFILL_MODULE_KEY]);
+
+// kind 级:只有这些 kind 才往 payload 塞日期窗口,其它 kind 不塞(固定窗口,传了也被忽略)。
+const KIND_NEEDS_DATE = new Set([
+  ...FULL_SETTLEMENT_REPORT_KINDS,
+  ...SEMI_SETTLEMENT_REPORT_KINDS,
+  'scrape:sku-sales-daily',   // 逐日销量回填:querySkuSalesNumber 需 startDate/endDate
+]);
 
 let _apiShops = [];          // /api/shops 返回
 let _apiTasks = [];          // /api/agent/tasks 返回
@@ -612,6 +621,10 @@ async function createTasksForSelected(options = {}) {
 }
 
 async function createAgentTask({ shop, kind, region, dates, priority = 5, extraPayload = {} }) {
+  // 仅结算报表家族(KIND_NEEDS_DATE)的 kind 才带时间窗口;其它采集固定窗口,不塞日期。
+  const datePayload = (dates && KIND_NEEDS_DATE.has(kind))
+    ? { startDate: dates.startDate, endDate: dates.endDate, dateFrom: dates.startDate, dateTo: dates.endDate }
+    : {};
   return apiFetch('/api/agent/tasks', {
     method: 'POST',
     body: JSON.stringify({
@@ -621,10 +634,7 @@ async function createAgentTask({ shop, kind, region, dates, priority = 5, extraP
         mallId: shop.platformShopId,
         siteType: shop.shopType,
         region,
-        startDate: dates.startDate,
-        endDate: dates.endDate,
-        dateFrom: dates.startDate,
-        dateTo: dates.endDate,
+        ...datePayload,
         ...extraPayload,
       },
       priority,
@@ -1251,7 +1261,32 @@ $$('.custody-tab').forEach((b) => b.addEventListener('click', () => selectCustod
 // 5. 操作按钮
 // ──────────────────────────────────────────────────────────────
 function getManualReportTypes() {
-  return MANUAL_REPORT_TYPES_BY_CUSTODY[activeCustody] || MANUAL_REPORT_TYPES_BY_CUSTODY.full;
+  // 报告类型 = 左侧全部采集类型(与 MODULES_BY_CUSTODY 一致);标签去掉「获取」前缀更像报告名
+  const list = MODULES_BY_CUSTODY[activeCustody] || MODULES_BY_CUSTODY.full;
+  const types = list.map((m) => ({ key: m.key, label: m.label.replace(/^获取\s*/, '') }));
+  // 手动专属:逐日销量按区间回填(全托)。日常已由「近30天销量」合并采集;此项用于补任意历史区间。
+  if (activeCustody === 'full') {
+    types.push({ key: DAILY_BACKFILL_MODULE_KEY, label: 'SKU每日销量(按区间回填)' });
+  }
+  return types;
+}
+
+function manualSelectionNeedsDate() {
+  return selectedManualModuleKeys().some((k) => MODULE_NEEDS_DATE.has(k));
+}
+
+// 根据所选报告类型是否需要时间,启用/置灰时间范围控件
+function updateManualDateState() {
+  const needsDate = manualSelectionNeedsDate();
+  const row = $('#manual-date-row');
+  if (row) row.classList.toggle('manual-date-disabled', !needsDate);
+  ['manual-date-from', 'manual-date-to'].forEach((id) => {
+    const el = $('#' + id);
+    if (el) el.disabled = !needsDate;
+  });
+  $$('.manual-shortcut').forEach((b) => { b.disabled = !needsDate; });
+  const hint = $('#manual-date-need-hint');
+  if (hint) hint.hidden = needsDate;
 }
 
 function getManualTargetShops() {
@@ -1292,6 +1327,7 @@ function selectedManualModuleKeys() {
 
 function validateManualFetch() {
   if (selectedManualModuleKeys().length === 0) return '请至少选择一个报告类型';
+  if (!manualSelectionNeedsDate()) return '';   // 所选类型都不需要时间 → 不校验日期(忽略时间范围)
   const from = $('#manual-date-from').value;
   const to = $('#manual-date-to').value;
   if (!from || !to) return '请选择时间范围';
@@ -1323,8 +1359,12 @@ function openManualFetchModal() {
       <span>${item.label}</span>
     </label>
   `).join('');
+  // 勾选变化 → 同步时间控件启用态 + 清错误(校验在提交时做)
+  $$('#manual-report-types input[type="checkbox"]').forEach((cb) =>
+    cb.addEventListener('change', () => { updateManualDateState(); setManualError(''); }));
 
   setManualDateRange('7d');
+  updateManualDateState();
   setManualError(shops.length === 0 ? '当前没有可派单的店铺' : '');
   $('#manual-fetch-modal').hidden = false;
 }

@@ -742,6 +742,7 @@ const KIND_LABELS = {
   'scrape:marketing-activity': '营销活动',
   'scrape:activity-products':  '活动可报商品',
   'scrape:sales-30d':          '近30天销量',
+  'scrape:sku-sales-daily':    '每日销量明细',
   'scrape:activity-data':      '活动报名记录',
   'scrape:declared-price':     '申报价确认',
   'scrape:lifecycle-management': '商品生命周期',
@@ -1375,6 +1376,17 @@ async function dispatchSales30d(task, signal) {
   const pageNoKey = semi ? 'pageNum' : 'pageNo';
   const pageSize = semi ? 30 : 50;
 
+  // ★ 2026-06-25 合并 sku-sales-daily:全托同 session 顺带逐日销量(querySkuSalesNumber)→
+  //   一个登录态写两表(shop_sku_snapshot + shop_sku_daily_snapshot)。同页同子域同 anti-content,
+  //   querySkuSalesNumber 入参 productSkuIds 复用 listOverall 翻页拿到的 SKU 列表。best-effort:
+  //   逐日失败只记 diag,不影响快照行落库。半托不需要:sale/analysis/detail 响应自带 skuSaleDTOList 日明细。
+  const dailyApiPath = semi ? null : '/mms/venom/api/supplier/sales/management/querySkuSalesNumber';
+  const fmtDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const _today = new Date();
+  const _start = new Date(_today); _start.setDate(_start.getDate() - 29);
+  const dailyStartDate = payload.startDate ?? payload.dateFrom ?? fmtDay(_start);
+  const dailyEndDate   = payload.endDate   ?? payload.dateTo   ?? fmtDay(_today);
+
   const TAB_LOAD_TIMEOUT_MS = 30_000;
   const SCRIPT_TIMEOUT_MS = 5 * 60_000;
   let tabId = null;
@@ -1395,7 +1407,7 @@ async function dispatchSales30d(task, signal) {
       target: { tabId },
       world: 'MAIN',
       func: runSalesInTab,
-      args: [{ apiPath, mallId: String(payload.mallId), listKey, baseBody, pageNoKey, pageSize, maxPages: Math.min(Number(payload.maxPages) || 40, 200) }],
+      args: [{ apiPath, mallId: String(payload.mallId), listKey, baseBody, pageNoKey, pageSize, maxPages: Math.min(Number(payload.maxPages) || 40, 200), dailyApiPath, dailyStartDate, dailyEndDate, dailyChunk: 100 }],
     });
     console.log(`[sales-30d] 注入页面抓取 ${apiPath} ...`);
     const result = await Promise.race([
@@ -1409,13 +1421,23 @@ async function dispatchSales30d(task, signal) {
       throw Object.assign(new Error(`页面内 fetch 失败: ${result.error}`), { code: result.code ?? 'TEMU_FETCH_FAILED' });
     }
 
+    // ★ 全托逐日销量:插件侧转换(querySkuSalesNumber raw → {platformSkuId,date,salesNumber}),
+    //   随 result.dailyRows 回传 → 后端 parseSemiDailyRows 直接读 → 写 shop_sku_daily_snapshot。
+    const dailyRows = (result.dailyRaw && result.dailyRaw.length)
+      ? transformSkuSalesDailyResponse(result.dailyRaw)
+      : [];
+    if (!semi && result.diag && result.diag.dailyError) {
+      console.warn(`[sales-30d] ⚠ 逐日销量 best-effort 失败(快照已落库,不影响): ${result.diag.dailyError}`);
+    }
     console.log(
-      `[sales-30d] ✓ mall=${payload.mallId} ${semi ? 'semi' : 'full'} rows=${result.rows.length}(raw 回传,后端解析)`,
-      { diag: result.diag, sample: result.rows[0] ?? null },
+      `[sales-30d] ✓ mall=${payload.mallId} ${semi ? 'semi' : 'full'} rows=${result.rows.length} dailyRows=${dailyRows.length}(raw 回传,后端解析)`,
+      { diag: result.diag, sample: result.rows[0] ?? null, dailySample: dailyRows[0] ?? null },
     );
     return {
       rows: result.rows,
+      dailyRows,
       rawCount: result.rows.length,
+      dailyCount: dailyRows.length,
       completedAt: new Date().toISOString(),
       agent: agentDiag(),
     };
@@ -1428,14 +1450,16 @@ async function dispatchSales30d(task, signal) {
 // 纯函数(executeScript 序列化)。全托 listOverall(pageNo/50/{isLack:0})、半托 sale/analysis/detail
 //(pageNum/30/{timeType});listKey 取 result 里的列表数组,raw 原样累加回传。
 async function runSalesInTab(args) {
-  const { apiPath, mallId, listKey, baseBody, pageNoKey, pageSize, maxPages } = args;
+  const { apiPath, mallId, listKey, baseBody, pageNoKey, pageSize, maxPages,
+          dailyApiPath, dailyStartDate, dailyEndDate, dailyChunk } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const genAntiContent = () => {
     try { return new (window.rose(4))({ serverTime: Date.now() }).messagePack(); } catch (e) { return ''; }
   };
-  const post = async (body) => {
+  const post = async (body, path) => {
+    const url = path || apiPath;
     for (let attempt = 0; attempt < 6; attempt++) {
-      const resp = await fetch(apiPath, {
+      const resp = await fetch(url, {
         method: 'POST', credentials: 'include',
         headers: { 'content-type': 'application/json', 'mallid': String(mallId), 'anti-content': genAntiContent() },
         body: JSON.stringify(body),
@@ -1473,7 +1497,35 @@ async function runSalesInTab(args) {
       if (list.length < pageSize) break;
       if (diag.total != null && rows.length >= diag.total) break;
     }
-    return { ok: true, rows, diag, firstListResp };
+
+    // ★ 全托:同 session 顺带逐日销量(querySkuSalesNumber)。best-effort —— 失败只记 diag.dailyError,
+    //   不影响已收集的快照行(rows 照常回传)。半托 dailyApiPath=null,跳过。
+    let dailyRaw = [];
+    if (dailyApiPath && rows.length) {
+      try {
+        const skuSet = new Set();
+        for (const spu of rows) {
+          const skus = (spu && spu.skuQuantityDetailList) || [];
+          for (const sku of skus) { if (sku && sku.productSkuId != null) skuSet.add(Number(sku.productSkuId)); }
+        }
+        const skuIds = [...skuSet].filter(Boolean);
+        diag.dailySkus = skuIds.length;
+        const CHUNK = dailyChunk || 100;
+        for (let i = 0; i < skuIds.length; i += CHUNK) {
+          const chunk = skuIds.slice(i, i + CHUNK);
+          const data = await post({ productSkuIds: chunk, startDate: dailyStartDate, endDate: dailyEndDate }, dailyApiPath);
+          const items = Array.isArray(data && data.result) ? data.result
+            : ((data && data.result && (data.result.list || data.result.items || data.result.dataList)) || []);
+          for (const it of items) dailyRaw.push(it);
+          if (i + CHUNK < skuIds.length) await wait(150);
+        }
+        diag.dailyRows = dailyRaw.length;
+      } catch (e) {
+        diag.dailyError = String((e && e.message) || e);
+      }
+    }
+
+    return { ok: true, rows, dailyRaw, diag, firstListResp };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e), code: e && e.code, diag, firstListResp };
   }
