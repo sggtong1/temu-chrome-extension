@@ -55,7 +55,7 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-actsessions-20260626a';
+const AGENT_BUILD_ID   = 'agent-enroll-rework-20260626a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -2264,25 +2264,26 @@ async function dispatchActivityEnroll(task, signal) {
     throw Object.assign(new Error('payload.thematicId/items missing'), { code: 'BAD_PAYLOAD' });
   }
   if (payload.activityType == null) {
-    throw Object.assign(new Error('payload.activityType missing (Temu detail-new 页必须 type 参数)'), { code: 'BAD_PAYLOAD' });
+    throw Object.assign(new Error('payload.activityType missing'), { code: 'BAD_PAYLOAD' });
   }
 
-  // ★ capture 锚点 = activity detail-new 页(对应 thematicId),NOT 顶层 list 页
-  //   原因:Temu submit 不接受随便一个 session,必须是"已经看过这个 thematic 详情页"的 session,
-  //   否则服务端找不到 enrollment context,返回 errorCode=3000000 "报名货品不可为空"。
-  //   detail-new 页自然会触发 /enroll/scroll/match(可报 SKU 列表),从那里捕 headers。
+  const semi = payload.shopType === 'semi';
+
+  // capture 锚点:活动列表主页(同 dispatchActivitySessions 范式)
+  // captureApiUrlPattern 用于从页面自然触发的请求捕 mallid + anti-content headers
   const captureSpec = {
-    pageUrl: (p) => `https://agentseller.temu.com/activity/marketing-activity/detail-new?type=${p.activityType}&thematicId=${p.thematicId}`,
-    apiUrlPattern: '/api/kiana/gamblers/marketing/enroll/scroll/match',
+    pageUrl: () => 'https://agentseller.temu.com/activity/marketing-activity',
+    captureApiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
   };
 
+  const submitUrl = `https://agentseller.temu.com/api/kiana/gamblers/marketing/enroll/${semi ? 'semi/' : ''}submit`;
+
   const mallId = payload.mallId;
-  // ★ NOT 走 getCachedSession — submit 必须每次 fresh capture 在 detail-new 页上下文,
-  //   再用一遍 list-page cached session 会让 Temu 服务端"忘了"当前正在哪个 thematic 上。
-  console.log(`[Temu后台] enroll always fresh-capture (detail-new) thematic=${payload.thematicId}`);
+  console.log(`[activity-enroll] start thematic=${payload.thematicId} type=${payload.activityType} semi=${semi} items=${payload.items.length}`);
   if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
   const session = await captureSessionViaTab(captureSpec, payload, signal);
-  // MALL_MISMATCH 防御(同账号多 mall 放行 — 见 dispatchViaHiddenTab 同款注释)
+
+  // MALL_MISMATCH 防御:同账号多 mall override,跨账号 fail-fast
   const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
   if (capturedMall && String(capturedMall) !== String(mallId)) {
     if (accountOwnsMall(mallId)) {
@@ -2296,63 +2297,60 @@ async function dispatchActivityEnroll(task, signal) {
     }
   }
 
-  // ★ Temu /enroll/submit body 结构(2026-05-19 真 cURL 实测 — DevTools 不显示 Payload,
-  //   用 window.fetch 注入 hook 在 console 捕到):
-  //   {
-  //     activityType: 13,
-  //     activityThematicId: 2605120000000022,             // ← 数字 不是 string
-  //     productList: [                                    // ← productList,NOT submitList
-  //       { productId, activityStock, skcList: [
-  //         { skcId, skuList: [{ skuId, activityPrice }] }
-  //       ]}
-  //     ]
-  //   }
-  // ★ 旧版本错用 submitList → Temu 找不到货品数组 → "报名货品不可为空"。
-  // ★ 所有 ID 字段都是 number(实测 10-16 位都在 Number.MAX_SAFE_INTEGER 之内)。
+  // 按 productId 分组;semi 加 siteInfoList + sessionIds,full 用 skcList
   const byProduct = new Map();
   for (const it of payload.items) {
     if (it.productId == null || it.productId === '') {
       throw Object.assign(
-        new Error(`BAD_PAYLOAD: items[].productId missing — Temu 必填,空值必返回"报名货品不可为空"`),
+        new Error(`BAD_PAYLOAD: items[].productId missing`),
         { code: 'BAD_PAYLOAD', offendingItem: it },
       );
     }
-    const pKey = String(it.productId);
-    if (!byProduct.has(pKey)) {
-      byProduct.set(pKey, {
-        productId: Number(it.productId),                    // ★ number(真 body 是 numeric)
-        activityStock: Number(it.targetActivityStock) || 0,
-        skcMap: new Map(),
-      });
-    }
-    const prod = byProduct.get(pKey);
-    const sKey = String(it.skcId ?? '');
-    if (!prod.skcMap.has(sKey)) prod.skcMap.set(sKey, { skcId: Number(it.skcId), skuList: [] });
-    prod.skcMap.get(sKey).skuList.push({
-      skuId: Number(it.productSkuId),
-      activityPrice: Number(it.supplyPrice),                // cents
+    const pid = String(it.productId);
+    if (!byProduct.has(pid)) byProduct.set(pid, {
+      productId: Number(it.productId),
+      activityStock: Number(it.targetActivityStock) || 0,
+      sessionIds: new Set(),
+      siteMap: new Map(),   // siteId -> Map(skcId -> skuList[])
+      skcMap: new Map(),    // 全托用:skcId -> skuList[]
     });
+    const p = byProduct.get(pid);
+    (it.sessionIds || []).forEach((s) => p.sessionIds.add(Number(s)));
+    const sku = { skuId: Number(it.productSkuId), activityPrice: Number(it.supplyPrice) };
+    // full branch
+    if (!p.skcMap.has(String(it.skcId))) p.skcMap.set(String(it.skcId), { skcId: Number(it.skcId), skuList: [] });
+    p.skcMap.get(String(it.skcId)).skuList.push(sku);
+    // semi branch(按 siteId 归组)
+    const siteId = Number(it.siteId);
+    if (!p.siteMap.has(siteId)) p.siteMap.set(siteId, new Map());
+    const skcM = p.siteMap.get(siteId);
+    if (!skcM.has(String(it.skcId))) skcM.set(String(it.skcId), { skcId: Number(it.skcId), skuList: [] });
+    skcM.get(String(it.skcId)).skuList.push(sku);
   }
-  const productList = Array.from(byProduct.values()).map((p) => ({
-    productId: p.productId,
-    activityStock: p.activityStock,
-    skcList: Array.from(p.skcMap.values()),
-  }));
+  const productList = Array.from(byProduct.values()).map((p) => {
+    if (semi) return {
+      productId: p.productId,
+      activityStock: p.activityStock,
+      siteInfoList: Array.from(p.siteMap.entries()).map(([siteId, skcM]) => ({
+        siteId, skcList: Array.from(skcM.values()),
+      })),
+      sessionIds: Array.from(p.sessionIds),
+    };
+    return { productId: p.productId, activityStock: p.activityStock, skcList: Array.from(p.skcMap.values()) };
+  });
 
-  const submitBody = {
+  const requestBody = {
     activityType: Number(payload.activityType),
     activityThematicId: Number(payload.thematicId),
     productList,
-    ...(payload.sessionId != null ? { sessionId: Number(payload.sessionId) } : {}),
   };
 
-  const submitUrl = `${session.origin}/api/kiana/gamblers/marketing/enroll/submit`;
   const headers = { ...session.headers, 'content-type': 'application/json' };
 
   let respJson;
   try {
     const resp = await fetch(submitUrl, {
-      method: 'POST', credentials: 'include', headers, body: JSON.stringify(submitBody),
+      method: 'POST', credentials: 'include', headers, body: JSON.stringify(requestBody),
     });
     if (resp.status === 429) {
       const ra = Number(resp.headers.get('Retry-After')) || 0;
@@ -2362,7 +2360,7 @@ async function dispatchActivityEnroll(task, signal) {
       const txt = await resp.text().catch(() => '');
       throw Object.assign(
         new Error(`SUBMIT_FAILED: HTTP ${resp.status}: ${txt.slice(0, 200)}`),
-        { code: 'SUBMIT_FAILED', requestBody: submitBody, httpStatus: resp.status, rawText: txt.slice(0, 500) },
+        { code: 'SUBMIT_FAILED', requestBody, httpStatus: resp.status, rawText: txt.slice(0, 500) },
       );
     }
     respJson = await resp.json();
@@ -2374,18 +2372,16 @@ async function dispatchActivityEnroll(task, signal) {
   const rl = detectRateLimitInBody(respJson);
   if (rl) throw rateLimitedError({ retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200, msg: `enroll rate-limited: ${rl.reason}` });
 
-  // 全量上抛 response + requestBody,便于 server 端 ingester debug + 后续修正 body schema
-  return {
-    success: respJson?.success === true,
-    response: respJson,
-    requestBody: submitBody,
-    errorCode: respJson?.errorCode ?? respJson?.error_code ?? null,
-    errorMsg: respJson?.errorMsg ?? respJson?.error_msg ?? null,
-    submittedCount: payload.items.length,
-    thematicId: payload.thematicId,
-    completedAt: new Date().toISOString(),
-    agent: agentDiag(),
-  };
+  const errorCode = respJson?.errorCode ?? respJson?.error_code ?? null;
+  const errorMsg = respJson?.errorMsg ?? respJson?.error_msg ?? null;
+
+  if (respJson?.success === true) {
+    console.log('[activity-enroll] ✓', { productId2EnrollIdMap: respJson?.result?.productId2EnrollIdMap, semi });
+  } else {
+    console.error('[activity-enroll] ✗', { errorCode, errorMsg, requestBody });
+  }
+
+  return { ok: true, success: respJson?.success === true, response: respJson, requestBody, errorCode, errorMsg };
 }
 
 // ── scrape:activity-sessions(顶层活动站点级场次,/enroll/session/list)────────────
