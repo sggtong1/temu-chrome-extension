@@ -55,13 +55,14 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-semiad-bjtz-20260624a';
+const AGENT_BUILD_ID   = 'agent-actsessions-20260626a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
 const SUPPORTED_KINDS = [
   'scrape:marketing-activity',
   'scrape:activity-products',
+  'scrape:activity-sessions',
   'scrape:sales-30d',
   'scrape:sku-sales-daily',
   'scrape:activity-data',
@@ -741,6 +742,7 @@ export async function pollOnce() {
 const KIND_LABELS = {
   'scrape:marketing-activity': '营销活动',
   'scrape:activity-products':  '活动可报商品',
+  'scrape:activity-sessions':  '活动场次站点',
   'scrape:sales-30d':          '近30天销量',
   'scrape:sku-sales-daily':    '每日销量明细',
   'scrape:activity-data':      '活动报名记录',
@@ -1089,6 +1091,7 @@ async function dispatch(task, signal, onProgress) {
   switch (task.kind) {
     case 'scrape:marketing-activity':   return dispatchMarketingActivity(task, signal);
     case 'scrape:activity-products':    return dispatchActivityProducts(task, signal);
+    case 'scrape:activity-sessions':    return dispatchActivitySessions(task, signal);
     case 'scrape:sales-30d':            return dispatchSales30d(task, signal);
     case 'scrape:sku-sales-daily':      return dispatchSkuSalesDaily(task, signal);
     case 'scrape:activity-data':        return dispatchActivityData(task, signal);
@@ -2383,6 +2386,101 @@ async function dispatchActivityEnroll(task, signal) {
     completedAt: new Date().toISOString(),
     agent: agentDiag(),
   };
+}
+
+// ── scrape:activity-sessions(顶层活动站点级场次,/enroll/session/list)────────────
+// 任务语义:给定 activityId + productIds,拉 /enroll/session/list 原始响应,原样回传。
+// 后端 ActivitySessionsIngestor 按 result.raw.result.list 解析落库。
+// payload: { mallId, activityId, activityType, thematicId?, productIds: number[] }
+// returns: { ok:true, raw:<Temu 完整响应JSON>, diag }
+async function dispatchActivitySessions(task, signal) {
+  const payload = task.payload ?? {};
+  const diag = {
+    productCount: Array.isArray(payload.productIds) ? payload.productIds.length : 0,
+    listCount: 0,
+    siteIds: [],
+  };
+  console.log(
+    `[activity-sessions] start activity=${payload.activityId} type=${payload.activityType} products=${diag.productCount}`,
+  );
+  if (!payload.mallId) {
+    throw Object.assign(new Error('payload.mallId missing'), { code: 'BAD_PAYLOAD' });
+  }
+  if (!Array.isArray(payload.productIds) || payload.productIds.length === 0) {
+    throw Object.assign(new Error('payload.productIds missing or empty'), { code: 'BAD_PAYLOAD' });
+  }
+
+  // capture 锚点:活动列表主页(自然会触发 /enroll/activity/list,从中捕 mallid + anti-content headers)
+  const captureSpec = {
+    pageUrl: () => 'https://agentseller.temu.com/activity/marketing-activity',
+    captureApiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
+  };
+
+  const mallId = payload.mallId;
+  if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
+  const session = await captureSessionViaTab(captureSpec, payload, signal);
+
+  // MALL_MISMATCH 防御:同账号多 mall 时 override,跨账号则 fail-fast
+  const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
+  if (capturedMall && String(capturedMall) !== String(mallId)) {
+    if (accountOwnsMall(mallId)) {
+      session.headers = overrideMallidHeader(session.headers, mallId);
+      session.mallId = String(mallId);
+    } else {
+      throw Object.assign(
+        new Error(`MALL_MISMATCH: activity-sessions expects mallId=${mallId} but chrome is ${capturedMall} (account malls=[${(_userIdCache.mallIdList || []).join(',')}])`),
+        { code: 'MALL_MISMATCH' },
+      );
+    }
+  }
+
+  // POST /enroll/session/list — 薄:原样回传完整响应,解析在后端
+  const sessionListBody = {
+    productIds: payload.productIds.map((p) => Number(p)),
+    activityType: Number(payload.activityType),
+    ...(payload.thematicId != null ? { activityThematicId: Number(payload.thematicId) } : {}),
+  };
+  const sessionListUrl = `${session.origin}/api/kiana/gamblers/marketing/enroll/session/list`;
+  const headers = { ...session.headers, 'content-type': 'application/json' };
+
+  let respJson;
+  try {
+    const resp = await fetch(sessionListUrl, {
+      method: 'POST', credentials: 'include', headers, body: JSON.stringify(sessionListBody),
+    });
+    if (resp.status === 429) {
+      const ra = Number(resp.headers.get('Retry-After')) || 0;
+      throw rateLimitedError({ retryAfterMs: ra ? ra * 1000 : null, httpStatus: 429, msg: 'activity-sessions HTTP 429' });
+    }
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw Object.assign(
+        new Error(`FETCH_FAILED: HTTP ${resp.status}: ${txt.slice(0, 200)}`),
+        { code: 'FETCH_FAILED', httpStatus: resp.status, rawText: txt.slice(0, 500) },
+      );
+    }
+    respJson = await resp.json();
+  } catch (e) {
+    if (e?.code === 'RATE_LIMITED' || e?.code === 'FETCH_FAILED' || e?.code === 'MALL_MISMATCH') throw e;
+    throw Object.assign(new Error(`FETCH_NETWORK: ${e.message}`), { code: 'FETCH_NETWORK' });
+  }
+
+  const rl = detectRateLimitInBody(respJson);
+  if (rl) throw rateLimitedError({ retryAfterMs: rl.retryAfterMs ?? null, httpStatus: 200, msg: `activity-sessions rate-limited: ${rl.reason}` });
+
+  diag.listCount = respJson?.result?.list?.length ?? 0;
+  diag.siteIds = respJson?.result?.siteIds ?? [];
+
+  if (respJson?.success === false) {
+    console.error('[activity-sessions] ✗', { error: respJson?.errorMsg, code: respJson?.errorCode, diag, firstResp: respJson });
+    throw Object.assign(
+      new Error(`session/list failed: ${respJson?.errorMsg ?? respJson?.errorCode}`),
+      { code: 'TEMU_ERROR' },
+    );
+  }
+
+  console.log('[activity-sessions] ✓', { diag, sampleSession: respJson?.result?.list?.[0] });
+  return { ok: true, raw: respJson, diag };
 }
 
 // ── 区域共享 tab 池 ──────────────────────────────────────────────────
