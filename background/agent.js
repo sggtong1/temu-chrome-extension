@@ -2276,12 +2276,13 @@ async function dispatchActivityEnroll(task, signal) {
     captureApiUrlPattern: '/api/kiana/gamblers/marketing/enroll/activity/list',
   };
 
-  const submitUrl = `https://agentseller.temu.com/api/kiana/gamblers/marketing/enroll/${semi ? 'semi/' : ''}submit`;
-
   const mallId = payload.mallId;
   console.log(`[activity-enroll] start thematic=${payload.thematicId} type=${payload.activityType} semi=${semi} items=${payload.items.length}`);
   if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORTED' });
   const session = await captureSessionViaTab(captureSpec, payload, signal);
+
+  // 用 capture 后的 session.origin(同 dispatchActivitySessions / dispatchPriceConfirm),多区域不打错域
+  const submitUrl = `${session.origin}/api/kiana/gamblers/marketing/enroll/${semi ? 'semi/' : ''}submit`;
 
   // MALL_MISMATCH 防御:同账号多 mall override,跨账号 fail-fast
   const capturedMall = session.mallId ?? extractMallIdFromHeaders(session.headers);
@@ -2322,6 +2323,9 @@ async function dispatchActivityEnroll(task, signal) {
     p.skcMap.get(String(it.skcId)).skuList.push(sku);
     // semi branch(按 siteId 归组)
     const siteId = Number(it.siteId);
+    if (semi && Number.isNaN(siteId)) {
+      throw Object.assign(new Error('BAD_PAYLOAD: semi enroll item 缺 siteId'), { code: 'BAD_PAYLOAD' });
+    }
     if (!p.siteMap.has(siteId)) p.siteMap.set(siteId, new Map());
     const skcM = p.siteMap.get(siteId);
     if (!skcM.has(String(it.skcId))) skcM.set(String(it.skcId), { skcId: Number(it.skcId), skuList: [] });
