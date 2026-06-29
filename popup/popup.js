@@ -82,7 +82,7 @@ async function apiFetch(path, opts = {}) {
       signal: ctrl.signal,
     });
   } catch (e) {
-    if (e?.name === 'AbortError') throw new Error(`连接 ERP 超时(${cfg.apiUrl})`);
+    if (e?.name === 'AbortError') throw new Error(`状态刷新超时(后台处理中,自动重试)`);
     throw new Error(`连不上 ERP(${cfg.apiUrl}): ${e?.message || e}`);
   } finally {
     clearTimeout(timer);

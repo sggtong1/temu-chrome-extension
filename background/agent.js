@@ -694,7 +694,7 @@ let _pollInFlight = false;
 // ── 派单轮询 ──────────────────────────────────────────────────────
 export async function pollOnce() {
   if (_pollInFlight) {
-    console.log(`· 轮询跳过:上一轮任务仍在执行 (build=${AGENT_BUILD_ID})`);
+    console.log(`· 正常跳过本轮领单:上一轮任务仍在执行(非异常) (build=${AGENT_BUILD_ID})`);
     return;
   }
   _pollInFlight = true;
