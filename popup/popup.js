@@ -678,9 +678,16 @@ async function createSettlementProjectTasks({ shop, dates, priority = 5 }) {
 async function createAgentTasksForKinds({ shop, kinds, dates, region, priority = 5 }) {
   const tasks = [];
   for (const kind of kinds) {
-    // 区域相关 kind(endpoint 有 -us/-eu 子域)扇出全球/美国/欧区各派一次;
-    // 不分区的 kind 用右上角下拉选的 region 派 1 次。
-    const regions = KIND_REGIONS[kind] || [region];
+    let regions;
+    if (kind === 'scrape:semi-ad') {
+      // 半托广告按店铺绑定区域(shop.geoRegion)采:选店即选区域,不依赖下拉。
+      // 广告数据按 Temu deployment 区域隔离(见 agent.js runSemiAdInTab);geoRegion 未设置 → 兜底采全部三区域。
+      regions = shop.geoRegion ? [shop.geoRegion] : ['global', 'us', 'eu'];
+    } else {
+      // 其它区域相关 kind(endpoint 有 -us/-eu 子域)扇出全球/美国/欧区各派一次;
+      // 不分区的 kind 用右上角下拉选的 region 派 1 次。
+      regions = KIND_REGIONS[kind] || [region];
+    }
     for (const rgn of regions) {
       tasks.push(await createAgentTask({ shop, kind, region: rgn, dates, priority }));
     }

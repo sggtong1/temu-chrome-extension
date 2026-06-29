@@ -55,7 +55,7 @@ const POOLABLE_SETTLEMENT_KINDS = new Set([
 // Bump this when diagnosing Chrome MV3 service-worker/module cache issues.
 // It is written into logs and successful task results, so we can prove which
 // evaluated module, not just which fetched source file, handled a task.
-const AGENT_BUILD_ID   = 'agent-enroll-rework-20260626a';
+const AGENT_BUILD_ID   = 'agent-semiad-region-20260628a';
 
 // plugin 能处理的 task kind 列表 — claim 时上报给 server,server 据此过滤派单
 // 老 plugin 不会上报这个,server 兼容路径会给它派所有 kind(但 dispatch 不认识就抛 UNSUPPORTED_KIND)
@@ -151,6 +151,10 @@ const REGION_TO_RETURNS_DETAIL_PATH = {
 // 半托广告:独立域名 ads.temu.com(实测注入页直 fetch,无需 x-phan-data/list_id/mallid,cookie 自带)。
 const SEMI_AD_PAGE_URL = 'https://ads.temu.com/data-report.html';
 const SEMI_AD_REPORT_PATH = '/api/v1/coconut/ad/ads_report';
+// 区域(deployment)切换:出价推广数据按区域隔离,后台新开页默认非目标区域 → 采集前必须显式切。
+//   source: 1=美国 / 2=全球 / 3=欧洲(实测)。切完同会话内 ads_report 即返该区域数据,无需 reload。
+const SEMI_AD_DEPLOYMENT_SWITCH_PATH = '/api/v1/coconut/account/deployment_switch';
+const SEMI_AD_REGION_SOURCE = { us: 1, global: 2, eu: 3 };
 
 // ★ 半托管数据中心「商品数据」页(销量 /api/sale/analysis/detail)。
 // ★★ 实测确认:销量 detail 的 host 固定主域 agentseller.temu.com,【不分区】(跟店铺区域无关);
@@ -2034,6 +2038,7 @@ async function runReturnsInTab(args) {
 async function dispatchSemiAd(task, signal) {
   const payload = task.payload ?? {};
   const region = payload.region ?? 'global';
+  const source = SEMI_AD_REGION_SOURCE[region] ?? 2;
 
   const TAB_LOAD_TIMEOUT_MS = 30_000;
   const SCRIPT_TIMEOUT_MS = 6 * 60_000;
@@ -2049,12 +2054,12 @@ async function dispatchSemiAd(task, signal) {
     if (t?.url && isLoginFlowUrl(t.url)) throw Object.assign(new Error(`ads.temu.com 跳登录,需登录半托广告后台`), { code: 'LOGIN_REQUIRED' });
     await sleep(2000, signal);
 
-    console.log(`[semi-ad] region=${region} 注入页面抓取(近 7 天逐日 + 分页)...`);
+    console.log(`[semi-ad] region=${region}(source=${source}) 先切区域再注入抓取(近 7 天逐日 + 分页)...`);
     const scriptPromise = chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       func: runSemiAdInTab,
-      args: [{ reportPath: SEMI_AD_REPORT_PATH, windowDays: 7, pageSize: 50, maxPages: 20, dayDelayMs: 300 }],
+      args: [{ reportPath: SEMI_AD_REPORT_PATH, switchPath: SEMI_AD_DEPLOYMENT_SWITCH_PATH, source, region, windowDays: 7, pageSize: 50, maxPages: 20, dayDelayMs: 300 }],
     });
     const result = await Promise.race([
       scriptPromise.then(([r]) => r?.result),
@@ -2067,11 +2072,21 @@ async function dispatchSemiAd(task, signal) {
     }
     const dayReports = result.dayReports ?? [];
     const totalRows = dayReports.reduce((s, d) => s + (d.pages ?? []).reduce((a, p) => a + (p?.result?.ads_detail?.length ?? 0), 0), 0);
-    console.log(`[semi-ad] ✓ region=${region} days=${dayReports.length} 商品行=${totalRows}`, {
+    const allPages = dayReports.flatMap((d) => d.pages ?? []);
+    const globalSample = allPages.find((p) => p?._tab === 'global' && (p?.result?.ads_detail?.length ?? 0) > 0);
+    const promoSample = allPages.find((p) => p?._tab === 'promo' && (p?.result?.ads_detail?.length ?? 0) > 0);
+    const bt = result.diag?.byTab ?? {};
+    const sw = result.diag?.deploymentSwitch;
+    console.log(`[semi-ad] ✓ region=${region} 切区域=${sw?.ok ? 'OK' : '失败'} days=${dayReports.length} 商品行=${totalRows}(全域 ${bt.global?.rows ?? '?'} / 推广 ${bt.promo?.rows ?? '?'}${bt.promo?.error ? ` promo错误:${bt.promo.error}` : ''})`, {
       diag: result.diag,
-      sampleRow: dayReports[0]?.pages?.[0]?.result?.ads_detail?.[0] ?? null,
+      sampleRowGlobal: globalSample?.result?.ads_detail?.[0] ?? null,
+      sampleRowPromo: promoSample?.result?.ads_detail?.[0] ?? null,
+      // 推广仍为 0 时,把真实响应贴出来定位(success/error_code/result 结构)
+      firstPromoResp: (bt.promo?.rows ?? 0) === 0 ? result.firstPromoResp ?? null : undefined,
     });
-    return { region, dayReports, diag: result.diag, completedAt: new Date().toISOString(), agent: agentDiag() };
+    // 推广为 0 时把真实响应一并落库,便于服务端排查(正常有数据则不带,避免膨胀)
+    const debugPromoResp = (bt.promo?.rows ?? 0) === 0 ? result.firstPromoResp ?? null : undefined;
+    return { region, dayReports, diag: result.diag, firstPromoResp: debugPromoResp, completedAt: new Date().toISOString(), agent: agentDiag() };
   } finally {
     await cleanup();
   }
@@ -2080,25 +2095,82 @@ async function dispatchSemiAd(task, signal) {
 // ── MAIN-world 注入:ads.temu.com 逐日 + 分页 fetch ads_report,raw 回传(不解析)──────
 // 实测:不需 x-phan-data / list_id / mallid(cookie 自带)。纯函数(序列化)。
 async function runSemiAdInTab(args) {
-  const { reportPath, windowDays, pageSize, maxPages, dayDelayMs } = args;
+  const { reportPath, switchPath, source, region, windowDays, pageSize, maxPages, dayDelayMs } = args;
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  const diag = { daysQueried: 0, pagesFetched: 0, rows: 0, beijingDates: [] };
+  const diag = {
+    region, source, deploymentSwitch: null,
+    daysQueried: 0, pagesFetched: 0, rows: 0, beijingDates: [],
+    byTab: { global: { pages: 0, rows: 0, error: null }, promo: { pages: 0, rows: 0, error: null } },
+  };
   let firstResp = null;
+  let firstPromoResp = null;
+  // ★ ads.temu.com 用 x-phan-data 签名(非 anti-content / window.rose)。该签名由页面 WAF SDK
+  //   包装 window.fetch 后自动注入 → 必须先等 fetch 被包装(变非 native)再发,否则出价推广(强校验)
+  //   返回 success:false error_code:5000000;全域(不强校验)即使没签也通。(同 reaper 域 runViolationAppealsInTab。)
+  let fetchWrapped = false;
+  for (let i = 0; i < 50; i++) {
+    if (!/native code/.test('' + window.fetch)) { fetchWrapped = true; break; }
+    await wait(500);
+  }
+  diag.fetchWrapped = fetchWrapped;
+  const RETRYABLE = new Set([5000000, 20002, 40001]); // x-phan-data 未就绪/系统异常 → 退避重试
   const post = async (body) => {
-    const resp = await fetch(reportPath, {
-      method: 'POST', credentials: 'include',
-      headers: { 'content-type': 'application/json;charset=UTF-8' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${reportPath}`);
-    return resp.json();
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const resp = await fetch(reportPath, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json;charset=UTF-8' },
+        body: JSON.stringify(body),
+      });
+      if ((resp.status === 429 || resp.status === 403 || resp.status === 401) && attempt < 5) {
+        await wait(1500 * (attempt + 1)); continue;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${reportPath}`);
+      const data = await resp.json();
+      if (data && data.success === false && RETRYABLE.has(Number(data.error_code ?? data.errorCode)) && attempt < 5) {
+        await wait(1500 * (attempt + 1)); continue;
+      }
+      return data;
+    }
+    throw new Error(`${reportPath}: 退避重试 6 次仍失败(x-phan-data 未就绪/系统异常)`);
   };
-  const baseBody = {
+  // ★ 采集前显式切区域:出价推广按区域(deployment)隔离,后台新开页默认非目标区域 → 不切就采到 0。
+  //   切换是账号级状态(同会话生效,无需 reload)。切换失败不抛 — 继续采(至少默认区域),由 diag 暴露。
+  if (switchPath && source) {
+    try {
+      const sw = await fetch(`${switchPath}?source=${source}`, {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json;charset=UTF-8' },
+        body: JSON.stringify({ source }),
+      });
+      let sj = null; try { sj = await sw.json(); } catch {}
+      diag.deploymentSwitch = { ok: sw.ok, status: sw.status, success: sj?.success, errorCode: sj?.error_code ?? sj?.errorCode };
+      await wait(1000); // 等服务端区域状态落定再查
+    } catch (e) {
+      diag.deploymentSwitch = { ok: false, error: String((e && e.message) || e) };
+    }
+  }
+  const baseCommon = {
     ad_status: [], specific_query_info: '', sort_by: 0, sort_type: 'desc', source: 0,
-    need_del_status_ad: true, need_calculate_goods_summary: true, selected_roas_type: 1,
+    need_del_status_ad: true, need_calculate_goods_summary: true,
     filter_cooperative_ad_type: 0, data_filter: null, ad_group_list: null,
-    selected_site_id_list: null, ad_phase: -1, columns_type: 21,
+    selected_site_id_list: null, ad_phase: -1,
   };
+  // ★ ads_report 同一 endpoint 有两个出价口径 tab(由 selected_roas_type + columns_type 区分):
+  //   global = 全域出价(新)、promo = 推广出价(存量单品,2026-07-15 下线)。
+  //   同一商品同一天只属于其中一个口径(互斥),两口径并集 = 全店全量花费。
+  //   修复前只采 global → 漏掉仍用推广出价的商品花费,总花费偏低。
+  const TABS = [
+    { key: 'global', selected_roas_type: 1, columns_type: 21 },
+    { key: 'promo', selected_roas_type: 0, columns_type: 14 },
+  ];
+  // list_id:真实 UI 每次请求带一个随机 UUID(server 仅要求存在、不校验值)。global 实测不带也通,
+  //   为对齐 UI 并给 promo 口径兜底,这里每请求生成一个。
+  const uuid = () => (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
   try {
     // ★ 北京日切(不依赖采集机本地时区):把 now 平移 +8h 当 UTC 读 → 取北京墙钟日期;
     //   窗口边界用显式 +08:00 算 epoch。ads_report 按所传 [start,end] 真实时间区间求和
@@ -2113,22 +2185,38 @@ async function runSemiAdInTab(args) {
       const startMs = new Date(`${reportDate}T00:00:00+08:00`).getTime();
       const endMs = startMs + 86400000 - 1;
       const pages = [];
-      for (let p = 1; p <= maxPages; p++) {
-        const data = await post({ ...baseBody, start_time: startMs, end_time: endMs, page_number: p, page_size: pageSize });
-        if (!firstResp) firstResp = data;
-        pages.push(data);
-        diag.pagesFetched++;
-        diag.rows += data?.result?.ads_detail?.length ?? 0;
-        if (!data?.result?.has_more) break;
+      for (const tab of TABS) {
+        try {
+          for (let p = 1; p <= maxPages; p++) {
+            const data = await post({
+              ...baseCommon,
+              selected_roas_type: tab.selected_roas_type, columns_type: tab.columns_type, list_id: uuid(),
+              start_time: startMs, end_time: endMs, page_number: p, page_size: pageSize,
+            });
+            if (!firstResp) firstResp = data;
+            if (tab.key === 'promo' && !firstPromoResp) firstPromoResp = data; // 留作 promo=0 时定位
+            pages.push({ _tab: tab.key, ...data }); // _tab 仅供诊断;parseSemiAdRows 只读 .result
+            diag.pagesFetched++;
+            diag.byTab[tab.key].pages++;
+            const n = data?.result?.ads_detail?.length ?? 0;
+            diag.rows += n;
+            diag.byTab[tab.key].rows += n;
+            if (!data?.result?.has_more) break;
+          }
+        } catch (e) {
+          // global 口径出错 → 抛出让整任务失败重试;promo 口径(7/15 后下线)出错只记 diag、不阻断 global。
+          if (tab.key === 'global') throw e;
+          diag.byTab[tab.key].error = String((e && e.message) || e);
+        }
       }
       dayReports.push({ reportDate, pages });
       diag.beijingDates.push(reportDate);
       diag.daysQueried++;
       if (dayDelayMs) await wait(dayDelayMs);
     }
-    return { ok: true, dayReports, diag };
+    return { ok: true, dayReports, diag, firstPromoResp };
   } catch (e) {
-    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp };
+    return { ok: false, error: String((e && e.message) || e), code: 'IN_PAGE_FETCH_FAILED', diag, firstResp, firstPromoResp };
   }
 }
 
