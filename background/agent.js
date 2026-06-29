@@ -33,6 +33,7 @@ import {
 } from './transform/sku_transform.js';
 // order_transform.js 已退役(2026-06-11 薄插件化):订单行解析迁至 ERP 后端
 // AgentResultIngestor.parseOrderAmounts,插件只回传 raw pageItems+bqResponses。
+import { gzipJson, GZIP_MIN_CHARS } from './gzip.js';
 
 const POLL_PERIOD_MIN  = 1 / 6;   // 10s
 const HEARTBEAT_PERIOD = 60_000;  // 60s
@@ -655,15 +656,30 @@ async function ensurePluginInstanceId() {
 async function api(path, opts = {}) {
   const { apiUrl, token, erpGateKey } = await getCfg();
   if (!apiUrl) throw new Error('agent-not-configured');
+
+  let body = opts.body;
+  const headers = {
+    'Authorization': `Bearer ${token || 'demo'}`,
+    'Content-Type': 'application/json',
+    ...(erpGateKey ? { 'X-ERP-Key': erpGateKey } : {}),
+    ...(opts.headers || {}),
+  };
+  // 大 body(结果上报)gzip:7.7MB → ~1MB,避免占满公网链路、饿死 popup 轮询。
+  if (typeof body === 'string' && body.length > GZIP_MIN_CHARS) {
+    try {
+      const gz = await gzipJson(body);
+      console.log(`[agent] ${path} 上报 ~${(body.length / 1048576).toFixed(1)}MB → gzip ${(gz.byteLength / 1024).toFixed(0)}KB,上传中…`);
+      body = gz;
+      headers['Content-Encoding'] = 'gzip';
+    } catch (e) {
+      console.warn(`[agent] gzip 失败,改发明文: ${e.message}`);
+    }
+  }
+
   const res = await fetch(apiUrl + path, {
     method: opts.method || 'GET',
-    headers: {
-      'Authorization': `Bearer ${token || 'demo'}`,
-      'Content-Type': 'application/json',
-      ...(erpGateKey ? { 'X-ERP-Key': erpGateKey } : {}),
-      ...(opts.headers || {}),
-    },
-    body: opts.body,
+    headers,
+    body,
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
